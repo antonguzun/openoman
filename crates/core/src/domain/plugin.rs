@@ -23,15 +23,36 @@ pub enum PublishPolicy {
     OnValidationSuccess,
 }
 
+impl PublishPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::OnValidationSuccess => "on_validation_success",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, PluginValueError> {
+        match value {
+            "never" => Ok(Self::Never),
+            "on_validation_success" => Ok(Self::OnValidationSuccess),
+            _ => Err(PluginValueError::InvalidPublishPolicy(value.to_string())),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginValueError {
     EmptyCheckProfile,
+    InvalidPublishPolicy(String),
 }
 
 impl Display for PluginValueError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyCheckProfile => write!(f, "check profile must not be empty"),
+            Self::InvalidPublishPolicy(value) => {
+                write!(f, "invalid publish policy: {value}")
+            }
         }
     }
 }

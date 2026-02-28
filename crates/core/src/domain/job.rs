@@ -16,6 +16,10 @@ impl JobId {
         }
         Ok(Self(value))
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +32,10 @@ impl RepoRef {
             return Err(JobValueError::EmptyRepoRef);
         }
         Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -42,6 +50,10 @@ impl Revision {
         }
         Ok(Self(value))
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +66,10 @@ impl ArtifactRef {
             return Err(JobValueError::EmptyArtifactRef);
         }
         Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -74,6 +90,35 @@ impl JobState {
     fn is_terminal(&self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::Canceled)
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::CollectingArtifacts => "collecting_artifacts",
+            Self::Validating => "validating",
+            Self::Publishing => "publishing",
+            Self::Notifying => "notifying",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, JobValueError> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "collecting_artifacts" => Ok(Self::CollectingArtifacts),
+            "validating" => Ok(Self::Validating),
+            "publishing" => Ok(Self::Publishing),
+            "notifying" => Ok(Self::Notifying),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "canceled" => Ok(Self::Canceled),
+            _ => Err(JobValueError::InvalidJobState(value.to_string())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +138,20 @@ pub struct Job {
     pub artifacts: Vec<ArtifactRef>,
     active_attempt_id: Option<u32>,
     validation_succeeded: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobSnapshot {
+    pub id: JobId,
+    pub repo_ref: RepoRef,
+    pub revision: Revision,
+    pub check_profile: CheckProfile,
+    pub publish_policy: PublishPolicy,
+    pub state: JobState,
+    pub attempts: Vec<Attempt>,
+    pub artifacts: Vec<ArtifactRef>,
+    pub active_attempt_id: Option<u32>,
+    pub validation_succeeded: bool,
 }
 
 impl Job {
@@ -117,6 +176,29 @@ impl Job {
         };
 
         (job, JobEvent::JobSubmitted { job_id: id })
+    }
+
+    pub fn rehydrate(snapshot: JobSnapshot) -> Self {
+        Self {
+            id: snapshot.id,
+            repo_ref: snapshot.repo_ref,
+            revision: snapshot.revision,
+            check_profile: snapshot.check_profile,
+            publish_policy: snapshot.publish_policy,
+            state: snapshot.state,
+            attempts: snapshot.attempts,
+            artifacts: snapshot.artifacts,
+            active_attempt_id: snapshot.active_attempt_id,
+            validation_succeeded: snapshot.validation_succeeded,
+        }
+    }
+
+    pub fn active_attempt_id(&self) -> Option<u32> {
+        self.active_attempt_id
+    }
+
+    pub fn validation_succeeded(&self) -> bool {
+        self.validation_succeeded
     }
 
     pub fn start_attempt(&mut self, attempt_id: u32) -> Result<JobEvent, JobError> {
@@ -277,6 +359,7 @@ pub enum JobValueError {
     EmptyRepoRef,
     EmptyRevision,
     EmptyArtifactRef,
+    InvalidJobState(String),
 }
 
 impl Display for JobValueError {
@@ -286,6 +369,7 @@ impl Display for JobValueError {
             Self::EmptyRepoRef => write!(f, "repo ref must not be empty"),
             Self::EmptyRevision => write!(f, "revision must not be empty"),
             Self::EmptyArtifactRef => write!(f, "artifact ref must not be empty"),
+            Self::InvalidJobState(value) => write!(f, "invalid job state: {value}"),
         }
     }
 }

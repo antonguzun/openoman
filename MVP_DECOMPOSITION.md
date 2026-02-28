@@ -62,6 +62,8 @@
 - Running a minimal flow persists job and can reload it after process restart
 - Schema migration works on clean database
 
+**Checkpoint:** ✅ Epic 2 completed (SQLite persistence repositories, migrations, and transactional job/outbox writes are in place).
+
 ---
 
 ## Epic 3 — CLI interface (MVP surface)
