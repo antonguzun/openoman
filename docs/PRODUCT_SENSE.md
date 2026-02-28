@@ -1,0 +1,5 @@
+The goal of this service is to safely automate small, well-scoped code changes in Git repositories by running an untrusted coding agent inside a strongly isolated sandbox while keeping all privileged actions deterministic and controlled.
+
+The service clones a target repository, prepares an isolated workspace, and executes the agent in a disposable microVM where it can modify files and run a realistic local environment (including Docker Compose stacks) to verify behavior. The agent is not allowed to access secrets or perform privileged operations such as pushing code or creating pull requests.
+
+After the agent finishes, the service collects a patch, logs, and a report, then re-applies the patch to a clean clone and re-runs validation in a trusted context. Only if validation succeeds does the service push a branch and create a pull request through the configured VCS provider (starting with GitHub). Results are then published through a notification system designed for multiple channels, with integrations implemented as external plugins (Python/JS/TS) communicating via a stable JSON-based protocol.
