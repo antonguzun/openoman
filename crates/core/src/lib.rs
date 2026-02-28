@@ -1,4 +1,5 @@
 pub mod domain;
+pub mod persistence;
 
 /// Returns true if the repository bootstrap is wired correctly.
 pub fn bootstrap_ready() -> bool {
