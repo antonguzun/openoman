@@ -388,6 +388,29 @@ impl OutboxRepository {
         Ok(events)
     }
 
+    pub fn list_by_job(&self, job_id: &str) -> Result<Vec<OutboxEventRecord>, PersistenceError> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT event_id, job_id, event_type, payload, status
+             FROM outbox_events WHERE job_id = ?1 ORDER BY event_id",
+        )?;
+        let rows = stmt.query_map(params![job_id], |row| {
+            Ok(OutboxEventRecord {
+                event_id: row.get(0)?,
+                job_id: row.get(1)?,
+                event_type: row.get(2)?,
+                payload: row.get(3)?,
+                status: OutboxStatus::parse(&row.get::<_, String>(4)?),
+            })
+        })?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
     pub fn update_status(
         &self,
         event_id: &str,
