@@ -1,3 +1,5 @@
+pub mod domain;
+
 /// Returns true if the repository bootstrap is wired correctly.
 pub fn bootstrap_ready() -> bool {
     true

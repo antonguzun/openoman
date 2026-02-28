@@ -42,6 +42,8 @@
 - Domain layer compiles with tests covering valid/invalid transitions
 - Domain events can be produced from state changes (even if not yet persisted)
 
+**Checkpoint:** ✅ Epic 1 completed (core domain model, state machine, and transition event coverage implemented).
+
 ---
 
 ## Epic 2 — Persistence layer (SQLite) with transactional state changes
