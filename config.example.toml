@@ -1,0 +1,19 @@
+[core]
+# Path to SQLite database file used by the core service.
+database_path = "./data/openoman.db"
+
+[git]
+# Base directory where trusted clones are stored.
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+# Placeholder values for future microVM resource controls.
+timeout_seconds = 1800
+memory_mb = 2048
+cpu_cores = 2
+
+[publishing]
+# Placeholder GitHub settings for future publish support.
+provider = "github"
+repo_owner = "example"
+repo_name = "example-repo"

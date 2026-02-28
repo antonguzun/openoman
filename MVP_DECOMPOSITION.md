@@ -22,6 +22,8 @@
 - `cargo test`, `cargo fmt --check`, `cargo clippy` pass locally
 - GitHub Actions runs on PR and main branch and is green
 
+**Checkpoint:** ✅ Epic 0 completed (repository bootstrap and CI baseline established).
+
 ---
 
 ## Epic 1 — Core domain model (DDD) and state machine
