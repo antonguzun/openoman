@@ -7,12 +7,14 @@ fn write_config(root: &Path) -> String {
     let config_path = root.join("config.toml");
     let db_path = root.join("openoman.sqlite");
     let workspace_path = root.join("workspaces");
+    let sandbox_runtime_path = root.join("sandbox-runtime");
     fs::write(
         &config_path,
         format!(
-            "[core]\ndatabase_path = \"{}\"\n\n[git]\ntrusted_workspace_dir = \"{}\"\n",
+            "[core]\ndatabase_path = \"{}\"\n\n[git]\ntrusted_workspace_dir = \"{}\"\n\n[sandbox]\nruntime_dir = \"{}\"\n",
             db_path.display().to_string().replace('\\', "\\\\"),
             workspace_path.display().to_string().replace('\\', "\\\\"),
+            sandbox_runtime_path.display().to_string().replace('\\', "\\\\"),
         ),
     )
     .expect("write config");
@@ -127,6 +129,9 @@ fn submit_then_run_prepares_git_workspaces() {
 
     assert!(artifacts_stdout.contains("workspace.trusted_clone"));
     assert!(artifacts_stdout.contains("workspace.sandbox"));
+    assert!(artifacts_stdout.contains("sandbox.patch"));
+    assert!(artifacts_stdout.contains("sandbox.report"));
+    assert!(artifacts_stdout.contains("sandbox.logs"));
     assert!(artifacts_stdout.contains(&trusted_dir.display().to_string()));
     assert!(artifacts_stdout.contains(&sandbox_dir.display().to_string()));
 }
