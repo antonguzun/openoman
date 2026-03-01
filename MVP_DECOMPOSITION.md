@@ -151,24 +151,17 @@
 
 ---
 
-## Epic 6 — Agent execution contract inside sandbox (compose + logs)
+## Epic 6 — Agent execution contract inside sandbox
 
-- Define the minimal “agent contract” inside the guest:
-  - Input: workspace path + instruction text
-  - Output: patch (unified diff), report text, logs
-- Implement initial agent stub (not LLM-based yet):
-  - Example: modify a known file and run `compose` commands (or simulate)
-- Add compose support in guest:
-  - `compose up`, `compose logs`, `compose down`
-  - Capture logs with size limits and exit codes
-- Add a sample compose project for testing:
-  - Minimal DB container + app container (or two trivial services)
+- Add interface for excuting agents in sandbox (codex, cursor-cli, claude cli, etc)
+- Add config section for agent
+- Implement codex execution from sandbox
 - Ensure network controls are compatible:
   - egress via proxy/mirror (even if proxy is not yet fully implemented)
 
 **Acceptance:**
 
-- Sandbox job can run a compose stack and return logs + patch to host
+- Sandbox job can run an agent, retrive logs + patch to host
 
 ---
 
