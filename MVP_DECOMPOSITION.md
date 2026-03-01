@@ -85,6 +85,8 @@
 - User can create a job and inspect it purely via CLI
 - Config errors are readable and deterministic
 
+**Checkpoint:** ✅ Epic 3 completed (CLI commands, config loading with env override, and CLI e2e coverage are in place).
+
 ---
 
 ## Epic 4 — Git operations (trusted clone/workspaces)

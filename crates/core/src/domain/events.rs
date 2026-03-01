@@ -38,3 +38,18 @@ pub enum JobEvent {
         reason: String,
     },
 }
+
+impl JobEvent {
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            Self::JobSubmitted { .. } => "job.submitted",
+            Self::JobAttemptStarted { .. } => "job.attempt_started",
+            Self::ArtifactsCollected { .. } => "job.artifacts_collected",
+            Self::ValidationSucceeded { .. } => "job.validation_succeeded",
+            Self::ValidationFailed { .. } => "job.validation_failed",
+            Self::PullRequestCreated { .. } => "job.pull_request_created",
+            Self::JobSucceeded { .. } => "job.succeeded",
+            Self::JobFailed { .. } => "job.failed",
+        }
+    }
+}
