@@ -1,9 +1,14 @@
-use std::{ffi::OsStr, fs, path::Path, process::Command as StdCommand};
+use std::{
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+    process::Command as StdCommand,
+};
 
 use assert_cmd::Command;
 use tempfile::TempDir;
 
-fn write_config(root: &Path) -> String {
+fn write_config(root: &Path, codex_bin: &Path) -> String {
     let config_path = root.join("config.toml");
     let db_path = root.join("openoman.sqlite");
     let workspace_path = root.join("workspaces");
@@ -11,10 +16,11 @@ fn write_config(root: &Path) -> String {
     fs::write(
         &config_path,
         format!(
-            "[core]\ndatabase_path = \"{}\"\n\n[git]\ntrusted_workspace_dir = \"{}\"\n\n[sandbox]\nruntime_dir = \"{}\"\n",
+            "[core]\ndatabase_path = \"{}\"\n\n[git]\ntrusted_workspace_dir = \"{}\"\n\n[sandbox]\nruntime_dir = \"{}\"\n\n[agent]\nprovider = \"codex\"\ncodex_bin = \"{}\"\n",
             db_path.display().to_string().replace('\\', "\\\\"),
             workspace_path.display().to_string().replace('\\', "\\\\"),
             sandbox_runtime_path.display().to_string().replace('\\', "\\\\"),
+            codex_bin.display().to_string().replace('\\', "\\\\"),
         ),
     )
     .expect("write config");
@@ -28,7 +34,8 @@ fn cli_cmd() -> Command {
 #[test]
 fn submit_then_status_reports_queued_state() {
     let temp = TempDir::new().expect("tempdir");
-    let config = write_config(temp.path());
+    let fake_codex = write_fake_codex(temp.path());
+    let config = write_config(temp.path(), &fake_codex);
 
     let mut submit = cli_cmd();
     let submit_output = submit
@@ -65,37 +72,14 @@ fn submit_then_status_reports_queued_state() {
 }
 
 #[test]
-fn submit_then_run_prepares_git_workspaces() {
+fn submit_then_run_persists_canonical_artifacts() {
     let temp = TempDir::new().expect("tempdir");
     let fixture_repo = temp.path().join("fixture-repo");
+    let fake_codex = write_fake_codex(temp.path());
     init_fixture_repo(&fixture_repo);
-    let config = write_config(temp.path());
+    let config = write_config(temp.path(), &fake_codex);
 
-    let mut submit = cli_cmd();
-    let submit_output = submit
-        .args([
-            "--config",
-            &config,
-            "submit",
-            "--repo",
-            &fixture_repo.display().to_string(),
-            "--revision",
-            "main",
-            "--instruction",
-            "create a patch",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    let submit_stdout = String::from_utf8(submit_output).expect("utf8 output");
-    let job_id = submit_stdout
-        .trim()
-        .strip_prefix("job_id=")
-        .expect("job id output")
-        .to_string();
+    let job_id = submit_job(&config, &fixture_repo, "add empty line in readme");
 
     let mut run = cli_cmd();
     run.args(["--config", &config, "run", &job_id])
@@ -103,7 +87,7 @@ fn submit_then_run_prepares_git_workspaces() {
         .success()
         .stdout(format!("job {job_id} finished with state=succeeded\n"));
 
-    let sandbox_dir = temp
+    let sandbox_input_dir = temp
         .path()
         .join("workspaces")
         .join(&job_id)
@@ -113,13 +97,23 @@ fn submit_then_run_prepares_git_workspaces() {
         .join("workspaces")
         .join(&job_id)
         .join("trusted-clone");
+    let runtime_attempt_dir = temp
+        .path()
+        .join("sandbox-runtime")
+        .join("jobs")
+        .join(&job_id)
+        .join("attempt-1");
 
-    assert_eq!(
-        fs::read_to_string(sandbox_dir.join("README.md")).expect("sandbox readme"),
-        "main branch content\n"
-    );
-    assert!(!sandbox_dir.join(".git").exists());
+    assert!(sandbox_input_dir.join(".git").exists());
+    let sandbox_config =
+        fs::read_to_string(sandbox_input_dir.join(".git").join("config")).expect("sandbox config");
+    assert!(!sandbox_config.contains("[remote \"origin\"]"));
     assert!(trusted_dir.join(".git").exists());
+
+    let patch_path = runtime_attempt_dir.join("patch.diff");
+    let patch_contents = fs::read_to_string(&patch_path).expect("patch file");
+    assert!(patch_contents.contains("README.md"));
+    assert!(!patch_contents.contains("EPIC6_AGENT.txt"));
 
     let mut artifacts = cli_cmd();
     let artifacts_output = artifacts
@@ -132,12 +126,80 @@ fn submit_then_run_prepares_git_workspaces() {
     let artifacts_stdout = String::from_utf8(artifacts_output).expect("utf8 artifacts output");
 
     assert!(artifacts_stdout.contains("workspace.trusted_clone"));
-    assert!(artifacts_stdout.contains("workspace.sandbox"));
+    assert!(artifacts_stdout.contains("workspace.sandbox_input"));
+    assert!(artifacts_stdout.contains("workspace.sandbox_result"));
     assert!(artifacts_stdout.contains("sandbox.patch"));
     assert!(artifacts_stdout.contains("sandbox.report"));
     assert!(artifacts_stdout.contains("sandbox.logs"));
     assert!(artifacts_stdout.contains(&trusted_dir.display().to_string()));
-    assert!(artifacts_stdout.contains(&sandbox_dir.display().to_string()));
+    assert!(artifacts_stdout.contains(&sandbox_input_dir.display().to_string()));
+    assert!(artifacts_stdout.contains(
+        &runtime_attempt_dir
+            .join("workspace-result")
+            .display()
+            .to_string()
+    ));
+}
+
+#[test]
+fn logs_print_sandbox_log_contents_when_present() {
+    let temp = TempDir::new().expect("tempdir");
+    let fixture_repo = temp.path().join("fixture-repo");
+    let fake_codex = write_fake_codex(temp.path());
+    init_fixture_repo(&fixture_repo);
+    let config = write_config(temp.path(), &fake_codex);
+
+    let job_id = submit_job(&config, &fixture_repo, "add empty line in readme");
+
+    let mut run = cli_cmd();
+    run.args(["--config", &config, "run", &job_id])
+        .assert()
+        .success();
+
+    let mut logs = cli_cmd();
+    logs.args(["--config", &config, "logs", &job_id])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("fake codex applied instruction"))
+        .stdout(predicates::str::contains(
+            "instruction: add empty line in readme",
+        ));
+}
+
+#[test]
+fn failing_sandbox_attempt_persists_artifacts_and_marks_job_failed() {
+    let temp = TempDir::new().expect("tempdir");
+    let fixture_repo = temp.path().join("fixture-repo");
+    let fake_codex = write_fake_codex(temp.path());
+    init_fixture_repo(&fixture_repo);
+    let config = write_config(temp.path(), &fake_codex);
+
+    let job_id = submit_job(&config, &fixture_repo, "fail after touching readme");
+
+    let mut run = cli_cmd();
+    run.args(["--config", &config, "run", &job_id])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("sandbox attempt failed"));
+
+    let mut status = cli_cmd();
+    status
+        .args(["--config", &config, "status", &job_id])
+        .assert()
+        .success()
+        .stdout(format!("job_id={job_id}\nstate=failed\nattempts=1\n"));
+
+    let attempt_dir = temp
+        .path()
+        .join("sandbox-runtime")
+        .join("jobs")
+        .join(&job_id)
+        .join("attempt-1");
+    let patch_contents =
+        fs::read_to_string(attempt_dir.join("patch.diff")).expect("patch exists after failure");
+    assert!(patch_contents.contains("README.md"));
+    assert!(attempt_dir.join("logs.txt").exists());
+    assert!(attempt_dir.join("report.txt").exists());
 }
 
 #[test]
@@ -161,6 +223,103 @@ fn missing_config_path_is_deterministic() {
     ));
 }
 
+fn submit_job(config: &str, repo_path: &Path, instruction: &str) -> String {
+    let mut submit = cli_cmd();
+    let submit_output = submit
+        .args([
+            "--config",
+            config,
+            "submit",
+            "--repo",
+            &repo_path.display().to_string(),
+            "--revision",
+            "main",
+            "--instruction",
+            instruction,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let submit_stdout = String::from_utf8(submit_output).expect("utf8 output");
+    submit_stdout
+        .trim()
+        .strip_prefix("job_id=")
+        .expect("job id output")
+        .to_string()
+}
+
+fn write_fake_codex(root: &Path) -> PathBuf {
+    let script_path = root.join("fake-codex.sh");
+    fs::write(
+        &script_path,
+        r#"#!/usr/bin/env sh
+set -eu
+if [ "${1:-}" = "--version" ]; then
+  echo "codex-cli 0.0-test"
+  exit 0
+fi
+if [ "${1:-}" != "exec" ]; then
+  echo "unexpected invocation" >&2
+  exit 2
+fi
+shift
+workdir="."
+report=""
+instruction=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -C)
+      workdir="$2"
+      shift 2
+      ;;
+    -o)
+      report="$2"
+      shift 2
+      ;;
+    --full-auto|--color)
+      if [ "$1" = "--color" ]; then
+        shift 2
+      else
+        shift 1
+      fi
+      ;;
+    *)
+      instruction="$1"
+      shift 1
+      ;;
+  esac
+done
+if [ -z "$report" ]; then
+  echo "missing report path" >&2
+  exit 3
+fi
+cd "$workdir"
+if printf "%s" "$instruction" | grep -q "readme"; then
+  printf "\n" >> README.md
+else
+  printf "agent touched workspace\n" > AGENT_OUTPUT.txt
+fi
+if printf "%s" "$instruction" | grep -q "fail"; then
+  printf "fake codex failed: %s\n" "$instruction" > "../$report"
+  echo "fake codex simulated failure"
+  exit 9
+fi
+printf "fake codex completed: %s\n" "$instruction" > "../$report"
+echo "fake codex applied instruction"
+"#,
+    )
+    .expect("write fake codex");
+    fs::set_permissions(
+        &script_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("chmod fake codex");
+    script_path
+}
+
 fn init_fixture_repo(path: &Path) {
     fs::create_dir_all(path).expect("create fixture repo");
     git(path, ["init", "-b", "main"]);
@@ -168,11 +327,13 @@ fn init_fixture_repo(path: &Path) {
     git(path, ["config", "user.email", "openoman@example.com"]);
 
     fs::write(path.join("README.md"), "initial content\n").expect("write readme");
-    git(path, ["add", "README.md"]);
+    fs::write(path.join("notes.txt"), "first note\n").expect("write notes");
+    git(path, ["add", "README.md", "notes.txt"]);
     git(path, ["commit", "-m", "initial"]);
 
     fs::write(path.join("README.md"), "main branch content\n").expect("write main update");
-    git(path, ["add", "README.md"]);
+    fs::write(path.join("notes.txt"), "kept note\n").expect("write notes update");
+    git(path, ["add", "README.md", "notes.txt"]);
     git(path, ["commit", "-m", "main update"]);
 }
 
