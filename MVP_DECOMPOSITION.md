@@ -163,6 +163,8 @@
 
 - Sandbox job can run an agent, retrive logs + patch to host
 
+**Checkpoint:** ✅ Epic 6 completed
+
 ---
 
 ## Epic 7 — Artifact pipeline and storage (patch/report/logs)
@@ -181,6 +183,8 @@
 **Acceptance:**
 
 - After sandbox run, artifacts are stored and retrievable after restart
+
+**Checkpoint:** ✅ Epic 7 completed
 
 ---
 

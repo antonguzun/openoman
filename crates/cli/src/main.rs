@@ -10,9 +10,12 @@ use openoman_core::{
         job::{ArtifactRef, Job, JobId, JobState, RepoRef, Revision},
         plugin::{CheckProfile, PublishPolicy},
     },
-    git::{GitAdapter, PreparedWorkspace},
+    git::{write_canonical_patch, GitAdapter, PreparedWorkspace},
     persistence::{NewArtifactRecord, NewOutboxEvent, OutboxStatus, SqliteStore},
-    sandbox::{AttemptSpec, FirecrackerRunner, ResourceLimits, SandboxRunner},
+    sandbox::{
+        AgentExecutionSpec, AgentProvider, AttemptSpec, CollectedSandboxOutput, FirecrackerRunner,
+        ResourceLimits, SandboxRunner,
+    },
 };
 use serde::Deserialize;
 
@@ -34,6 +37,8 @@ enum Commands {
         repo: String,
         #[arg(long)]
         revision: String,
+        #[arg(long)]
+        instruction: String,
         #[arg(long, default_value = "unit")]
         check_profile: String,
         #[arg(long, default_value = "on_validation_success")]
@@ -61,6 +66,7 @@ struct FileConfig {
     core: Option<CoreConfig>,
     git: Option<GitConfig>,
     sandbox: Option<SandboxConfig>,
+    agent: Option<AgentConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,12 +84,32 @@ struct SandboxConfig {
     runtime_dir: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AgentConfig {
+    provider: Option<String>,
+    codex_bin: Option<String>,
+    egress_proxy_url: Option<String>,
+}
+
 #[derive(Debug)]
 struct AppConfig {
     database_path: PathBuf,
     trusted_workspace_dir: PathBuf,
     sandbox_runtime_dir: PathBuf,
+    agent: AgentRuntimeConfig,
 }
+
+#[derive(Debug)]
+struct AgentRuntimeConfig {
+    provider: AgentProvider,
+    codex_bin: String,
+    egress_proxy: Option<String>,
+}
+
+const LOG_LIMIT_BYTES: usize = 1024 * 1024;
+const REPORT_LIMIT_BYTES: usize = 256 * 1024;
+const PATCH_LIMIT_BYTES: u64 = 5 * 1024 * 1024;
+const TRUNCATION_MARKER: &str = "\n...[truncated by openoman]\n";
 
 fn main() {
     if let Err(err) = run() {
@@ -107,6 +133,7 @@ fn run() -> Result<(), String> {
         Commands::Submit {
             repo,
             revision,
+            instruction,
             check_profile,
             publish_policy,
         } => {
@@ -117,7 +144,14 @@ fn run() -> Result<(), String> {
             let publish_policy =
                 PublishPolicy::parse(&publish_policy).map_err(|e| e.to_string())?;
 
-            let (job, event) = Job::submit(id, repo_ref, revision, check_profile, publish_policy);
+            let (job, event) = Job::submit(
+                id,
+                repo_ref,
+                revision,
+                instruction,
+                check_profile,
+                publish_policy,
+            );
             jobs.create(&job).map_err(|e| e.to_string())?;
             store
                 .outbox()
@@ -158,18 +192,24 @@ fn run() -> Result<(), String> {
                 })?;
             let artifact_records = build_workspace_artifact_records(job.id.as_str(), &prepared)?;
             let mut all_artifact_records = artifact_records;
+            let attempt_id = 1;
 
             let mut runner = FirecrackerRunner::new(&config.sandbox_runtime_dir);
             let attempt_spec = AttemptSpec {
                 job_id: job.id.as_str().to_string(),
-                attempt_id: 1,
+                attempt_id,
                 workspace_dir: prepared.sandbox_workspace_dir.clone(),
-                instruction: "mvp smoke sandbox run".to_string(),
+                instruction: job.instruction.clone(),
                 limits: ResourceLimits {
                     vcpu_count: 1,
                     memory_mib: 512,
                     disk_quota_bytes: 2 * 1024 * 1024 * 1024,
                     timeout_secs: 30,
+                },
+                agent: AgentExecutionSpec {
+                    provider: config.agent.provider,
+                    codex_bin: config.agent.codex_bin.clone(),
+                    egress_proxy: config.agent.egress_proxy.clone(),
                 },
             };
 
@@ -177,41 +217,100 @@ fn run() -> Result<(), String> {
                 .start(attempt_spec)
                 .map_err(|e| format!("failed to start sandbox attempt: {e}"))?;
 
+            job.start_attempt(attempt_id).map_err(|e| e.to_string())?;
+
             let wait_result = runner
                 .wait(&handle)
                 .map_err(|e| format!("failed while waiting for sandbox attempt: {e}"))?;
-            if wait_result.timed_out {
-                let _ = runner.stop(&handle);
-                return Err(format!(
+
+            let collected = runner
+                .collect_output(&handle, job.id.as_str(), attempt_id)
+                .map_err(|e| format!("failed to collect sandbox output: {e}"));
+            let stop_result = runner
+                .stop(&handle)
+                .map_err(|e| format!("failed to stop sandbox attempt: {e}"));
+
+            let mut failure_reason = if wait_result.timed_out {
+                Some(format!(
                     "sandbox attempt timed out for job {}",
                     job.id.as_str()
-                ));
-            }
-            if !wait_result.success {
-                let _ = runner.stop(&handle);
-                return Err(format!(
+                ))
+            } else if !wait_result.success {
+                Some(format!(
                     "sandbox attempt failed for job {} with exit code {:?}",
                     job.id.as_str(),
                     wait_result.code
-                ));
+                ))
+            } else {
+                None
+            };
+
+            if let Ok(collected) = &collected {
+                match build_workspace_result_artifact_records(job.id.as_str(), collected) {
+                    Ok(records) => all_artifact_records.extend(records),
+                    Err(err) if failure_reason.is_none() => {
+                        failure_reason = Some(format!(
+                            "failed to fingerprint sandbox workspace result: {err}"
+                        ));
+                    }
+                    Err(_) => {}
+                }
+
+                if let Err(err) = prepare_text_artifact(&collected.logs_path, LOG_LIMIT_BYTES) {
+                    if failure_reason.is_none() {
+                        failure_reason = Some(format!("failed to prepare sandbox logs: {err}"));
+                    }
+                }
+                if let Err(err) = prepare_text_artifact(&collected.report_path, REPORT_LIMIT_BYTES)
+                {
+                    if failure_reason.is_none() {
+                        failure_reason = Some(format!("failed to prepare sandbox report: {err}"));
+                    }
+                }
+
+                match build_file_artifact_records(
+                    job.id.as_str(),
+                    &[
+                        ("sandbox.report", collected.report_path.as_path()),
+                        ("sandbox.logs", collected.logs_path.as_path()),
+                    ],
+                ) {
+                    Ok(records) => all_artifact_records.extend(records),
+                    Err(err) if failure_reason.is_none() => {
+                        failure_reason =
+                            Some(format!("failed to store sandbox text artifacts: {err}"));
+                    }
+                    Err(_) => {}
+                }
+
+                let patch_path = collected
+                    .report_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("patch.diff");
+                let patch_result = write_canonical_patch(
+                    &prepared.trusted_clone_dir,
+                    &collected.modified_workspace_dir,
+                    &patch_path,
+                )
+                .map_err(|e| format!("failed to generate canonical patch: {e}"))
+                .and_then(|_| ensure_patch_size(&patch_path))
+                .and_then(|_| {
+                    build_file_artifact_record(job.id.as_str(), "sandbox.patch", &patch_path)
+                });
+
+                match patch_result {
+                    Ok(record) => all_artifact_records.push(record),
+                    Err(err) if failure_reason.is_none() => failure_reason = Some(err),
+                    Err(_) => {}
+                }
+            } else if failure_reason.is_none() {
+                failure_reason = Some(collected.err().unwrap_or_default());
             }
 
-            let collected = runner
-                .collect_artifacts(&handle)
-                .map_err(|e| format!("failed to collect sandbox artifacts: {e}"))?;
-
-            all_artifact_records.extend(build_file_artifact_records(
-                job.id.as_str(),
-                &[
-                    ("sandbox.patch", collected.patch_path.as_path()),
-                    ("sandbox.report", collected.report_path.as_path()),
-                    ("sandbox.logs", collected.logs_path.as_path()),
-                ],
-            )?);
-
-            runner
-                .stop(&handle)
-                .map_err(|e| format!("failed to stop sandbox attempt: {e}"))?;
+            if let Err(err) = stop_result {
+                return Err(err);
+            }
 
             let artifact_refs = all_artifact_records
                 .iter()
@@ -219,17 +318,27 @@ fn run() -> Result<(), String> {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
 
-            job.start_attempt(1).map_err(|e| e.to_string())?;
-            job.collect_artifacts(artifact_refs)
-                .map_err(|e| e.to_string())?;
-            job.start_validation().map_err(|e| e.to_string())?;
-            job.mark_validation_succeeded().map_err(|e| e.to_string())?;
-            job.mark_pull_request_created("https://example.invalid/pr/1")
-                .map_err(|e| e.to_string())?;
-            job.mark_succeeded().map_err(|e| e.to_string())?;
+            if !artifact_refs.is_empty() {
+                job.collect_artifacts(artifact_refs)
+                    .map_err(|e| e.to_string())?;
+            }
+
+            if let Some(reason) = failure_reason.clone() {
+                job.mark_failed(reason.clone()).map_err(|e| e.to_string())?;
+            } else {
+                job.start_validation().map_err(|e| e.to_string())?;
+                job.mark_validation_succeeded().map_err(|e| e.to_string())?;
+                job.mark_pull_request_created("https://example.invalid/pr/1")
+                    .map_err(|e| e.to_string())?;
+                job.mark_succeeded().map_err(|e| e.to_string())?;
+            }
             store
                 .update_job_and_insert_artifacts(&job, &all_artifact_records)
                 .map_err(|e| e.to_string())?;
+
+            if let Some(reason) = failure_reason {
+                return Err(reason);
+            }
 
             println!(
                 "job {} finished with state={}",
@@ -248,20 +357,34 @@ fn run() -> Result<(), String> {
             println!("attempts={}", job.attempts.len());
         }
         Commands::Logs { job_id } => {
-            let events = store
-                .outbox()
+            let artifacts = store
+                .artifacts()
                 .list_by_job(&job_id)
                 .map_err(|e| e.to_string())?;
-            if events.is_empty() {
-                println!("no logs for {job_id}");
+            if let Some(log_artifact) = artifacts
+                .iter()
+                .find(|artifact| artifact.artifact_ref == "sandbox.logs")
+            {
+                let contents = fs::read_to_string(&log_artifact.path).map_err(|e| {
+                    format!("failed to read sandbox logs {}: {e}", log_artifact.path)
+                })?;
+                print!("{contents}");
             } else {
-                for event in events {
-                    println!(
-                        "{} {} {}",
-                        event.event_id,
-                        event.event_type,
-                        event.status.as_str()
-                    );
+                let events = store
+                    .outbox()
+                    .list_by_job(&job_id)
+                    .map_err(|e| e.to_string())?;
+                if events.is_empty() {
+                    println!("no logs for {job_id}");
+                } else {
+                    for event in events {
+                        println!(
+                            "{} {} {}",
+                            event.event_id,
+                            event.event_type,
+                            event.status.as_str()
+                        );
+                    }
                 }
             }
         }
@@ -321,11 +444,35 @@ impl AppConfig {
             .sandbox
             .and_then(|s| s.runtime_dir)
             .unwrap_or_else(|| "./workspaces/sandboxes".to_string());
+        let agent = parsed.agent.unwrap_or(AgentConfig {
+            provider: None,
+            codex_bin: None,
+            egress_proxy_url: None,
+        });
+        let provider = match agent
+            .provider
+            .unwrap_or_else(|| "codex".to_string())
+            .to_lowercase()
+            .as_str()
+        {
+            "codex" => AgentProvider::Codex,
+            other => {
+                return Err(format!(
+                    "unsupported agent provider '{}'; supported providers: codex",
+                    other
+                ))
+            }
+        };
 
         Ok(Self {
             database_path: PathBuf::from(database_path),
             trusted_workspace_dir: PathBuf::from(trusted_workspace_dir),
             sandbox_runtime_dir: PathBuf::from(sandbox_runtime_dir),
+            agent: AgentRuntimeConfig {
+                provider,
+                codex_bin: agent.codex_bin.unwrap_or_else(|| "codex".to_string()),
+                egress_proxy: agent.egress_proxy_url,
+            },
         })
     }
 }
@@ -350,10 +497,21 @@ fn build_workspace_artifact_records(
         )?,
         build_workspace_artifact_record(
             job_id,
-            "workspace.sandbox",
+            "workspace.sandbox_input",
             &prepared.sandbox_workspace_dir,
         )?,
     ])
+}
+
+fn build_workspace_result_artifact_records(
+    job_id: &str,
+    collected: &CollectedSandboxOutput,
+) -> Result<Vec<NewArtifactRecord>, String> {
+    Ok(vec![build_workspace_artifact_record(
+        job_id,
+        "workspace.sandbox_result",
+        &collected.modified_workspace_dir,
+    )?])
 }
 
 fn build_workspace_artifact_record(
@@ -402,6 +560,34 @@ fn build_file_artifact_record(
         size_bytes: i64::try_from(contents.len())
             .map_err(|_| format!("artifact file too large: {}", path.display()))?,
     })
+}
+
+fn prepare_text_artifact(path: &Path, limit_bytes: usize) -> Result<(), String> {
+    let contents = fs::read(path)
+        .map_err(|e| format!("failed to read artifact file {}: {e}", path.display()))?;
+    if contents.len() <= limit_bytes {
+        return Ok(());
+    }
+
+    let marker = TRUNCATION_MARKER.as_bytes();
+    let keep_len = limit_bytes.saturating_sub(marker.len());
+    let mut truncated = contents[..keep_len].to_vec();
+    truncated.extend_from_slice(marker);
+    fs::write(path, truncated)
+        .map_err(|e| format!("failed to write truncated artifact {}: {e}", path.display()))
+}
+
+fn ensure_patch_size(path: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(path)
+        .map_err(|e| format!("failed to stat patch artifact {}: {e}", path.display()))?;
+    if metadata.len() > PATCH_LIMIT_BYTES {
+        return Err(format!(
+            "canonical patch exceeds {} bytes at {}",
+            PATCH_LIMIT_BYTES,
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 struct TreeFingerprint {

@@ -24,14 +24,25 @@ pub struct AttemptSpec {
     pub workspace_dir: PathBuf,
     pub instruction: String,
     pub limits: ResourceLimits,
+    pub agent: AgentExecutionSpec,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentExecutionSpec {
+    pub provider: AgentProvider,
+    pub codex_bin: String,
+    pub egress_proxy: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentProvider {
+    Codex,
 }
 
 #[derive(Debug, Clone)]
 pub struct SandboxHandle {
     pub id: u64,
     pub run_dir: PathBuf,
-    pub host_workspace_copy: PathBuf,
-    pub host_artifacts_dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -42,8 +53,8 @@ pub struct SandboxExitStatus {
 }
 
 #[derive(Debug, Clone)]
-pub struct CollectedArtifacts {
-    pub patch_path: PathBuf,
+pub struct CollectedSandboxOutput {
+    pub modified_workspace_dir: PathBuf,
     pub report_path: PathBuf,
     pub logs_path: PathBuf,
 }
@@ -51,8 +62,12 @@ pub struct CollectedArtifacts {
 pub trait SandboxRunner {
     fn start(&mut self, spec: AttemptSpec) -> Result<SandboxHandle, SandboxError>;
     fn wait(&mut self, handle: &SandboxHandle) -> Result<SandboxExitStatus, SandboxError>;
-    fn collect_artifacts(&self, handle: &SandboxHandle)
-        -> Result<CollectedArtifacts, SandboxError>;
+    fn collect_output(
+        &self,
+        handle: &SandboxHandle,
+        job_id: &str,
+        attempt_id: u32,
+    ) -> Result<CollectedSandboxOutput, SandboxError>;
     fn stop(&mut self, handle: &SandboxHandle) -> Result<(), SandboxError>;
 }
 
@@ -142,18 +157,23 @@ impl FirecrackerRunner {
             self.next_handle_id,
             nonce
         ));
-        self.run_tar(
-            source,
-            &["-cf", archive.to_str().unwrap_or("tmp-copy.tar"), "."],
-        )?;
-        self.run_tar(
-            destination,
-            &["-xf", archive.to_str().unwrap_or("tmp-copy.tar")],
-        )?;
+        let archive_name = archive.to_str().unwrap_or("tmp-copy.tar");
+        let result = (|| {
+            self.run_tar(source, &["-cf", archive_name, "."])?;
+            self.run_tar(destination, &["-xf", archive_name])?;
+            Ok(())
+        })();
         if archive.exists() {
-            fs::remove_file(archive)?;
+            fs::remove_file(&archive)?;
         }
-        Ok(())
+        result
+    }
+
+    fn stable_output_dir(&self, job_id: &str, attempt_id: u32) -> PathBuf {
+        self.root_dir
+            .join("jobs")
+            .join(job_id)
+            .join(format!("attempt-{attempt_id}"))
     }
 }
 
@@ -174,43 +194,79 @@ impl SandboxRunner for FirecrackerRunner {
         let guest_dir = run_dir.join("guest");
         let guest_workspace = guest_dir.join("workspace");
         let guest_artifacts = guest_dir.join("artifacts");
-        let host_artifacts = self
-            .root_dir
-            .join("collected-artifacts")
-            .join(format!("handle-{}", handle_id));
         fs::create_dir_all(&guest_workspace)?;
         fs::create_dir_all(&guest_artifacts)?;
-        fs::create_dir_all(&host_artifacts)?;
 
         self.copy_tree_with_tar(&spec.workspace_dir, &guest_workspace)?;
 
         let script_path = guest_dir.join("run-smoke.sh");
         let mut script = fs::File::create(&script_path)?;
+        let quoted_instruction = shell_quote(&spec.instruction);
+        let quoted_codex_bin = shell_quote(&spec.agent.codex_bin);
+
         writeln!(script, "#!/usr/bin/env sh")?;
-        writeln!(script, "set -eu")?;
+        writeln!(script, "set -u")?;
+        writeln!(script, "agent_status=0")?;
         writeln!(script, "echo 'sandbox started' > artifacts/logs.txt")?;
         writeln!(
             script,
             "echo 'instruction: {}' >> artifacts/logs.txt",
             spec.instruction.replace('\'', "")
         )?;
+        if let Some(proxy) = &spec.agent.egress_proxy {
+            let sanitized = proxy.replace('\'', "");
+            writeln!(script, "export HTTPS_PROXY='{}'", sanitized)?;
+            writeln!(script, "export HTTP_PROXY='{}'", sanitized)?;
+            writeln!(
+                script,
+                "echo 'egress proxy configured: {}' >> artifacts/logs.txt",
+                sanitized
+            )?;
+        }
+        match spec.agent.provider {
+            AgentProvider::Codex => {
+                writeln!(
+                    script,
+                    "if command -v {} >/dev/null 2>&1; then",
+                    quoted_codex_bin
+                )?;
+                writeln!(
+                    script,
+                    "  {} --version >> artifacts/logs.txt 2>&1 || true",
+                    quoted_codex_bin
+                )?;
+                writeln!(
+                    script,
+                    "  {} exec --full-auto --color never -C workspace -o artifacts/report.txt {} >> artifacts/logs.txt 2>&1",
+                    quoted_codex_bin,
+                    quoted_instruction
+                )?;
+                writeln!(script, "  agent_status=$?")?;
+                writeln!(script, "  if [ \"$agent_status\" -ne 0 ]; then")?;
+                writeln!(
+                    script,
+                    "    echo \"codex execution failed with exit code ${{agent_status}}\" >> artifacts/logs.txt"
+                )?;
+                writeln!(script, "  fi")?;
+                writeln!(script, "else")?;
+                writeln!(script, "  agent_status=127")?;
+                writeln!(
+                    script,
+                    "  echo 'codex binary not found: {}' >> artifacts/logs.txt",
+                    spec.agent.codex_bin.replace('\'', "")
+                )?;
+                writeln!(script, "fi")?;
+            }
+        }
+
+        writeln!(script, "if [ ! -f artifacts/report.txt ]; then")?;
         writeln!(
             script,
-            "echo 'Epic 5 smoke run complete.' > artifacts/report.txt"
+            "  echo 'Sandbox execution completed without report output.' > artifacts/report.txt"
         )?;
-        writeln!(script, "echo '--- /dev/null' > artifacts/patch.diff")?;
-        writeln!(script, "echo '+++ EPIC5_SMOKE.txt' >> artifacts/patch.diff")?;
-        writeln!(script, "echo '@@ -0,0 +1 @@' >> artifacts/patch.diff")?;
-        writeln!(
-            script,
-            "echo '+epic5 smoke output for {}' >> artifacts/patch.diff",
-            spec.job_id
-        )?;
-        writeln!(
-            script,
-            "echo 'epic5 smoke output for {}' > workspace/EPIC5_SMOKE.txt",
-            spec.job_id
-        )?;
+        writeln!(script, "fi")?;
+        writeln!(script, "exit \"${{agent_status}}\"")?;
+
         fs::set_permissions(
             &script_path,
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -236,8 +292,6 @@ impl SandboxRunner for FirecrackerRunner {
         Ok(SandboxHandle {
             id: handle_id,
             run_dir,
-            host_workspace_copy: guest_workspace,
-            host_artifacts_dir: host_artifacts,
         })
     }
 
@@ -271,17 +325,28 @@ impl SandboxRunner for FirecrackerRunner {
         }
     }
 
-    fn collect_artifacts(
+    fn collect_output(
         &self,
         handle: &SandboxHandle,
-    ) -> Result<CollectedArtifacts, SandboxError> {
-        let guest_artifacts = handle.run_dir.join("guest").join("artifacts");
-        self.copy_tree_with_tar(&guest_artifacts, &handle.host_artifacts_dir)?;
+        job_id: &str,
+        attempt_id: u32,
+    ) -> Result<CollectedSandboxOutput, SandboxError> {
+        let output_dir = self.stable_output_dir(job_id, attempt_id);
+        if output_dir.exists() {
+            fs::remove_dir_all(&output_dir)?;
+        }
+        fs::create_dir_all(&output_dir)?;
 
-        Ok(CollectedArtifacts {
-            patch_path: handle.host_artifacts_dir.join("patch.diff"),
-            report_path: handle.host_artifacts_dir.join("report.txt"),
-            logs_path: handle.host_artifacts_dir.join("logs.txt"),
+        let guest_workspace = handle.run_dir.join("guest").join("workspace");
+        let guest_artifacts = handle.run_dir.join("guest").join("artifacts");
+        let modified_workspace_dir = output_dir.join("workspace-result");
+        self.copy_tree_with_tar(&guest_workspace, &modified_workspace_dir)?;
+        self.copy_tree_with_tar(&guest_artifacts, &output_dir)?;
+
+        Ok(CollectedSandboxOutput {
+            modified_workspace_dir,
+            report_path: output_dir.join("report.txt"),
+            logs_path: output_dir.join("logs.txt"),
         })
     }
 
@@ -301,6 +366,14 @@ impl SandboxRunner for FirecrackerRunner {
     }
 }
 
+fn shell_quote(input: &str) -> String {
+    if input.is_empty() {
+        return "''".to_string();
+    }
+
+    format!("'{}'", input.replace('\'', "'\"'\"'"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,9 +389,10 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_creates_and_collects_smoke_artifacts() {
+    fn lifecycle_collects_workspace_report_and_logs() {
         let temp = TempDir::new().expect("tempdir");
         let workspace = temp.path().join("workspace");
+        let fake_codex = write_fake_codex(temp.path());
         fs::create_dir_all(&workspace).expect("create workspace");
         fs::write(workspace.join("README.md"), "hello\n").expect("write workspace file");
 
@@ -328,30 +402,46 @@ mod tests {
                 job_id: "job-1".to_string(),
                 attempt_id: 1,
                 workspace_dir: workspace,
-                instruction: "smoke".to_string(),
+                instruction: "append blank line to readme".to_string(),
                 limits: limits(5),
+                agent: AgentExecutionSpec {
+                    provider: AgentProvider::Codex,
+                    codex_bin: fake_codex.display().to_string(),
+                    egress_proxy: Some("http://proxy.internal:3128".to_string()),
+                },
             })
             .expect("start");
 
         let status = runner.wait(&handle).expect("wait");
         assert!(status.success);
-        let artifacts = runner.collect_artifacts(&handle).expect("collect");
+        let output = runner
+            .collect_output(&handle, "job-1", 1)
+            .expect("collect output");
 
-        assert!(artifacts.patch_path.exists());
-        assert!(artifacts.report_path.exists());
-        assert!(artifacts.logs_path.exists());
+        assert!(output.modified_workspace_dir.exists());
+        assert!(output.report_path.exists());
+        assert!(output.logs_path.exists());
 
-        let report = fs::read_to_string(&artifacts.report_path).expect("report");
-        assert!(report.contains("Epic 5 smoke run complete."));
+        let report = fs::read_to_string(&output.report_path).expect("report");
+        assert!(report.contains("fake codex completed"));
+        let logs = fs::read_to_string(&output.logs_path).expect("logs");
+        assert!(logs.contains("egress proxy configured: http://proxy.internal:3128"));
+        assert!(logs.contains("codex-cli 0.0-test"));
+        assert_eq!(
+            fs::read_to_string(output.modified_workspace_dir.join("README.md")).expect("readme"),
+            "hello\n\n"
+        );
 
         runner.stop(&handle).expect("stop");
         assert!(!handle.run_dir.exists());
+        assert!(output.modified_workspace_dir.exists());
     }
 
     #[test]
     fn wait_marks_timeout_when_process_exceeds_limit() {
         let temp = TempDir::new().expect("tempdir");
         let workspace = temp.path().join("workspace");
+        let fake_codex = write_fake_codex(temp.path());
         fs::create_dir_all(&workspace).expect("create workspace");
         fs::write(workspace.join("README.md"), "hello\n").expect("write workspace file");
 
@@ -363,10 +453,14 @@ mod tests {
                 workspace_dir: workspace,
                 instruction: "smoke".to_string(),
                 limits: limits(1),
+                agent: AgentExecutionSpec {
+                    provider: AgentProvider::Codex,
+                    codex_bin: fake_codex.display().to_string(),
+                    egress_proxy: None,
+                },
             })
             .expect("start");
 
-        // Replace running process with a long sleep by starting new shell in-place for timeout verification.
         if let Some(state) = runner.running.get_mut(&handle.id) {
             let _ = state.child.kill();
             let _ = state.child.wait();
@@ -382,5 +476,71 @@ mod tests {
         assert!(status.timed_out);
         assert!(!status.success);
         runner.stop(&handle).expect("stop");
+    }
+
+    fn write_fake_codex(root: &Path) -> PathBuf {
+        let script_path = root.join("fake-codex.sh");
+        fs::write(
+            &script_path,
+            r#"#!/usr/bin/env sh
+set -eu
+if [ "${1:-}" = "--version" ]; then
+  echo "codex-cli 0.0-test"
+  exit 0
+fi
+if [ "${1:-}" != "exec" ]; then
+  echo "unexpected invocation" >&2
+  exit 2
+fi
+shift
+workdir="."
+report=""
+instruction=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -C)
+      workdir="$2"
+      shift 2
+      ;;
+    -o)
+      report="$2"
+      shift 2
+      ;;
+    --full-auto|--color)
+      if [ "$1" = "--color" ]; then
+        shift 2
+      else
+        shift 1
+      fi
+      ;;
+    *)
+      instruction="$1"
+      shift 1
+      ;;
+  esac
+done
+if [ -z "$report" ]; then
+  echo "missing report path" >&2
+  exit 3
+fi
+cd "$workdir"
+if printf "%s" "$instruction" | grep -q fail; then
+  printf "\n" >> README.md
+  printf "fake codex failed\n" > "../$report"
+  echo "simulated failure"
+  exit 9
+fi
+printf "\n" >> README.md
+printf "fake codex completed: %s\n" "$instruction" > "../$report"
+echo "fake codex applied instruction"
+"#,
+        )
+        .expect("write fake codex");
+        fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod fake codex");
+        script_path
     }
 }

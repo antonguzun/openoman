@@ -17,3 +17,11 @@ cpu_cores = 2
 provider = "github"
 repo_owner = "antonguzun"
 repo_name = "git@github.com:antonguzun/tsight-agent.git"
+
+[agent]
+# Agent provider executed inside sandbox. MVP supports only "codex".
+provider = "codex"
+# Binary looked up in sandbox PATH for Codex execution contract.
+codex_bin = "codex"
+# Optional proxy endpoint used for egress controls inside sandbox.
+# egress_proxy_url = "http://proxy.internal:3128"
