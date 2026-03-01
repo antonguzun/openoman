@@ -12,6 +12,7 @@ use openoman_core::{
     },
     git::{GitAdapter, PreparedWorkspace},
     persistence::{NewArtifactRecord, NewOutboxEvent, OutboxStatus, SqliteStore},
+    sandbox::{AttemptSpec, FirecrackerRunner, ResourceLimits, SandboxRunner},
 };
 use serde::Deserialize;
 
@@ -59,6 +60,7 @@ enum Commands {
 struct FileConfig {
     core: Option<CoreConfig>,
     git: Option<GitConfig>,
+    sandbox: Option<SandboxConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,10 +73,16 @@ struct GitConfig {
     trusted_workspace_dir: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SandboxConfig {
+    runtime_dir: Option<String>,
+}
+
 #[derive(Debug)]
 struct AppConfig {
     database_path: PathBuf,
     trusted_workspace_dir: PathBuf,
+    sandbox_runtime_dir: PathBuf,
 }
 
 fn main() {
@@ -149,7 +157,63 @@ fn run() -> Result<(), String> {
                     )
                 })?;
             let artifact_records = build_workspace_artifact_records(job.id.as_str(), &prepared)?;
-            let artifact_refs = artifact_records
+            let mut all_artifact_records = artifact_records;
+
+            let mut runner = FirecrackerRunner::new(&config.sandbox_runtime_dir);
+            let attempt_spec = AttemptSpec {
+                job_id: job.id.as_str().to_string(),
+                attempt_id: 1,
+                workspace_dir: prepared.sandbox_workspace_dir.clone(),
+                instruction: "mvp smoke sandbox run".to_string(),
+                limits: ResourceLimits {
+                    vcpu_count: 1,
+                    memory_mib: 512,
+                    disk_quota_bytes: 2 * 1024 * 1024 * 1024,
+                    timeout_secs: 30,
+                },
+            };
+
+            let handle = runner
+                .start(attempt_spec)
+                .map_err(|e| format!("failed to start sandbox attempt: {e}"))?;
+
+            let wait_result = runner
+                .wait(&handle)
+                .map_err(|e| format!("failed while waiting for sandbox attempt: {e}"))?;
+            if wait_result.timed_out {
+                let _ = runner.stop(&handle);
+                return Err(format!(
+                    "sandbox attempt timed out for job {}",
+                    job.id.as_str()
+                ));
+            }
+            if !wait_result.success {
+                let _ = runner.stop(&handle);
+                return Err(format!(
+                    "sandbox attempt failed for job {} with exit code {:?}",
+                    job.id.as_str(),
+                    wait_result.code
+                ));
+            }
+
+            let collected = runner
+                .collect_artifacts(&handle)
+                .map_err(|e| format!("failed to collect sandbox artifacts: {e}"))?;
+
+            all_artifact_records.extend(build_file_artifact_records(
+                job.id.as_str(),
+                &[
+                    ("sandbox.patch", collected.patch_path.as_path()),
+                    ("sandbox.report", collected.report_path.as_path()),
+                    ("sandbox.logs", collected.logs_path.as_path()),
+                ],
+            )?);
+
+            runner
+                .stop(&handle)
+                .map_err(|e| format!("failed to stop sandbox attempt: {e}"))?;
+
+            let artifact_refs = all_artifact_records
                 .iter()
                 .map(|artifact| ArtifactRef::new(artifact.artifact_ref.clone()))
                 .collect::<Result<Vec<_>, _>>()
@@ -164,7 +228,7 @@ fn run() -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             job.mark_succeeded().map_err(|e| e.to_string())?;
             store
-                .update_job_and_insert_artifacts(&job, &artifact_records)
+                .update_job_and_insert_artifacts(&job, &all_artifact_records)
                 .map_err(|e| e.to_string())?;
 
             println!(
@@ -253,10 +317,15 @@ impl AppConfig {
             .git
             .and_then(|g| g.trusted_workspace_dir)
             .unwrap_or_else(|| "./workspaces/trusted".to_string());
+        let sandbox_runtime_dir = parsed
+            .sandbox
+            .and_then(|s| s.runtime_dir)
+            .unwrap_or_else(|| "./workspaces/sandboxes".to_string());
 
         Ok(Self {
             database_path: PathBuf::from(database_path),
             trusted_workspace_dir: PathBuf::from(trusted_workspace_dir),
+            sandbox_runtime_dir: PathBuf::from(sandbox_runtime_dir),
         })
     }
 }
@@ -301,6 +370,37 @@ fn build_workspace_artifact_record(
         path: path.display().to_string(),
         content_hash: fingerprint.content_hash,
         size_bytes: fingerprint.size_bytes,
+    })
+}
+
+fn build_file_artifact_records(
+    job_id: &str,
+    inputs: &[(&str, &Path)],
+) -> Result<Vec<NewArtifactRecord>, String> {
+    inputs
+        .iter()
+        .map(|(artifact_ref, path)| build_file_artifact_record(job_id, artifact_ref, path))
+        .collect()
+}
+
+fn build_file_artifact_record(
+    job_id: &str,
+    artifact_ref: &str,
+    path: &Path,
+) -> Result<NewArtifactRecord, String> {
+    let contents = fs::read(path)
+        .map_err(|e| format!("failed to read artifact file {}: {e}", path.display()))?;
+    let mut hasher = Fnv1a::new();
+    hasher.update(&contents);
+
+    Ok(NewArtifactRecord {
+        job_id: job_id.to_string(),
+        artifact_ref: artifact_ref.to_string(),
+        kind: artifact_ref.to_string(),
+        path: path.display().to_string(),
+        content_hash: hasher.finish_hex(),
+        size_bytes: i64::try_from(contents.len())
+            .map_err(|_| format!("artifact file too large: {}", path.display()))?,
     })
 }
 

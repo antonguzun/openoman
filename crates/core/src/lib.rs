@@ -1,6 +1,7 @@
 pub mod domain;
 pub mod git;
 pub mod persistence;
+pub mod sandbox;
 
 /// Returns true if the repository bootstrap is wired correctly.
 pub fn bootstrap_ready() -> bool {
