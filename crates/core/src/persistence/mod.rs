@@ -145,6 +145,21 @@ impl SqliteStore {
         tx.commit()?;
         Ok(())
     }
+
+    pub fn update_job_and_insert_artifacts(
+        &self,
+        job: &Job,
+        artifacts: &[NewArtifactRecord],
+    ) -> Result<(), PersistenceError> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+        upsert_job(&tx, job)?;
+        for artifact in artifacts {
+            insert_artifact_tx(&tx, artifact)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 pub struct JobRepository {
@@ -481,18 +496,7 @@ pub struct ArtifactRecord {
 impl ArtifactsRepository {
     pub fn insert(&self, artifact: &NewArtifactRecord) -> Result<(), PersistenceError> {
         let conn = self.conn.borrow();
-        conn.execute(
-            "INSERT INTO artifacts(job_id, artifact_ref, kind, path, content_hash, size_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                artifact.job_id,
-                artifact.artifact_ref,
-                artifact.kind,
-                artifact.path,
-                artifact.content_hash,
-                artifact.size_bytes,
-            ],
-        )?;
+        insert_artifact_conn(&conn, artifact)?;
         Ok(())
     }
 
@@ -519,6 +523,44 @@ impl ArtifactsRepository {
 
         Ok(artifacts)
     }
+}
+
+fn insert_artifact_tx(
+    tx: &Transaction<'_>,
+    artifact: &NewArtifactRecord,
+) -> Result<(), PersistenceError> {
+    tx.execute(
+        "INSERT INTO artifacts(job_id, artifact_ref, kind, path, content_hash, size_bytes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            &artifact.job_id,
+            &artifact.artifact_ref,
+            &artifact.kind,
+            &artifact.path,
+            &artifact.content_hash,
+            artifact.size_bytes,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_artifact_conn(
+    conn: &Connection,
+    artifact: &NewArtifactRecord,
+) -> Result<(), PersistenceError> {
+    conn.execute(
+        "INSERT INTO artifacts(job_id, artifact_ref, kind, path, content_hash, size_bytes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            &artifact.job_id,
+            &artifact.artifact_ref,
+            &artifact.kind,
+            &artifact.path,
+            &artifact.content_hash,
+            artifact.size_bytes,
+        ],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

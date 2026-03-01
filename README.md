@@ -22,3 +22,13 @@ The `openoman` binary provides a minimal local workflow against SQLite:
 - `openoman --config ./config.toml result <job_id>`
 
 Configuration is loaded from `--config` and can be overridden with `OPENOMAN_DATABASE_PATH`.
+
+## Core Git workspace preparation (Epic 4)
+
+`openoman-core` now includes a trusted `GitAdapter` that can:
+
+- clone a repository into a trusted workspace directory
+- checkout a branch name or commit SHA
+- export a sandbox workspace copy without `.git` metadata
+
+See `crates/core/src/git.rs` for the adapter API and tests.
