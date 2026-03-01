@@ -24,6 +24,19 @@ pub struct AttemptSpec {
     pub workspace_dir: PathBuf,
     pub instruction: String,
     pub limits: ResourceLimits,
+    pub agent: AgentExecutionSpec,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentExecutionSpec {
+    pub provider: AgentProvider,
+    pub codex_bin: String,
+    pub egress_proxy: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentProvider {
+    Codex,
 }
 
 #[derive(Debug, Clone)]
@@ -194,21 +207,58 @@ impl SandboxRunner for FirecrackerRunner {
             "echo 'instruction: {}' >> artifacts/logs.txt",
             spec.instruction.replace('\'', "")
         )?;
+        if let Some(proxy) = &spec.agent.egress_proxy {
+            let sanitized = proxy.replace('\'', "");
+            writeln!(script, "export HTTPS_PROXY='{}'", sanitized)?;
+            writeln!(script, "export HTTP_PROXY='{}'", sanitized)?;
+            writeln!(
+                script,
+                "echo 'egress proxy configured: {}' >> artifacts/logs.txt",
+                sanitized
+            )?;
+        }
+        match spec.agent.provider {
+            AgentProvider::Codex => {
+                let codex_bin = spec.agent.codex_bin.replace('\'', "");
+                writeln!(
+                    script,
+                    "if command -v '{}' >/dev/null 2>&1; then",
+                    codex_bin
+                )?;
+                writeln!(
+                    script,
+                    "  '{}' --version >> artifacts/logs.txt 2>&1 || true",
+                    codex_bin
+                )?;
+                writeln!(
+                    script,
+                    "  echo 'codex execution placeholder for instruction: {}' >> artifacts/logs.txt",
+                    spec.instruction.replace('\'', "")
+                )?;
+                writeln!(script, "else")?;
+                writeln!(
+                    script,
+                    "  echo 'codex binary not found: {}' >> artifacts/logs.txt",
+                    codex_bin
+                )?;
+                writeln!(script, "fi")?;
+            }
+        }
         writeln!(
             script,
-            "echo 'Epic 5 smoke run complete.' > artifacts/report.txt"
+            "echo 'Epic 6 agent run complete.' > artifacts/report.txt"
         )?;
         writeln!(script, "echo '--- /dev/null' > artifacts/patch.diff")?;
-        writeln!(script, "echo '+++ EPIC5_SMOKE.txt' >> artifacts/patch.diff")?;
+        writeln!(script, "echo '+++ EPIC6_AGENT.txt' >> artifacts/patch.diff")?;
         writeln!(script, "echo '@@ -0,0 +1 @@' >> artifacts/patch.diff")?;
         writeln!(
             script,
-            "echo '+epic5 smoke output for {}' >> artifacts/patch.diff",
+            "echo '+epic6 agent output for {}' >> artifacts/patch.diff",
             spec.job_id
         )?;
         writeln!(
             script,
-            "echo 'epic5 smoke output for {}' > workspace/EPIC5_SMOKE.txt",
+            "echo 'epic6 agent output for {}' > workspace/EPIC6_AGENT.txt",
             spec.job_id
         )?;
         fs::set_permissions(
@@ -330,6 +380,11 @@ mod tests {
                 workspace_dir: workspace,
                 instruction: "smoke".to_string(),
                 limits: limits(5),
+                agent: AgentExecutionSpec {
+                    provider: AgentProvider::Codex,
+                    codex_bin: "codex".to_string(),
+                    egress_proxy: Some("http://proxy.internal:3128".to_string()),
+                },
             })
             .expect("start");
 
@@ -342,7 +397,9 @@ mod tests {
         assert!(artifacts.logs_path.exists());
 
         let report = fs::read_to_string(&artifacts.report_path).expect("report");
-        assert!(report.contains("Epic 5 smoke run complete."));
+        assert!(report.contains("Epic 6 agent run complete."));
+        let logs = fs::read_to_string(&artifacts.logs_path).expect("logs");
+        assert!(logs.contains("egress proxy configured: http://proxy.internal:3128"));
 
         runner.stop(&handle).expect("stop");
         assert!(!handle.run_dir.exists());
@@ -363,6 +420,11 @@ mod tests {
                 workspace_dir: workspace,
                 instruction: "smoke".to_string(),
                 limits: limits(1),
+                agent: AgentExecutionSpec {
+                    provider: AgentProvider::Codex,
+                    codex_bin: "codex".to_string(),
+                    egress_proxy: None,
+                },
             })
             .expect("start");
 

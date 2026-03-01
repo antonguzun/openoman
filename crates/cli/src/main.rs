@@ -12,7 +12,10 @@ use openoman_core::{
     },
     git::{GitAdapter, PreparedWorkspace},
     persistence::{NewArtifactRecord, NewOutboxEvent, OutboxStatus, SqliteStore},
-    sandbox::{AttemptSpec, FirecrackerRunner, ResourceLimits, SandboxRunner},
+    sandbox::{
+        AgentExecutionSpec, AgentProvider, AttemptSpec, FirecrackerRunner, ResourceLimits,
+        SandboxRunner,
+    },
 };
 use serde::Deserialize;
 
@@ -34,6 +37,8 @@ enum Commands {
         repo: String,
         #[arg(long)]
         revision: String,
+        #[arg(long)]
+        instruction: String,
         #[arg(long, default_value = "unit")]
         check_profile: String,
         #[arg(long, default_value = "on_validation_success")]
@@ -61,6 +66,7 @@ struct FileConfig {
     core: Option<CoreConfig>,
     git: Option<GitConfig>,
     sandbox: Option<SandboxConfig>,
+    agent: Option<AgentConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,11 +84,26 @@ struct SandboxConfig {
     runtime_dir: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AgentConfig {
+    provider: Option<String>,
+    codex_bin: Option<String>,
+    egress_proxy_url: Option<String>,
+}
+
 #[derive(Debug)]
 struct AppConfig {
     database_path: PathBuf,
     trusted_workspace_dir: PathBuf,
     sandbox_runtime_dir: PathBuf,
+    agent: AgentRuntimeConfig,
+}
+
+#[derive(Debug)]
+struct AgentRuntimeConfig {
+    provider: AgentProvider,
+    codex_bin: String,
+    egress_proxy: Option<String>,
 }
 
 fn main() {
@@ -107,6 +128,7 @@ fn run() -> Result<(), String> {
         Commands::Submit {
             repo,
             revision,
+            instruction,
             check_profile,
             publish_policy,
         } => {
@@ -117,7 +139,14 @@ fn run() -> Result<(), String> {
             let publish_policy =
                 PublishPolicy::parse(&publish_policy).map_err(|e| e.to_string())?;
 
-            let (job, event) = Job::submit(id, repo_ref, revision, check_profile, publish_policy);
+            let (job, event) = Job::submit(
+                id,
+                repo_ref,
+                revision,
+                instruction,
+                check_profile,
+                publish_policy,
+            );
             jobs.create(&job).map_err(|e| e.to_string())?;
             store
                 .outbox()
@@ -164,12 +193,17 @@ fn run() -> Result<(), String> {
                 job_id: job.id.as_str().to_string(),
                 attempt_id: 1,
                 workspace_dir: prepared.sandbox_workspace_dir.clone(),
-                instruction: "mvp smoke sandbox run".to_string(),
+                instruction: job.instruction.clone(),
                 limits: ResourceLimits {
                     vcpu_count: 1,
                     memory_mib: 512,
                     disk_quota_bytes: 2 * 1024 * 1024 * 1024,
                     timeout_secs: 30,
+                },
+                agent: AgentExecutionSpec {
+                    provider: config.agent.provider,
+                    codex_bin: config.agent.codex_bin.clone(),
+                    egress_proxy: config.agent.egress_proxy.clone(),
                 },
             };
 
@@ -321,11 +355,35 @@ impl AppConfig {
             .sandbox
             .and_then(|s| s.runtime_dir)
             .unwrap_or_else(|| "./workspaces/sandboxes".to_string());
+        let agent = parsed.agent.unwrap_or(AgentConfig {
+            provider: None,
+            codex_bin: None,
+            egress_proxy_url: None,
+        });
+        let provider = match agent
+            .provider
+            .unwrap_or_else(|| "codex".to_string())
+            .to_lowercase()
+            .as_str()
+        {
+            "codex" => AgentProvider::Codex,
+            other => {
+                return Err(format!(
+                    "unsupported agent provider '{}'; supported providers: codex",
+                    other
+                ))
+            }
+        };
 
         Ok(Self {
             database_path: PathBuf::from(database_path),
             trusted_workspace_dir: PathBuf::from(trusted_workspace_dir),
             sandbox_runtime_dir: PathBuf::from(sandbox_runtime_dir),
+            agent: AgentRuntimeConfig {
+                provider,
+                codex_bin: agent.codex_bin.unwrap_or_else(|| "codex".to_string()),
+                egress_proxy: agent.egress_proxy_url,
+            },
         })
     }
 }

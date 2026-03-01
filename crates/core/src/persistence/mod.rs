@@ -71,6 +71,7 @@ impl SqliteStore {
                 id TEXT PRIMARY KEY,
                 repo_ref TEXT NOT NULL,
                 revision TEXT NOT NULL,
+                instruction TEXT NOT NULL DEFAULT '',
                 check_profile TEXT NOT NULL,
                 publish_policy TEXT NOT NULL,
                 state TEXT NOT NULL,
@@ -111,6 +112,26 @@ impl SqliteStore {
             );
             ",
         )?;
+
+        let has_instruction = {
+            let mut stmt = conn.prepare("PRAGMA table_info(jobs)")?;
+            let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for column in columns {
+                if column?.eq("instruction") {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+
+        if !has_instruction {
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN instruction TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
 
         Ok(())
     }
@@ -182,7 +203,7 @@ impl JobRepository {
     pub fn load(&self, id: &JobId) -> Result<Option<Job>, PersistenceError> {
         let conn = self.conn.borrow();
         let mut stmt = conn.prepare(
-            "SELECT id, repo_ref, revision, check_profile, publish_policy, state, active_attempt_id, validation_succeeded
+            "SELECT id, repo_ref, revision, instruction, check_profile, publish_policy, state, active_attempt_id, validation_succeeded
              FROM jobs WHERE id = ?1",
         )?;
 
@@ -191,16 +212,18 @@ impl JobRepository {
                 let id: String = row.get(0)?;
                 let repo_ref: String = row.get(1)?;
                 let revision: String = row.get(2)?;
-                let check_profile: String = row.get(3)?;
-                let publish_policy: String = row.get(4)?;
-                let state: String = row.get(5)?;
-                let active_attempt_id: Option<u32> = row.get(6)?;
-                let validation_succeeded: bool = row.get(7)?;
+                let instruction: String = row.get(3)?;
+                let check_profile: String = row.get(4)?;
+                let publish_policy: String = row.get(5)?;
+                let state: String = row.get(6)?;
+                let active_attempt_id: Option<u32> = row.get(7)?;
+                let validation_succeeded: bool = row.get(8)?;
 
                 Ok((
                     id,
                     repo_ref,
                     revision,
+                    instruction,
                     check_profile,
                     publish_policy,
                     state,
@@ -214,6 +237,7 @@ impl JobRepository {
             id,
             repo_ref,
             revision,
+            instruction,
             check_profile,
             publish_policy,
             state,
@@ -231,6 +255,7 @@ impl JobRepository {
             id: JobId::new(id)?,
             repo_ref: RepoRef::new(repo_ref)?,
             revision: Revision::new(revision)?,
+            instruction,
             check_profile: CheckProfile::new(check_profile)?,
             publish_policy: PublishPolicy::parse(&publish_policy)?,
             state: JobState::parse(&state)?,
@@ -246,11 +271,12 @@ impl JobRepository {
 
 fn upsert_job(tx: &Transaction<'_>, job: &Job) -> Result<(), PersistenceError> {
     tx.execute(
-        "INSERT INTO jobs(id, repo_ref, revision, check_profile, publish_policy, state, active_attempt_id, validation_succeeded)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO jobs(id, repo_ref, revision, instruction, check_profile, publish_policy, state, active_attempt_id, validation_succeeded)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(id) DO UPDATE SET
             repo_ref = excluded.repo_ref,
             revision = excluded.revision,
+            instruction = excluded.instruction,
             check_profile = excluded.check_profile,
             publish_policy = excluded.publish_policy,
             state = excluded.state,
@@ -260,6 +286,7 @@ fn upsert_job(tx: &Transaction<'_>, job: &Job) -> Result<(), PersistenceError> {
             job.id.as_str(),
             job.repo_ref.as_str(),
             job.revision.as_str(),
+            job.instruction.as_str(),
             job.check_profile.as_str(),
             job.publish_policy.as_str(),
             job.state.as_str(),
@@ -575,6 +602,7 @@ mod tests {
             JobId::new("job-epic-2").expect("job id"),
             RepoRef::new("github.com/acme/repo").expect("repo ref"),
             Revision::new("main").expect("revision"),
+            "persisted instruction".to_string(),
             CheckProfile::new("unit").expect("profile"),
             PublishPolicy::OnValidationSuccess,
         )

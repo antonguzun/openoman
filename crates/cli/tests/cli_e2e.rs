@@ -40,6 +40,8 @@ fn submit_then_status_reports_queued_state() {
             "github.com/acme/repo",
             "--revision",
             "main",
+            "--instruction",
+            "create a patch",
         ])
         .assert()
         .success()
@@ -79,6 +81,8 @@ fn submit_then_run_prepares_git_workspaces() {
             &fixture_repo.display().to_string(),
             "--revision",
             "main",
+            "--instruction",
+            "create a patch",
         ])
         .assert()
         .success()
@@ -147,6 +151,8 @@ fn missing_config_path_is_deterministic() {
         "r",
         "--revision",
         "main",
+        "--instruction",
+        "do work",
     ])
     .assert()
     .failure()

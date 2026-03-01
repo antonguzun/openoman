@@ -7,10 +7,16 @@ database_path = "./data/openoman.db"
 trusted_workspace_dir = "./workspaces/trusted"
 
 [sandbox]
-# Placeholder values for future microVM resource controls.
-timeout_seconds = 1800
-memory_mb = 2048
-cpu_cores = 2
+# Base directory where sandbox runs are materialized.
+runtime_dir = "./workspaces/sandboxes"
+
+[agent]
+# Agent provider executed inside sandbox. MVP supports only "codex".
+provider = "codex"
+# Binary looked up in sandbox PATH for Codex execution contract.
+codex_bin = "codex"
+# Optional proxy endpoint used for egress controls inside sandbox.
+egress_proxy_url = "http://proxy.internal:3128"
 
 [publishing]
 # Placeholder GitHub settings for future publish support.
