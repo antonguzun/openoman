@@ -147,6 +147,8 @@
 - Artifacts can be collected from sandbox
 - No host docker socket is exposed to sandbox
 
+**Checkpoint:** ✅ Epic 5 completed
+
 ---
 
 ## Epic 6 — Agent execution contract inside sandbox (compose + logs)
