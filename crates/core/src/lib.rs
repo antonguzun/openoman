@@ -1,4 +1,5 @@
 pub mod domain;
+pub mod git;
 pub mod persistence;
 
 /// Returns true if the repository bootstrap is wired correctly.

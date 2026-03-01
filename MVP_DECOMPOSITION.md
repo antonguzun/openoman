@@ -104,6 +104,8 @@
 **Acceptance:**
 - Core can clone/check out a repo and produce a sandbox workspace directory deterministically
 
+**Checkpoint:** ✅ Epic 4 completed (trusted Git adapter clone/checkout and deterministic sandbox workspace export are in place).
+
 ---
 
 ## Epic 5 — microVM runner (sandbox lifecycle) — minimal viable implementation
