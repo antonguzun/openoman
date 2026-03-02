@@ -23,6 +23,24 @@ The `openoman` binary provides a minimal local workflow against SQLite:
 
 Configuration is loaded from `--config` and can be overridden with `OPENOMAN_DATABASE_PATH`.
 
+Startup now validates the configured sandbox backend before any command runs. With the default Firecracker backend, `openoman` will fail fast if required host dependencies such as `firecracker`, `/dev/kvm`, or the configured guest asset paths are unavailable.
+
+## Sandbox backend
+
+The sandbox runtime is now selected from config:
+
+- `backend = "firecracker"`
+- `sandbox.firecracker.mode = "direct"` boots Firecracker without Jailer and is the only working mode in this release
+- `sandbox.firecracker.mode = "jailer"` is config-visible but intentionally rejected during startup validation because it needs a more prepared host environment
+
+The direct backend stages the prepared workspace plus any explicitly allowlisted host-user package directories into an ext4 runtime image, boots Firecracker with a per-run writable copy of the configured rootfs, and then extracts the modified workspace plus report/log artifacts back out of that image on the host.
+
+Guest asset notes:
+
+- asset-pair build helper: [guest/build-assets.sh](/home/antonguzun/Work/personal/openoman/guest/build-assets.sh)
+- rootfs-only build helper: [guest/build-rootfs.sh](/home/antonguzun/Work/personal/openoman/guest/build-rootfs.sh)
+- guest contract documentation: [guest/README.md](/home/antonguzun/Work/personal/openoman/guest/README.md)
+
 ## Core Git workspace preparation (Epic 4)
 
 `openoman-core` now includes a trusted `GitAdapter` that can:

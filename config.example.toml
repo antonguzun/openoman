@@ -7,14 +7,38 @@ database_path = "./data/openoman.db"
 trusted_workspace_dir = "./workspaces/trusted"
 
 [sandbox]
+# Virtualization backend used for sandbox attempts.
+backend = "firecracker"
 # Base directory where sandbox runs are materialized.
 runtime_dir = "./workspaces/sandboxes"
+# Firecracker resource controls for the direct backend.
+timeout_seconds = 1800
+memory_mb = 2048
+cpu_cores = 2
+
+[sandbox.firecracker]
+# direct works in this release; jailer is reserved for a future hardened mode.
+mode = "direct"
+firecracker_bin = "firecracker"
+jailer_bin = "jailer"
+# Provide host paths to the guest kernel and rootfs assets.
+kernel_image_path = "/opt/openoman/guest/vmlinux"
+rootfs_image_path = "/opt/openoman/guest/rootfs.ext4"
+guest_cid_base = 10000
+
+[[sandbox.firecracker.user_package_dirs]]
+# Optional allowlisted host-user package directory copied into each run.
+host_path = "~/.local/bin"
+guest_path = "/opt/openoman/user-bin"
+add_to_path = true
 
 [agent]
 # Agent provider executed inside sandbox. MVP supports only "codex".
 provider = "codex"
-# Binary looked up in sandbox PATH for Codex execution contract.
-codex_bin = "codex"
+# Binary baked into the default guest rootfs build.
+codex_bin = "/usr/local/bin/codex"
+# Domain allowlist carried into the guest contract for future egress controls.
+egress_allowed_domains = ["api.openai.com"]
 # Optional proxy endpoint used for egress controls inside sandbox.
 egress_proxy_url = "http://proxy.internal:3128"
 

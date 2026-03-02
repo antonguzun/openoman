@@ -30,7 +30,7 @@ After this change, a sandbox attempt is configured with an explicit agent contra
 
 ## Outcomes & Retrospective
 
-Epic 6 MVP now adds an explicit agent runtime contract to the sandbox lifecycle and CLI config, including egress proxy propagation, while preserving deterministic artifact generation and testability. Remaining future work is richer interactive command execution beyond contract-level invocation.
+Epic 6 MVP now adds an explicit agent runtime contract to the sandbox lifecycle and CLI config, including egress proxy propagation and an optional egress domain allowlist field, while preserving deterministic artifact generation and testability. Remaining future work is richer interactive command execution beyond contract-level invocation.
 
 ## Context and Orientation
 
@@ -80,6 +80,7 @@ Core now exposes:
         pub provider: AgentProvider,
         pub codex_bin: String,
         pub egress_proxy: Option<String>,
+        pub egress_allowed_domains: Vec<String>,
     }
 
     pub enum AgentProvider {
@@ -91,9 +92,11 @@ CLI config now supports:
     [agent]
     provider = "codex"
     codex_bin = "codex"
+    egress_allowed_domains = ["api.openai.com"]
     egress_proxy_url = "http://proxy.internal:3128"
 
 Revision note (2026-03-01): Created Epic 6 ExecPlan and updated it inline during implementation to record progress and decisions.
 
 
 Revision note (2026-03-01): Updated plan after review feedback to require submit-time instructions and pass them to sandbox agent execution.
+Revision note (2026-03-02): Updated the documented agent contract to include the optional `egress_allowed_domains` list used by the current guest runtime wiring.
