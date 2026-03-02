@@ -32,6 +32,24 @@ echo "agent provider: $AGENT_PROVIDER"
 echo "workspace dir: $WORKSPACE_DIR"
 echo "output dir: $OUTPUT_DIR"
 echo "codex bin: ${CODEX_BIN:-}"
+export HOME="/root"
+
+if [ -n "${OPENOMAN_CODEX_AUTH_FILE:-}" ]; then
+  echo "installing codex auth file from $OPENOMAN_CODEX_AUTH_FILE"
+  mkdir -p /root/.codex
+  cp "$OPENOMAN_CODEX_AUTH_FILE" /root/.codex/auth.json
+  chmod 600 /root/.codex/auth.json
+fi
+
+if [ "${OPENOMAN_NET_MODE:-}" = "host-proxy" ]; then
+  echo "configuring guest network: iface=${OPENOMAN_NET_IFACE:-eth0} addr=${OPENOMAN_NET_GUEST_IPV4:-unset}"
+  busybox ip link set "${OPENOMAN_NET_IFACE:-eth0}" up
+  busybox ip addr flush dev "${OPENOMAN_NET_IFACE:-eth0}" || true
+  busybox ip addr add "${OPENOMAN_NET_GUEST_IPV4:?missing guest ipv4}" dev "${OPENOMAN_NET_IFACE:-eth0}"
+  export HTTPS_PROXY="${OPENOMAN_NET_HOST_PROXY_URL:?missing host proxy url}"
+  export HTTP_PROXY="$HTTPS_PROXY"
+  busybox ip addr show dev "${OPENOMAN_NET_IFACE:-eth0}" || true
+fi
 
 if [ -n "${HTTPS_PROXY:-}" ]; then
   export HTTPS_PROXY HTTP_PROXY
@@ -123,7 +141,7 @@ case "$AGENT_PROVIDER" in
       fi
       if [ "$codex_probe_failed" -eq 0 ]; then
         echo "running codex exec in $WORKSPACE_DIR"
-        "$CODEX_BIN" exec --full-auto --color never -C "$WORKSPACE_DIR" -o "$OUTPUT_DIR/report.txt" "$instruction" || agent_status=$?
+        "$CODEX_BIN" exec --dangerously-bypass-approvals-and-sandbox --color never -C "$WORKSPACE_DIR" -o "$OUTPUT_DIR/report.txt" "$instruction" || agent_status=$?
         echo "codex exec exit status: $agent_status"
       fi
     else

@@ -26,6 +26,17 @@ kernel_image_path = "/opt/openoman/guest/vmlinux"
 rootfs_image_path = "/opt/openoman/guest/rootfs.ext4"
 guest_cid_base = 10000
 
+[sandbox.firecracker.network]
+# disabled: no guest NIC.
+# host-proxy: attach a tap-backed NIC and route guest HTTPS through a host-local allowlisting proxy.
+mode = "host-proxy"
+# sudo: use the hidden openoman helper through sudo for tap lifecycle management.
+# direct: manage tap lifecycle directly when the whole process already has CAP_NET_ADMIN/root.
+privilege_mode = "sudo"
+tap_name_prefix = "oomtap"
+proxy_port = 3128
+subnet_cidr = "172.22.0.0/16"
+
 [[sandbox.firecracker.user_package_dirs]]
 # Optional allowlisted host-user package directory copied into each run.
 host_path = "~/.local/bin"
@@ -37,10 +48,10 @@ add_to_path = true
 provider = "codex"
 # Binary baked into the default guest rootfs build.
 codex_bin = "/usr/local/bin/codex"
-# Domain allowlist carried into the guest contract for future egress controls.
+# Optional host auth file copied into the guest as /root/.codex/auth.json.
+# codex_auth_file = "~/.codex/auth.json"
+# Domain allowlist enforced by the host CONNECT proxy in host-proxy networking mode.
 egress_allowed_domains = ["api.openai.com"]
-# Optional proxy endpoint used for egress controls inside sandbox.
-egress_proxy_url = "http://proxy.internal:3128"
 
 [publishing]
 # Placeholder GitHub settings for future publish support.

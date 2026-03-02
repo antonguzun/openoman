@@ -13,14 +13,17 @@ The host runtime boots Firecracker with:
 
 - a per-attempt writable copy of the configured root filesystem as the root block device (`/dev/vda`)
 - a per-attempt ext4 runtime image as `/dev/vdb`
+- optionally, a tap-backed virtio-net interface when `sandbox.firecracker.network.mode = "host-proxy"`
 - kernel boot args that set `init=/sbin/openoman-init`
 
 The rootfs therefore needs to contain `/sbin/openoman-init`. The checked-in [`openoman-init.sh`](/home/antonguzun/Work/personal/openoman/guest/openoman-init.sh) implements the current guest contract:
 
 - mount `/dev/vdb` at `/mnt/runtime`
 - load `/mnt/runtime/openoman-config/agent.env`
+- optionally copy a staged Codex auth file to `/root/.codex/auth.json`
 - bind configured package directories into the guest filesystem
-- run the agent inside `/mnt/runtime/workspace`
+- optionally configure `eth0` with a static `/30` address and export a host-local HTTP CONNECT proxy
+- run the agent inside `/mnt/runtime/workspace` with Firecracker as the outer sandbox boundary
 - write logs and report into `/mnt/runtime/openoman-output`
 - write an exit-code marker into `/mnt/runtime/openoman-output/exit-code.txt`
 - attempt shutdown, while the host runner is also allowed to terminate Firecracker once that completion marker appears
@@ -94,11 +97,27 @@ OPENOMAN_FIRECRACKER_ROOTFS="/abs/path/rootfs.ext4" \
 cargo test -p openoman-core direct_runner_smoke_boots_real_firecracker_when_opted_in -- --nocapture
 ```
 
+## Host-proxy networking
+
+Direct Firecracker mode now supports a host-proxy networking path for real Codex/API traffic:
+
+- `sandbox.firecracker.network.mode = "host-proxy"`
+- the host creates one tap device per run
+- the guest gets a static `eth0` address inside a `/30` subnet
+- `HTTP_PROXY` and `HTTPS_PROXY` inside the guest point at a host-local HTTP CONNECT proxy
+- the proxy allows only exact hostnames from `agent.egress_allowed_domains`
+
+This keeps guest egress constrained to the host proxy path instead of giving the VM general outbound internet access.
+
+`privilege_mode = "sudo"` is the default because creating the tap device requires host network privileges. `openoman run` calls `sudo -v` once before the attempt starts, then uses a hidden internal helper for tap setup and teardown. Use `privilege_mode = "direct"` only when the whole `openoman` process already runs with the required capabilities.
+
+The current guest kernel does not enable Linux Landlock (`CONFIG_SECURITY_LANDLOCK` is off in the pinned Firecracker kernel config), so the guest init script runs `codex exec` with `--dangerously-bypass-approvals-and-sandbox`. That is intentional here: Firecracker is already the actual isolation boundary for the untrusted workload.
+
 ## Limitations
 
-- `sandbox.firecracker.mode = "direct"` currently does not set up a guest network device.
-- the default `firecracker-ci` kernel solves the earlier virtio-rng gap, but real `codex exec` still needs future guest networking support.
-- a built-in `codex` binary avoids the earlier "binary not found" failure, but real `codex exec` still needs future guest networking support.
+- host-proxy mode currently supports HTTPS through HTTP CONNECT only; it does not provide general guest internet access.
+- `agent.egress_allowed_domains` uses exact hostname matching; wildcard domains are not implemented.
+- guest networking in direct mode depends on host privileges for tap lifecycle management.
 - user package directories are copied into the per-run runtime image; they are not live-mounted from the host.
 - copied host-user binaries must still be compatible with the guest userspace to run successfully.
 - `sandbox.firecracker.mode = "jailer"` is not implemented yet and fails during startup validation.

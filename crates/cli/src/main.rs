@@ -1,7 +1,8 @@
 use std::{
     env, fs,
+    net::Ipv4Addr,
     path::{Path, PathBuf},
-    process,
+    process::{self, Command as ProcessCommand, Stdio},
 };
 
 use clap::{Parser, Subcommand};
@@ -14,8 +15,9 @@ use openoman_core::{
     persistence::{NewArtifactRecord, NewOutboxEvent, OutboxStatus, SqliteStore},
     sandbox::{
         build_sandbox_backend, AgentExecutionSpec, AgentProvider, AttemptSpec,
-        CollectedSandboxOutput, FirecrackerBackendConfig, FirecrackerMode, ResourceLimits,
-        SandboxBackendKind, SandboxRuntimeConfig, UserPackageDir,
+        CollectedSandboxOutput, FirecrackerBackendConfig, FirecrackerMode,
+        FirecrackerNetworkPrivilegeMode, FirecrackerNetworkingConfig, FirecrackerNetworkingMode,
+        ResourceLimits, SandboxBackendKind, SandboxRuntimeConfig, UserPackageDir,
     },
 };
 use serde::Deserialize;
@@ -60,6 +62,35 @@ enum Commands {
     Result {
         job_id: String,
     },
+    #[command(hide = true)]
+    Internal {
+        #[command(subcommand)]
+        command: InternalCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum InternalCommands {
+    FirecrackerNet {
+        #[command(subcommand)]
+        command: FirecrackerNetCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FirecrackerNetCommands {
+    Setup {
+        #[arg(long)]
+        tap_name: String,
+        #[arg(long)]
+        host_ip: Ipv4Addr,
+        #[arg(long)]
+        prefix_len: u8,
+    },
+    Teardown {
+        #[arg(long)]
+        tap_name: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +130,16 @@ struct FirecrackerConfig {
     rootfs_image_path: Option<String>,
     guest_cid_base: Option<u32>,
     user_package_dirs: Option<Vec<UserPackageDirConfig>>,
+    network: Option<FirecrackerNetworkConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FirecrackerNetworkConfig {
+    mode: Option<String>,
+    privilege_mode: Option<String>,
+    tap_name_prefix: Option<String>,
+    proxy_port: Option<u16>,
+    subnet_cidr: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +153,7 @@ struct UserPackageDirConfig {
 struct AgentConfig {
     provider: Option<String>,
     codex_bin: Option<String>,
+    codex_auth_file: Option<String>,
     egress_proxy_url: Option<String>,
     egress_allowed_domains: Option<Vec<String>>,
 }
@@ -128,6 +170,7 @@ struct AppConfig {
 struct AgentRuntimeConfig {
     provider: AgentProvider,
     codex_bin: String,
+    codex_auth_file: Option<PathBuf>,
     egress_proxy: Option<String>,
     egress_allowed_domains: Vec<String>,
 }
@@ -146,7 +189,12 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
-    let config = AppConfig::load(&cli.config)?;
+    let Cli { config, command } = cli;
+    if let Commands::Internal { command } = command {
+        return run_internal(command);
+    }
+
+    let config = AppConfig::load(&config)?;
     let sandbox_backend = build_sandbox_backend(config.sandbox.clone())
         .map_err(|e| format!("failed to configure sandbox backend: {e}"))?;
     sandbox_backend
@@ -160,7 +208,7 @@ fn run() -> Result<(), String> {
     })?;
     let jobs = store.jobs();
 
-    match cli.command {
+    match command {
         Commands::Submit {
             repo,
             revision,
@@ -198,6 +246,7 @@ fn run() -> Result<(), String> {
             println!("job_id={}", job.id.as_str());
         }
         Commands::Run { job_id } => {
+            ensure_network_privileges(&config.sandbox)?;
             let job_id = JobId::new(job_id).map_err(|e| e.to_string())?;
             let Some(mut job) = jobs.load(&job_id).map_err(|e| e.to_string())? else {
                 return Err(format!("job not found: {}", job_id.as_str()));
@@ -237,6 +286,7 @@ fn run() -> Result<(), String> {
                 agent: AgentExecutionSpec {
                     provider: config.agent.provider,
                     codex_bin: config.agent.codex_bin.clone(),
+                    codex_auth_file: config.agent.codex_auth_file.clone(),
                     egress_proxy: config.agent.egress_proxy.clone(),
                     egress_allowed_domains: config.agent.egress_allowed_domains.clone(),
                 },
@@ -450,6 +500,7 @@ fn run() -> Result<(), String> {
             };
             println!("job_id={} result={}", job.id.as_str(), result);
         }
+        Commands::Internal { .. } => unreachable!("internal commands are handled before config"),
     }
 
     Ok(())
@@ -483,6 +534,7 @@ impl AppConfig {
         let agent = parsed.agent.unwrap_or(AgentConfig {
             provider: None,
             codex_bin: None,
+            codex_auth_file: None,
             egress_proxy_url: None,
             egress_allowed_domains: None,
         });
@@ -519,6 +571,17 @@ impl AppConfig {
             path,
             matches!(sandbox_backend, SandboxBackendKind::Firecracker),
         )?;
+        let agent_runtime = AgentRuntimeConfig {
+            provider,
+            codex_bin: agent.codex_bin.unwrap_or_else(|| "codex".to_string()),
+            codex_auth_file: match agent.codex_auth_file {
+                Some(raw_path) => Some(resolve_config_path(path, &raw_path)?),
+                None => None,
+            },
+            egress_proxy: agent.egress_proxy_url,
+            egress_allowed_domains: normalize_egress_allowed_domains(agent.egress_allowed_domains)?,
+        };
+        validate_agent_networking_contract(firecracker.as_ref(), &agent_runtime)?;
 
         Ok(Self {
             database_path: resolve_config_path(path, &database_path)?,
@@ -540,14 +603,7 @@ impl AppConfig {
                 },
                 firecracker,
             },
-            agent: AgentRuntimeConfig {
-                provider,
-                codex_bin: agent.codex_bin.unwrap_or_else(|| "codex".to_string()),
-                egress_proxy: agent.egress_proxy_url,
-                egress_allowed_domains: normalize_egress_allowed_domains(
-                    agent.egress_allowed_domains,
-                )?,
-            },
+            agent: agent_runtime,
         })
     }
 }
@@ -585,6 +641,7 @@ fn load_firecracker_config(
         rootfs_image_path: None,
         guest_cid_base: None,
         user_package_dirs: None,
+        network: None,
     });
     let mode = match firecracker
         .mode
@@ -610,6 +667,7 @@ fn load_firecracker_config(
             add_to_path: package_dir.add_to_path.unwrap_or(false),
         });
     }
+    let networking = load_firecracker_networking_config(firecracker.network)?;
 
     Ok(Some(FirecrackerBackendConfig {
         mode,
@@ -635,7 +693,289 @@ fn load_firecracker_config(
         )?,
         guest_cid_base: firecracker.guest_cid_base.unwrap_or(10_000),
         user_package_dirs,
+        networking,
     }))
+}
+
+fn load_firecracker_networking_config(
+    config: Option<FirecrackerNetworkConfig>,
+) -> Result<FirecrackerNetworkingConfig, String> {
+    let network = config.unwrap_or(FirecrackerNetworkConfig {
+        mode: None,
+        privilege_mode: None,
+        tap_name_prefix: None,
+        proxy_port: None,
+        subnet_cidr: None,
+    });
+    let mode = match network
+        .mode
+        .unwrap_or_else(|| "disabled".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "disabled" => FirecrackerNetworkingMode::Disabled,
+        "host-proxy" => FirecrackerNetworkingMode::HostProxy,
+        other => {
+            return Err(format!(
+                "unsupported sandbox.firecracker.network.mode '{}'; supported modes: disabled, host-proxy",
+                other
+            ))
+        }
+    };
+    let privilege_mode = match network
+        .privilege_mode
+        .unwrap_or_else(|| "sudo".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "sudo" => FirecrackerNetworkPrivilegeMode::Sudo,
+        "direct" => FirecrackerNetworkPrivilegeMode::Direct,
+        other => {
+            return Err(format!(
+                "unsupported sandbox.firecracker.network.privilege_mode '{}'; supported modes: sudo, direct",
+                other
+            ))
+        }
+    };
+    let tap_name_prefix = network
+        .tap_name_prefix
+        .unwrap_or_else(|| "oomtap".to_string());
+    validate_tap_name_prefix(&tap_name_prefix)?;
+    let proxy_port = network.proxy_port.unwrap_or(3128);
+    if proxy_port == 0 {
+        return Err("sandbox.firecracker.network.proxy_port must be non-zero".to_string());
+    }
+    let subnet_cidr = network
+        .subnet_cidr
+        .unwrap_or_else(|| "172.22.0.0/16".to_string());
+    validate_ipv4_cidr(&subnet_cidr, "sandbox.firecracker.network.subnet_cidr")?;
+
+    Ok(FirecrackerNetworkingConfig {
+        mode,
+        privilege_mode,
+        tap_name_prefix,
+        proxy_port,
+        subnet_cidr,
+    })
+}
+
+fn validate_agent_networking_contract(
+    firecracker: Option<&FirecrackerBackendConfig>,
+    agent: &AgentRuntimeConfig,
+) -> Result<(), String> {
+    if let Some(auth_file) = &agent.codex_auth_file {
+        let metadata = fs::metadata(auth_file).map_err(|e| {
+            format!(
+                "agent.codex_auth_file does not exist or is not readable at {}: {e}",
+                auth_file.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "agent.codex_auth_file must point to a regular file: {}",
+                auth_file.display()
+            ));
+        }
+    }
+
+    let Some(firecracker) = firecracker else {
+        return Ok(());
+    };
+    if firecracker.networking.mode != FirecrackerNetworkingMode::HostProxy {
+        return Ok(());
+    }
+
+    if agent.egress_allowed_domains.is_empty() {
+        return Err(
+            "agent.egress_allowed_domains must include at least one domain when sandbox.firecracker.network.mode = \"host-proxy\""
+                .to_string(),
+        );
+    }
+    if agent.egress_proxy.is_some() {
+        return Err(
+            "agent.egress_proxy_url must not be set when sandbox.firecracker.network.mode = \"host-proxy\" because the host proxy is configured automatically"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_tap_name_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.is_empty() {
+        return Err("sandbox.firecracker.network.tap_name_prefix must not be empty".to_string());
+    }
+    if prefix.len() >= 15 {
+        return Err(
+            "sandbox.firecracker.network.tap_name_prefix must leave room for a numeric suffix"
+                .to_string(),
+        );
+    }
+    if !prefix
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(
+            "sandbox.firecracker.network.tap_name_prefix may contain only ASCII letters, digits, '.', '-', and '_'"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_ipv4_cidr(raw: &str, field_name: &str) -> Result<(), String> {
+    let (address, prefix) = raw
+        .split_once('/')
+        .ok_or_else(|| format!("{field_name} must be an IPv4 CIDR like 172.22.0.0/16"))?;
+    address
+        .parse::<Ipv4Addr>()
+        .map_err(|_| format!("{field_name} must contain a valid IPv4 address"))?;
+    let prefix_len = prefix
+        .parse::<u8>()
+        .map_err(|_| format!("{field_name} must contain a numeric prefix length"))?;
+    if prefix_len > 30 {
+        return Err(format!(
+            "{field_name} must have prefix length 30 or smaller so openoman can allocate per-run /30 networks"
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_network_privileges(config: &SandboxRuntimeConfig) -> Result<(), String> {
+    let Some(firecracker) = &config.firecracker else {
+        return Ok(());
+    };
+    if firecracker.networking.mode != FirecrackerNetworkingMode::HostProxy {
+        return Ok(());
+    }
+    if firecracker.networking.privilege_mode != FirecrackerNetworkPrivilegeMode::Sudo {
+        return Ok(());
+    }
+
+    let status = ProcessCommand::new("sudo")
+        .arg("-v")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("failed to launch sudo -v for sandbox networking: {e}"))?;
+    if !status.success() {
+        return Err(
+            "failed to acquire sudo credentials for sandbox.firecracker.network.mode = \"host-proxy\""
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_internal(command: InternalCommands) -> Result<(), String> {
+    match command {
+        InternalCommands::FirecrackerNet { command } => run_firecracker_net_internal(command),
+    }
+}
+
+fn run_firecracker_net_internal(command: FirecrackerNetCommands) -> Result<(), String> {
+    match command {
+        FirecrackerNetCommands::Setup {
+            tap_name,
+            host_ip,
+            prefix_len,
+        } => firecracker_net_setup(&tap_name, host_ip, prefix_len),
+        FirecrackerNetCommands::Teardown { tap_name } => firecracker_net_teardown(&tap_name),
+    }
+}
+
+fn firecracker_net_setup(tap_name: &str, host_ip: Ipv4Addr, prefix_len: u8) -> Result<(), String> {
+    validate_tap_name(tap_name)?;
+    if prefix_len > 30 {
+        return Err("prefix_len must be 30 or smaller".to_string());
+    }
+
+    let _ = firecracker_net_teardown(tap_name);
+    let mut tuntap_args = vec![
+        "tuntap".to_string(),
+        "add".to_string(),
+        "dev".to_string(),
+        tap_name.to_string(),
+        "mode".to_string(),
+        "tap".to_string(),
+    ];
+    if let Ok(uid) = env::var("SUDO_UID") {
+        tuntap_args.push("user".to_string());
+        tuntap_args.push(uid);
+    }
+    if let Ok(gid) = env::var("SUDO_GID") {
+        tuntap_args.push("group".to_string());
+        tuntap_args.push(gid);
+    }
+    run_ip_command(&tuntap_args)?;
+
+    let cidr = format!("{host_ip}/{prefix_len}");
+    run_ip_command(&[
+        "addr".to_string(),
+        "add".to_string(),
+        cidr,
+        "dev".to_string(),
+        tap_name.to_string(),
+    ])?;
+    run_ip_command(&[
+        "link".to_string(),
+        "set".to_string(),
+        "dev".to_string(),
+        tap_name.to_string(),
+        "up".to_string(),
+    ])?;
+    Ok(())
+}
+
+fn firecracker_net_teardown(tap_name: &str) -> Result<(), String> {
+    validate_tap_name(tap_name)?;
+    let output = ProcessCommand::new("ip")
+        .args(["link", "delete", "dev", tap_name])
+        .output()
+        .map_err(|e| format!("failed to launch ip link delete for {tap_name}: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("Cannot find device") || stderr.contains("does not exist") {
+        return Ok(());
+    }
+
+    Err(format!(
+        "failed to delete tap device {tap_name}: {}",
+        stderr.trim()
+    ))
+}
+
+fn validate_tap_name(tap_name: &str) -> Result<(), String> {
+    if tap_name.is_empty() || tap_name.len() > 15 {
+        return Err("tap_name must be 1-15 characters".to_string());
+    }
+    if !tap_name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(
+            "tap_name may contain only ASCII letters, digits, '.', '-', and '_'".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_ip_command(args: &[String]) -> Result<(), String> {
+    let output = ProcessCommand::new("ip")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to launch ip {}: {e}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "ip {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
 }
 
 fn resolve_config_path(config_path: &Path, raw: &str) -> Result<PathBuf, String> {
@@ -884,6 +1224,171 @@ mod tests {
     fn app_config_loads_egress_allowed_domains() {
         let temp = TempDir::new().expect("tempdir");
         let config_path = temp.path().join("config.toml");
+        let auth_path = temp.path().join("auth.json");
+        fs::write(&auth_path, "{}").expect("write auth file");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+[agent]
+provider = "codex"
+codex_bin = "/usr/local/bin/codex"
+codex_auth_file = "{}"
+egress_proxy_url = "http://proxy.internal:3128"
+egress_allowed_domains = ["api.openai.com", " api.openai.com ", "files.openai.com"]
+"#,
+                auth_path.display()
+            ),
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+
+        assert_eq!(
+            loaded.agent.codex_auth_file.as_deref(),
+            Some(auth_path.as_path())
+        );
+        assert_eq!(
+            loaded.agent.egress_proxy.as_deref(),
+            Some("http://proxy.internal:3128")
+        );
+        assert_eq!(
+            loaded.agent.egress_allowed_domains,
+            vec!["api.openai.com".to_string(), "files.openai.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn app_config_loads_firecracker_host_proxy_networking() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+[sandbox.firecracker.network]
+mode = "host-proxy"
+privilege_mode = "direct"
+tap_name_prefix = "oomtap"
+proxy_port = 4128
+subnet_cidr = "172.30.0.0/16"
+
+[agent]
+provider = "codex"
+codex_bin = "/usr/local/bin/codex"
+egress_allowed_domains = ["api.openai.com"]
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        let firecracker = loaded
+            .sandbox
+            .firecracker
+            .as_ref()
+            .expect("firecracker config");
+        assert_eq!(
+            firecracker.networking.mode,
+            FirecrackerNetworkingMode::HostProxy
+        );
+        assert_eq!(
+            firecracker.networking.privilege_mode,
+            FirecrackerNetworkPrivilegeMode::Direct
+        );
+        assert_eq!(firecracker.networking.tap_name_prefix, "oomtap");
+        assert_eq!(firecracker.networking.proxy_port, 4128);
+        assert_eq!(firecracker.networking.subnet_cidr, "172.30.0.0/16");
+    }
+
+    #[test]
+    fn normalize_egress_allowed_domains_rejects_empty_entries() {
+        let err = normalize_egress_allowed_domains(Some(vec![
+            "api.openai.com".to_string(),
+            "   ".to_string(),
+        ]))
+        .expect_err("empty entry should fail");
+
+        assert!(err.contains("agent.egress_allowed_domains"));
+    }
+
+    #[test]
+    fn host_proxy_mode_rejects_manual_proxy_url() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+[sandbox.firecracker.network]
+mode = "host-proxy"
+
+[agent]
+provider = "codex"
+codex_bin = "/usr/local/bin/codex"
+egress_proxy_url = "http://proxy.internal:3128"
+egress_allowed_domains = ["api.openai.com"]
+"#,
+        )
+        .expect("write config");
+
+        let err = AppConfig::load(&config_path).expect_err("manual proxy should be rejected");
+        assert!(err.contains("agent.egress_proxy_url"));
+        assert!(err.contains("host-proxy"));
+    }
+
+    #[test]
+    fn app_config_rejects_missing_codex_auth_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
         fs::write(
             &config_path,
             r#"
@@ -907,32 +1412,13 @@ rootfs_image_path = "./guest/out/rootfs.ext4"
 [agent]
 provider = "codex"
 codex_bin = "/usr/local/bin/codex"
-egress_proxy_url = "http://proxy.internal:3128"
-egress_allowed_domains = ["api.openai.com", " api.openai.com ", "files.openai.com"]
+codex_auth_file = "./missing-auth.json"
 "#,
         )
         .expect("write config");
 
-        let loaded = AppConfig::load(&config_path).expect("load config");
-
-        assert_eq!(
-            loaded.agent.egress_proxy.as_deref(),
-            Some("http://proxy.internal:3128")
-        );
-        assert_eq!(
-            loaded.agent.egress_allowed_domains,
-            vec!["api.openai.com".to_string(), "files.openai.com".to_string()]
-        );
-    }
-
-    #[test]
-    fn normalize_egress_allowed_domains_rejects_empty_entries() {
-        let err = normalize_egress_allowed_domains(Some(vec![
-            "api.openai.com".to_string(),
-            "   ".to_string(),
-        ]))
-        .expect_err("empty entry should fail");
-
-        assert!(err.contains("agent.egress_allowed_domains"));
+        let err = AppConfig::load(&config_path).expect_err("missing auth file should fail");
+        assert!(err.contains("agent.codex_auth_file"));
+        assert!(err.contains("missing-auth.json"));
     }
 }

@@ -4,8 +4,9 @@ mod backend;
 mod firecracker;
 
 pub use backend::{
-    build_sandbox_backend, FirecrackerBackendConfig, FirecrackerMode, SandboxBackend,
-    SandboxBackendKind, SandboxRuntimeConfig, UserPackageDir,
+    build_sandbox_backend, FirecrackerBackendConfig, FirecrackerMode,
+    FirecrackerNetworkPrivilegeMode, FirecrackerNetworkingConfig, FirecrackerNetworkingMode,
+    SandboxBackend, SandboxBackendKind, SandboxRuntimeConfig, UserPackageDir,
 };
 
 #[derive(Debug, Clone)]
@@ -30,6 +31,7 @@ pub struct AttemptSpec {
 pub struct AgentExecutionSpec {
     pub provider: AgentProvider,
     pub codex_bin: String,
+    pub codex_auth_file: Option<PathBuf>,
     pub egress_proxy: Option<String>,
     pub egress_allowed_domains: Vec<String>,
 }

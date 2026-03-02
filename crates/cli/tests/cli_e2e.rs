@@ -270,6 +270,29 @@ fn jailer_mode_fails_fast_with_clear_error() {
     .stderr(predicates::str::contains("mode = \"direct\""));
 }
 
+#[test]
+fn internal_firecracker_helper_bypasses_config_loading_and_validates_args() {
+    let mut cmd = cli_cmd();
+    cmd.args([
+        "--config",
+        "./does-not-exist.toml",
+        "internal",
+        "firecracker-net",
+        "setup",
+        "--tap-name",
+        "bad name",
+        "--host-ip",
+        "172.22.0.1",
+        "--prefix-len",
+        "30",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains(
+        "tap_name may contain only ASCII letters",
+    ));
+}
+
 fn submit_job(config: &str, repo_path: &Path, instruction: &str) -> String {
     let mut submit = cli_cmd();
     let submit_output = submit

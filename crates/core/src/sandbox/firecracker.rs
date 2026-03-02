@@ -1,9 +1,16 @@
 use std::{
     collections::HashMap,
     fs,
+    io::{self, Read, Write},
+    net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -11,11 +18,14 @@ use serde::Serialize;
 
 use super::{
     shell_quote, AgentExecutionSpec, AgentProvider, AttemptSpec, CollectedSandboxOutput,
-    FirecrackerBackendConfig, FirecrackerMode, SandboxBackend, SandboxBackendKind, SandboxError,
-    SandboxHandle, SandboxRunner, SandboxRuntimeConfig, UserPackageDir,
+    FirecrackerBackendConfig, FirecrackerMode, FirecrackerNetworkPrivilegeMode,
+    FirecrackerNetworkingMode, SandboxBackend, SandboxBackendKind, SandboxError, SandboxHandle,
+    SandboxRunner, SandboxRuntimeConfig, UserPackageDir,
 };
 
 const EXT4_BLOCK_SIZE_BYTES: u64 = 4096;
+const FIRECRACKER_NET_HELPER_SUBCOMMAND: &[&str] = &["internal", "firecracker-net"];
+const PROXY_REQUEST_LIMIT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug)]
 pub struct FirecrackerBackend {
@@ -72,6 +82,14 @@ impl SandboxBackend for FirecrackerBackend {
                     "sandbox.firecracker.rootfs_image_path",
                 )?;
                 validate_user_package_dirs(&self.firecracker.user_package_dirs)?;
+                if self.firecracker.networking.mode == FirecrackerNetworkingMode::HostProxy {
+                    ensure_command_exists("ip")?;
+                    if self.firecracker.networking.privilege_mode
+                        == FirecrackerNetworkPrivilegeMode::Sudo
+                    {
+                        ensure_command_exists("sudo")?;
+                    }
+                }
                 Ok(())
             }
             FirecrackerMode::Jailer => {
@@ -96,10 +114,50 @@ impl SandboxBackend for FirecrackerBackend {
     }
 }
 
+#[derive(Debug, Clone)]
+struct NetworkLease {
+    tap_name: String,
+    guest_iface: String,
+    host_ip: Ipv4Addr,
+    guest_ip: Ipv4Addr,
+    prefix_len: u8,
+    guest_mac: String,
+    proxy_port: u16,
+}
+
+impl NetworkLease {
+    fn guest_ip_cidr(&self) -> String {
+        format!("{}/{}", self.guest_ip, self.prefix_len)
+    }
+
+    fn host_proxy_url(&self) -> String {
+        format!("http://{}:{}", self.host_ip, self.proxy_port)
+    }
+}
+
+#[derive(Debug)]
+struct NetworkProxyHandle {
+    bind_addr: SocketAddrV4,
+    shutdown: Arc<AtomicBool>,
+    accept_thread: Option<JoinHandle<()>>,
+}
+
+impl NetworkProxyHandle {
+    fn stop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.bind_addr);
+        if let Some(handle) = self.accept_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RunningFirecrackerVm {
     child: Child,
     timeout: Duration,
+    network_lease: Option<NetworkLease>,
+    network_proxy: Option<NetworkProxyHandle>,
 }
 
 #[derive(Debug)]
@@ -200,6 +258,7 @@ impl FirecrackerDirectRunner {
         &self,
         spec: &AttemptSpec,
         run_dir: &Path,
+        network_lease: Option<&NetworkLease>,
     ) -> Result<PreparedRuntimeTree, SandboxError> {
         let stage_root = run_dir.join("runtime-tree");
         if stage_root.exists() {
@@ -236,12 +295,16 @@ impl FirecrackerDirectRunner {
 
         fs::write(config_dir.join("instruction.txt"), &spec.instruction)?;
         fs::write(config_dir.join("package-mounts.tsv"), manifest)?;
+        if let Some(auth_file) = &spec.agent.codex_auth_file {
+            fs::copy(auth_file, config_dir.join("codex-auth.json"))?;
+        }
         fs::write(
             config_dir.join("agent.env"),
             render_agent_env(
                 &spec.agent,
                 &guest_path_entries,
                 &self.firecracker.user_package_dirs,
+                network_lease,
             ),
         )?;
         fs::write(
@@ -272,6 +335,7 @@ impl FirecrackerDirectRunner {
         rootfs_image_path: &Path,
         runtime_image_path: &Path,
         spec: &AttemptSpec,
+        network_lease: Option<&NetworkLease>,
     ) -> Result<PathBuf, SandboxError> {
         let config_path = run_dir.join("firecracker-config.json");
         let config = FirecrackerConfigFile {
@@ -298,6 +362,15 @@ impl FirecrackerDirectRunner {
                 mem_size_mib: spec.limits.memory_mib.max(128),
                 smt: false,
             },
+            network_interfaces: network_lease
+                .map(|lease| {
+                    vec![NetworkInterfaceConfig {
+                        iface_id: lease.guest_iface.clone(),
+                        host_dev_name: lease.tap_name.clone(),
+                        guest_mac: lease.guest_mac.clone(),
+                    }]
+                })
+                .unwrap_or_default(),
             entropy: EntropyDeviceConfig {},
         };
 
@@ -326,6 +399,10 @@ impl FirecrackerDirectRunner {
 
     fn vmm_log_path(handle: &SandboxHandle) -> PathBuf {
         handle.run_dir.join("firecracker.log")
+    }
+
+    fn network_log_path(handle: &SandboxHandle) -> PathBuf {
+        handle.run_dir.join("network.log")
     }
 
     fn dump_file_from_image(
@@ -397,6 +474,226 @@ impl FirecrackerDirectRunner {
         })?;
         Ok(Some(code))
     }
+
+    fn configure_networking(
+        &self,
+        handle: &SandboxHandle,
+        spec: &AttemptSpec,
+    ) -> Result<(Option<NetworkLease>, Option<NetworkProxyHandle>), SandboxError> {
+        if self.firecracker.networking.mode != FirecrackerNetworkingMode::HostProxy {
+            return Ok((None, None));
+        }
+        if spec.agent.egress_allowed_domains.is_empty() {
+            return Err(SandboxError::InvalidConfig(
+                "agent.egress_allowed_domains must include at least one domain when sandbox.firecracker.networking.mode = host-proxy"
+                    .to_string(),
+            ));
+        }
+
+        let lease = allocate_network_lease(
+            &self.firecracker.networking.subnet_cidr,
+            handle.id,
+            &self.firecracker.networking.tap_name_prefix,
+            self.firecracker.networking.proxy_port,
+        )?;
+        let log_path = Self::network_log_path(handle);
+        self.append_network_log_line(
+            &log_path,
+            &format!(
+                "network setup requested: tap={} host_ip={}/{} guest_ip={}/{} proxy_port={} allowlist={}",
+                lease.tap_name,
+                lease.host_ip,
+                lease.prefix_len,
+                lease.guest_ip,
+                lease.prefix_len,
+                lease.proxy_port,
+                spec.agent.egress_allowed_domains.join(",")
+            ),
+        )?;
+        self.run_network_helper_command(
+            "setup",
+            &[
+                ("--tap-name", lease.tap_name.clone()),
+                ("--host-ip", lease.host_ip.to_string()),
+                ("--prefix-len", lease.prefix_len.to_string()),
+            ],
+            &log_path,
+        )?;
+        match self.start_network_proxy(&lease, &spec.agent.egress_allowed_domains, &log_path) {
+            Ok(proxy) => Ok((Some(lease), Some(proxy))),
+            Err(err) => {
+                let _ = self.teardown_network_lease(&lease, &log_path);
+                Err(err)
+            }
+        }
+    }
+
+    fn append_network_log_line(&self, log_path: &Path, message: &str) -> Result<(), SandboxError> {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)?;
+        writeln!(file, "{message}")?;
+        Ok(())
+    }
+
+    fn run_network_helper_command(
+        &self,
+        action: &str,
+        args: &[(&str, String)],
+        log_path: &Path,
+    ) -> Result<(), SandboxError> {
+        let current_exe = std::env::current_exe().map_err(SandboxError::Io)?;
+        let mut command = match self.firecracker.networking.privilege_mode {
+            FirecrackerNetworkPrivilegeMode::Sudo => {
+                let mut command = Command::new("sudo");
+                command.arg("-n").arg(&current_exe);
+                command
+            }
+            FirecrackerNetworkPrivilegeMode::Direct => Command::new(&current_exe),
+        };
+        command.args(FIRECRACKER_NET_HELPER_SUBCOMMAND).arg(action);
+        let mut display_args = Vec::new();
+        if self.firecracker.networking.privilege_mode == FirecrackerNetworkPrivilegeMode::Sudo {
+            display_args.push("-n".to_string());
+            display_args.push(current_exe.display().to_string());
+        }
+        display_args.extend(
+            FIRECRACKER_NET_HELPER_SUBCOMMAND
+                .iter()
+                .map(|value| (*value).to_string()),
+        );
+        display_args.push(action.to_string());
+        for (flag, value) in args {
+            command.arg(flag).arg(value);
+            display_args.push((*flag).to_string());
+            display_args.push(value.clone());
+        }
+
+        let helper_program = match self.firecracker.networking.privilege_mode {
+            FirecrackerNetworkPrivilegeMode::Sudo => "sudo".to_string(),
+            FirecrackerNetworkPrivilegeMode::Direct => current_exe.display().to_string(),
+        };
+        self.append_network_log_line(
+            log_path,
+            &format!(
+                "running network helper: {} {}",
+                helper_program,
+                display_args.join(" ")
+            ),
+        )?;
+
+        let output = command.output()?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if !stdout.is_empty() {
+                self.append_network_log_line(log_path, &format!("helper stdout: {stdout}"))?;
+            }
+            if !stderr.is_empty() {
+                self.append_network_log_line(log_path, &format!("helper stderr: {stderr}"))?;
+            }
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        self.append_network_log_line(
+            log_path,
+            &format!(
+                "network helper failed: exit={:?} stderr={stderr}",
+                output.status.code()
+            ),
+        )?;
+        Err(SandboxError::CommandFailed {
+            program: match self.firecracker.networking.privilege_mode {
+                FirecrackerNetworkPrivilegeMode::Sudo => "sudo".to_string(),
+                FirecrackerNetworkPrivilegeMode::Direct => current_exe.display().to_string(),
+            },
+            args: display_args,
+            stderr,
+        })
+    }
+
+    fn start_network_proxy(
+        &self,
+        lease: &NetworkLease,
+        allowed_domains: &[String],
+        log_path: &Path,
+    ) -> Result<NetworkProxyHandle, SandboxError> {
+        let requested_bind_addr = SocketAddrV4::new(lease.host_ip, lease.proxy_port);
+        let listener = TcpListener::bind(requested_bind_addr)?;
+        let bind_addr = match listener.local_addr()? {
+            std::net::SocketAddr::V4(addr) => addr,
+            std::net::SocketAddr::V6(_) => {
+                return Err(SandboxError::RunnerState(
+                    "host proxy unexpectedly bound to an IPv6 address".to_string(),
+                ))
+            }
+        };
+        listener.set_nonblocking(true)?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let allowed_domains = Arc::new(allowed_domains.to_vec());
+        let log_file = Arc::new(Mutex::new(
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)?,
+        ));
+        write_shared_log(&log_file, &format!("host proxy listening on {bind_addr}"));
+        let shutdown_for_thread = Arc::clone(&shutdown);
+        let log_for_thread = Arc::clone(&log_file);
+        let allowed_for_thread = Arc::clone(&allowed_domains);
+        let accept_thread = thread::spawn(move || {
+            loop {
+                if shutdown_for_thread.load(Ordering::SeqCst) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, peer_addr)) => {
+                        let log_for_client = Arc::clone(&log_for_thread);
+                        let allowed_for_client = Arc::clone(&allowed_for_thread);
+                        thread::spawn(move || {
+                            handle_connect_proxy_client(
+                                stream,
+                                peer_addr.to_string(),
+                                allowed_for_client,
+                                log_for_client,
+                            );
+                        });
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(err) => {
+                        write_shared_log(&log_for_thread, &format!("proxy accept failed: {err}"));
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+            write_shared_log(&log_for_thread, "host proxy stopped");
+        });
+        Ok(NetworkProxyHandle {
+            bind_addr,
+            shutdown,
+            accept_thread: Some(accept_thread),
+        })
+    }
+
+    fn teardown_network_lease(
+        &self,
+        lease: &NetworkLease,
+        log_path: &Path,
+    ) -> Result<(), SandboxError> {
+        self.append_network_log_line(
+            log_path,
+            &format!("tearing down tap device {}", lease.tap_name),
+        )?;
+        self.run_network_helper_command(
+            "teardown",
+            &[("--tap-name", lease.tap_name.clone())],
+            log_path,
+        )
+    }
 }
 
 impl SandboxRunner for FirecrackerDirectRunner {
@@ -412,25 +709,59 @@ impl SandboxRunner for FirecrackerDirectRunner {
             fs::remove_dir_all(&run_dir)?;
         }
         fs::create_dir_all(&run_dir)?;
-
-        let rootfs_copy = Self::rootfs_copy_path(&SandboxHandle {
-            id: handle_id,
-            run_dir: run_dir.clone(),
-        });
-        fs::copy(&self.firecracker.rootfs_image_path, &rootfs_copy)?;
-        let prepared = self.stage_runtime_tree(&spec, &run_dir)?;
-        let config_path =
-            self.write_firecracker_config(&run_dir, &rootfs_copy, &prepared.image_path, &spec)?;
         let handle = SandboxHandle {
             id: handle_id,
             run_dir: run_dir.clone(),
+        };
+        let network_log_path = Self::network_log_path(&handle);
+        let (network_lease, mut network_proxy) = match self.configure_networking(&handle, &spec) {
+            Ok(result) => result,
+            Err(err) => {
+                if run_dir.exists() {
+                    let _ = fs::remove_dir_all(&run_dir);
+                }
+                return Err(err);
+            }
+        };
+
+        let rootfs_copy = Self::rootfs_copy_path(&handle);
+        fs::copy(&self.firecracker.rootfs_image_path, &rootfs_copy)?;
+        let prepared = match self.stage_runtime_tree(&spec, &run_dir, network_lease.as_ref()) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                if let Some(proxy) = network_proxy.as_mut() {
+                    proxy.stop();
+                }
+                if let Some(lease) = network_lease.as_ref() {
+                    let _ = self.teardown_network_lease(lease, &network_log_path);
+                }
+                return Err(err);
+            }
+        };
+        let config_path = match self.write_firecracker_config(
+            &run_dir,
+            &rootfs_copy,
+            &prepared.image_path,
+            &spec,
+            network_lease.as_ref(),
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                if let Some(proxy) = network_proxy.as_mut() {
+                    proxy.stop();
+                }
+                if let Some(lease) = network_lease.as_ref() {
+                    let _ = self.teardown_network_lease(lease, &network_log_path);
+                }
+                return Err(err);
+            }
         };
         let serial_log = Self::serial_log_path(&handle);
         let serial_log_file = fs::File::create(&serial_log)?;
         let vmm_log = Self::vmm_log_path(&handle);
 
         let firecracker_bin = resolve_command_path(&self.firecracker.firecracker_bin)?;
-        let child = Command::new(firecracker_bin)
+        let child = match Command::new(firecracker_bin)
             .arg("--no-api")
             .arg("--id")
             .arg(format!("openoman-{}-{handle_id}", spec.job_id))
@@ -447,13 +778,27 @@ impl SandboxRunner for FirecrackerDirectRunner {
                 "OPENOMAN_FAKE_RUNTIME_ROOTFS",
                 &self.firecracker.rootfs_image_path,
             )
-            .spawn()?;
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => {
+                if let Some(proxy) = network_proxy.as_mut() {
+                    proxy.stop();
+                }
+                if let Some(lease) = network_lease.as_ref() {
+                    let _ = self.teardown_network_lease(lease, &network_log_path);
+                }
+                return Err(SandboxError::Io(err));
+            }
+        };
 
         self.running.insert(
             handle_id,
             RunningFirecrackerVm {
                 child,
                 timeout: Duration::from_secs(spec.limits.timeout_secs.max(1)),
+                network_lease,
+                network_proxy,
             },
         );
 
@@ -562,6 +907,10 @@ impl SandboxRunner for FirecrackerDirectRunner {
                 fs::write(&logs_path, "sandbox execution did not produce logs\n")?;
             }
         }
+        let network_log_path = Self::network_log_path(handle);
+        if network_log_path.exists() {
+            append_host_network_log(&logs_path, &network_log_path)?;
+        }
 
         Ok(CollectedSandboxOutput {
             modified_workspace_dir,
@@ -575,6 +924,14 @@ impl SandboxRunner for FirecrackerDirectRunner {
             if running.child.try_wait()?.is_none() {
                 running.child.kill()?;
                 let _ = running.child.wait();
+            }
+            let network_log_path = Self::network_log_path(handle);
+            if let Some(proxy) = running.network_proxy.as_mut() {
+                self.append_network_log_line(&network_log_path, "stopping host proxy")?;
+                proxy.stop();
+            }
+            if let Some(lease) = running.network_lease.as_ref() {
+                self.teardown_network_lease(lease, &network_log_path)?;
             }
         }
 
@@ -598,6 +955,8 @@ struct FirecrackerConfigFile {
     drives: Vec<DriveConfig>,
     #[serde(rename = "machine-config")]
     machine_config: MachineConfig,
+    #[serde(rename = "network-interfaces", skip_serializing_if = "Vec::is_empty")]
+    network_interfaces: Vec<NetworkInterfaceConfig>,
     entropy: EntropyDeviceConfig,
 }
 
@@ -623,6 +982,13 @@ struct MachineConfig {
 }
 
 #[derive(Debug, Serialize)]
+struct NetworkInterfaceConfig {
+    iface_id: String,
+    host_dev_name: String,
+    guest_mac: String,
+}
+
+#[derive(Debug, Serialize)]
 struct EntropyDeviceConfig {}
 
 fn validate_firecracker_common(config: &FirecrackerBackendConfig) -> Result<(), SandboxError> {
@@ -631,6 +997,12 @@ fn validate_firecracker_common(config: &FirecrackerBackendConfig) -> Result<(), 
             "sandbox.firecracker.guest_cid_base must be at least 10000".to_string(),
         ));
     }
+    if config.networking.tap_name_prefix.is_empty() {
+        return Err(SandboxError::InvalidConfig(
+            "sandbox.firecracker.network.tap_name_prefix must not be empty".to_string(),
+        ));
+    }
+    parse_ipv4_cidr(&config.networking.subnet_cidr)?;
 
     Ok(())
 }
@@ -759,10 +1131,317 @@ fn directory_size_bytes(path: &Path) -> Result<u64, SandboxError> {
     Ok(total)
 }
 
+type SharedLog = Arc<Mutex<fs::File>>;
+
+fn append_host_network_log(logs_path: &Path, network_log_path: &Path) -> Result<(), SandboxError> {
+    let network_log = fs::read_to_string(network_log_path)?;
+    if network_log.is_empty() {
+        return Ok(());
+    }
+
+    let existing = fs::read(logs_path)?;
+    let mut logs_file = fs::OpenOptions::new().append(true).open(logs_path)?;
+    if !existing.is_empty() && !existing.ends_with(b"\n") {
+        writeln!(logs_file)?;
+    }
+    writeln!(logs_file)?;
+    writeln!(logs_file, "[host network log]")?;
+    write!(logs_file, "{network_log}")?;
+    if !network_log.ends_with('\n') {
+        writeln!(logs_file)?;
+    }
+    Ok(())
+}
+
+fn write_shared_log(log: &SharedLog, message: &str) {
+    if let Ok(mut file) = log.lock() {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+fn handle_connect_proxy_client(
+    mut client: TcpStream,
+    peer_addr: String,
+    allowed_domains: Arc<Vec<String>>,
+    log: SharedLog,
+) {
+    let request = match read_connect_proxy_request(&mut client) {
+        Ok(request) => request,
+        Err(err) => {
+            let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+            write_shared_log(
+                &log,
+                &format!("proxy rejected malformed request from {peer_addr}: {err}"),
+            );
+            return;
+        }
+    };
+
+    let (method, host, port) = match parse_connect_request(&request) {
+        Ok(parts) => parts,
+        Err(err) => {
+            let status = if err.contains("CONNECT") {
+                b"HTTP/1.1 405 Method Not Allowed\r\n\r\n".as_slice()
+            } else {
+                b"HTTP/1.1 400 Bad Request\r\n\r\n".as_slice()
+            };
+            let _ = client.write_all(status);
+            write_shared_log(
+                &log,
+                &format!("proxy rejected bad request from {peer_addr}: {err}"),
+            );
+            return;
+        }
+    };
+
+    if method != "CONNECT" {
+        let _ = client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+        write_shared_log(
+            &log,
+            &format!("proxy rejected unsupported method from {peer_addr}: {method}"),
+        );
+        return;
+    }
+
+    if port != 443 {
+        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        write_shared_log(
+            &log,
+            &format!("proxy denied {host}:{port} from {peer_addr}: only port 443 is allowed"),
+        );
+        return;
+    }
+    if !allowed_domains.iter().any(|allowed| allowed == &host) {
+        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        write_shared_log(
+            &log,
+            &format!("proxy denied {host}:{port} from {peer_addr}: hostname not allowlisted"),
+        );
+        return;
+    }
+
+    match TcpStream::connect((host.as_str(), port)) {
+        Ok(mut upstream) => {
+            if client
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .is_err()
+            {
+                write_shared_log(
+                    &log,
+                    &format!(
+                        "proxy failed to acknowledge CONNECT for {host}:{port} from {peer_addr}"
+                    ),
+                );
+                return;
+            }
+            write_shared_log(
+                &log,
+                &format!("proxy accepted {host}:{port} from {peer_addr}"),
+            );
+            if let Err(err) = tunnel_tcp_streams(client, &mut upstream) {
+                write_shared_log(
+                    &log,
+                    &format!(
+                        "proxy tunnel to {host}:{port} from {peer_addr} ended with error: {err}"
+                    ),
+                );
+            } else {
+                write_shared_log(
+                    &log,
+                    &format!("proxy tunnel to {host}:{port} from {peer_addr} closed cleanly"),
+                );
+            }
+        }
+        Err(err) => {
+            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            write_shared_log(
+                &log,
+                &format!("proxy upstream connect failed for {host}:{port} from {peer_addr}: {err}"),
+            );
+        }
+    }
+}
+
+fn read_connect_proxy_request(stream: &mut TcpStream) -> io::Result<String> {
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    while request.len() < PROXY_REQUEST_LIMIT_BYTES {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before proxy request headers were complete",
+            ));
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            return Ok(String::from_utf8_lossy(&request).into_owned());
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "proxy request headers exceeded size limit",
+    ))
+}
+
+fn parse_connect_request(request: &str) -> Result<(String, String, u16), &'static str> {
+    let first_line = request.lines().next().ok_or("empty request")?;
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().ok_or("missing HTTP method")?.to_string();
+    let target = parts.next().ok_or("missing CONNECT target")?;
+    let version = parts.next().ok_or("missing HTTP version")?;
+    if !version.starts_with("HTTP/1.") {
+        return Err("unsupported HTTP version");
+    }
+    let (host, port) = target
+        .rsplit_once(':')
+        .ok_or("CONNECT target must be host:port")?;
+    let host = host
+        .trim_matches(|ch| ch == '[' || ch == ']')
+        .trim()
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return Err("CONNECT target host must not be empty");
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| "CONNECT target port must be numeric")?;
+    Ok((method, host, port))
+}
+
+fn tunnel_tcp_streams(client: TcpStream, upstream: &mut TcpStream) -> io::Result<()> {
+    let mut client_reader = client.try_clone()?;
+    let mut client_writer = client;
+    let mut upstream_writer = upstream.try_clone()?;
+    let upstream_to_client = thread::spawn(move || {
+        let _ = io::copy(&mut client_reader, &mut upstream_writer);
+        let _ = upstream_writer.shutdown(Shutdown::Write);
+    });
+
+    let mut upstream_reader = upstream.try_clone()?;
+    let result = io::copy(&mut upstream_reader, &mut client_writer);
+    let _ = client_writer.shutdown(Shutdown::Write);
+    let _ = upstream_to_client.join();
+    result.map(|_| ())
+}
+
+fn allocate_network_lease(
+    subnet_cidr: &str,
+    handle_id: u64,
+    tap_name_prefix: &str,
+    proxy_port: u16,
+) -> Result<NetworkLease, SandboxError> {
+    let (subnet_base, subnet_prefix) = parse_ipv4_cidr(subnet_cidr)?;
+    let Some(handle_index) = handle_id.checked_sub(1) else {
+        return Err(SandboxError::RunnerState(format!(
+            "invalid firecracker handle id {handle_id} for network lease allocation"
+        )));
+    };
+    let available_subnets = 1_u64 << u32::from(30 - subnet_prefix);
+    if handle_index >= available_subnets {
+        return Err(SandboxError::InvalidConfig(format!(
+            "sandbox.firecracker.network.subnet_cidr {subnet_cidr} does not have enough /30 networks for handle id {handle_id}"
+        )));
+    }
+
+    let block_base = subnet_base
+        .checked_add(u32::try_from(handle_index * 4).map_err(|_| {
+            SandboxError::RunnerState(format!(
+                "network handle id {handle_id} overflowed /30 block allocation"
+            ))
+        })?)
+        .ok_or_else(|| {
+            SandboxError::RunnerState(format!(
+                "network handle id {handle_id} overflowed IPv4 lease allocation"
+            ))
+        })?;
+    let host_ip = u32_to_ipv4(block_base + 1);
+    let guest_ip = u32_to_ipv4(block_base + 2);
+    let mac_bytes = handle_id.to_be_bytes();
+    let guest_mac = format!(
+        "02:fc:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac_bytes[4], mac_bytes[5], mac_bytes[6], mac_bytes[7]
+    );
+
+    Ok(NetworkLease {
+        tap_name: make_tap_name(tap_name_prefix, handle_id)?,
+        guest_iface: "eth0".to_string(),
+        host_ip,
+        guest_ip,
+        prefix_len: 30,
+        guest_mac,
+        proxy_port,
+    })
+}
+
+fn parse_ipv4_cidr(raw: &str) -> Result<(u32, u8), SandboxError> {
+    let (address, prefix) = raw.split_once('/').ok_or_else(|| {
+        SandboxError::InvalidConfig(format!(
+            "sandbox.firecracker.network.subnet_cidr must be an IPv4 CIDR like 172.22.0.0/16: {raw}"
+        ))
+    })?;
+    let address = address.parse::<Ipv4Addr>().map_err(|_| {
+        SandboxError::InvalidConfig(format!(
+            "sandbox.firecracker.network.subnet_cidr must contain a valid IPv4 address: {raw}"
+        ))
+    })?;
+    let prefix_len = prefix.parse::<u8>().map_err(|_| {
+        SandboxError::InvalidConfig(format!(
+            "sandbox.firecracker.network.subnet_cidr must contain a numeric prefix length: {raw}"
+        ))
+    })?;
+    if prefix_len > 30 {
+        return Err(SandboxError::InvalidConfig(format!(
+            "sandbox.firecracker.network.subnet_cidr must have prefix length 30 or smaller: {raw}"
+        )));
+    }
+
+    let address_u32 = ipv4_to_u32(address);
+    let network_mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << u32::from(32 - prefix_len)
+    };
+    if address_u32 & !network_mask != 0 {
+        return Err(SandboxError::InvalidConfig(format!(
+            "sandbox.firecracker.network.subnet_cidr must use a network base address aligned to its prefix: {raw}"
+        )));
+    }
+    Ok((address_u32, prefix_len))
+}
+
+fn make_tap_name(prefix: &str, handle_id: u64) -> Result<String, SandboxError> {
+    let suffix = handle_id.to_string();
+    if suffix.len() >= 15 {
+        return Err(SandboxError::InvalidConfig(format!(
+            "firecracker handle id {handle_id} is too large to fit in a Linux tap interface name"
+        )));
+    }
+    let max_prefix_len = 15 - suffix.len();
+    let truncated_prefix = prefix.chars().take(max_prefix_len).collect::<String>();
+    if truncated_prefix.is_empty() {
+        return Err(SandboxError::InvalidConfig(
+            "sandbox.firecracker.network.tap_name_prefix must leave room for a numeric suffix"
+                .to_string(),
+        ));
+    }
+    Ok(format!("{truncated_prefix}{suffix}"))
+}
+
+fn ipv4_to_u32(address: Ipv4Addr) -> u32 {
+    u32::from_be_bytes(address.octets())
+}
+
+fn u32_to_ipv4(address: u32) -> Ipv4Addr {
+    Ipv4Addr::from(address.to_be_bytes())
+}
+
 fn render_agent_env(
     agent: &AgentExecutionSpec,
     guest_path_entries: &[String],
     user_package_dirs: &[UserPackageDir],
+    network_lease: Option<&NetworkLease>,
 ) -> String {
     let mut env_file = String::new();
     env_file.push_str(&format!(
@@ -778,6 +1457,11 @@ fn render_agent_env(
             user_package_dirs
         ))
     ));
+    if agent.codex_auth_file.is_some() {
+        env_file.push_str(
+            "OPENOMAN_CODEX_AUTH_FILE='/mnt/runtime/openoman-config/codex-auth.json'\n",
+        );
+    }
     if let Some(proxy) = &agent.egress_proxy {
         env_file.push_str(&format!("HTTPS_PROXY={}\n", shell_quote(proxy)));
         env_file.push_str(&format!("HTTP_PROXY={}\n", shell_quote(proxy)));
@@ -786,6 +1470,29 @@ fn render_agent_env(
         env_file.push_str(&format!(
             "OPENOMAN_EGRESS_ALLOWED_DOMAINS={}\n",
             shell_quote(&agent.egress_allowed_domains.join(","))
+        ));
+    }
+    if let Some(lease) = network_lease {
+        env_file.push_str("OPENOMAN_NET_MODE='host-proxy'\n");
+        env_file.push_str(&format!(
+            "OPENOMAN_NET_IFACE={}\n",
+            shell_quote(&lease.guest_iface)
+        ));
+        env_file.push_str(&format!(
+            "OPENOMAN_NET_GUEST_IPV4={}\n",
+            shell_quote(&lease.guest_ip_cidr())
+        ));
+        env_file.push_str(&format!(
+            "OPENOMAN_NET_HOST_PROXY_URL={}\n",
+            shell_quote(&lease.host_proxy_url())
+        ));
+        env_file.push_str(&format!(
+            "HTTPS_PROXY={}\n",
+            shell_quote(&lease.host_proxy_url())
+        ));
+        env_file.push_str(&format!(
+            "HTTP_PROXY={}\n",
+            shell_quote(&lease.host_proxy_url())
         ));
     }
     env_file.push_str("WORKSPACE_DIR='/mnt/runtime/workspace'\n");
@@ -840,6 +1547,13 @@ mod tests {
                 rootfs_image_path: rootfs,
                 guest_cid_base: 10_000,
                 user_package_dirs: Vec::new(),
+                networking: super::super::FirecrackerNetworkingConfig {
+                    mode: super::super::FirecrackerNetworkingMode::Disabled,
+                    privilege_mode: super::super::FirecrackerNetworkPrivilegeMode::Direct,
+                    tap_name_prefix: "oomtap".to_string(),
+                    proxy_port: 3128,
+                    subnet_cidr: "172.22.0.0/16".to_string(),
+                },
             }),
         }
     }
@@ -921,11 +1635,13 @@ mod tests {
                     agent: AgentExecutionSpec {
                         provider: AgentProvider::Codex,
                         codex_bin: "codex".to_string(),
+                        codex_auth_file: None,
                         egress_proxy: None,
                         egress_allowed_domains: Vec::new(),
                     },
                 },
                 &run_dir,
+                None,
             )
             .expect("stage runtime tree");
 
@@ -941,6 +1657,62 @@ mod tests {
             .len();
 
         assert_eq!(actual_image_size, expected_image_size);
+    }
+
+    #[test]
+    fn stage_runtime_tree_copies_codex_auth_file_when_configured() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let auth_file = temp.path().join("auth.json");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::write(workspace.join("README.md"), "hello\n").expect("write workspace file");
+        fs::write(&auth_file, "{\"auth_mode\":\"chatgpt\"}\n").expect("write auth file");
+
+        let fake_firecracker = write_fake_firecracker(temp.path());
+        let config = base_runtime_config(temp.path(), &fake_firecracker);
+        let runner = FirecrackerDirectRunner::new(
+            config.runtime_dir.clone(),
+            config
+                .firecracker
+                .clone()
+                .expect("firecracker config should exist"),
+        );
+        let run_dir = config.runtime_dir.join("runs").join("job-auth-attempt-1-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+
+        let prepared = runner
+            .stage_runtime_tree(
+                &AttemptSpec {
+                    job_id: "job-auth".to_string(),
+                    attempt_id: 1,
+                    workspace_dir: workspace,
+                    instruction: "noop".to_string(),
+                    limits: config.limits.clone(),
+                    agent: AgentExecutionSpec {
+                        provider: AgentProvider::Codex,
+                        codex_bin: "codex".to_string(),
+                        codex_auth_file: Some(auth_file),
+                        egress_proxy: None,
+                        egress_allowed_domains: Vec::new(),
+                    },
+                },
+                &run_dir,
+                None,
+            )
+            .expect("stage runtime tree");
+
+        let auth_contents = Command::new("debugfs")
+            .args([
+                "-R",
+                "cat /openoman-config/codex-auth.json",
+                prepared.image_path.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .expect("read auth file from image");
+        assert!(auth_contents.status.success());
+        assert!(
+            String::from_utf8_lossy(&auth_contents.stdout).contains("\"auth_mode\":\"chatgpt\"")
+        );
     }
 
     #[test]
@@ -968,6 +1740,7 @@ mod tests {
                 agent: AgentExecutionSpec {
                     provider: AgentProvider::Codex,
                     codex_bin: "codex".to_string(),
+                    codex_auth_file: None,
                     egress_proxy: Some("http://proxy.internal:3128".to_string()),
                     egress_allowed_domains: vec!["api.openai.com".to_string()],
                 },
@@ -1035,10 +1808,12 @@ mod tests {
                     agent: AgentExecutionSpec {
                         provider: AgentProvider::Codex,
                         codex_bin: "codex".to_string(),
+                        codex_auth_file: None,
                         egress_proxy: None,
                         egress_allowed_domains: Vec::new(),
                     },
                 },
+                None,
             )
             .expect("write firecracker config");
 
@@ -1047,6 +1822,128 @@ mod tests {
                 .expect("parse firecracker config");
 
         assert_eq!(config_json["entropy"], serde_json::json!({}));
+        assert!(config_json.get("network-interfaces").is_none());
+    }
+
+    #[test]
+    fn firecracker_config_includes_network_interface_when_enabled() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let runtime_image = temp.path().join("runtime.ext4");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::write(workspace.join("README.md"), "hello\n").expect("write workspace file");
+        fs::write(&runtime_image, "runtime").expect("write runtime image");
+
+        let fake_firecracker = write_fake_firecracker(temp.path());
+        let mut config = base_runtime_config(temp.path(), &fake_firecracker);
+        config
+            .firecracker
+            .as_mut()
+            .expect("firecracker config")
+            .networking
+            .mode = super::super::FirecrackerNetworkingMode::HostProxy;
+        let runner = FirecrackerDirectRunner::new(
+            config.runtime_dir.clone(),
+            config
+                .firecracker
+                .clone()
+                .expect("firecracker config should exist"),
+        );
+        let run_dir = config
+            .runtime_dir
+            .join("runs")
+            .join("job-network-config-attempt-1-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+        let lease =
+            allocate_network_lease("172.22.0.0/16", 1, "oomtap", 3128).expect("allocate lease");
+
+        let config_path = runner
+            .write_firecracker_config(
+                &run_dir,
+                &runner.firecracker.rootfs_image_path,
+                &runtime_image,
+                &AttemptSpec {
+                    job_id: "job-config".to_string(),
+                    attempt_id: 1,
+                    workspace_dir: workspace,
+                    instruction: "noop".to_string(),
+                    limits: config.limits.clone(),
+                    agent: AgentExecutionSpec {
+                        provider: AgentProvider::Codex,
+                        codex_bin: "codex".to_string(),
+                        codex_auth_file: None,
+                        egress_proxy: None,
+                        egress_allowed_domains: vec!["api.openai.com".to_string()],
+                    },
+                },
+                Some(&lease),
+            )
+            .expect("write firecracker config");
+
+        let config_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).expect("read firecracker config"))
+                .expect("parse firecracker config");
+        assert_eq!(config_json["network-interfaces"][0]["iface_id"], "eth0");
+        assert_eq!(
+            config_json["network-interfaces"][0]["host_dev_name"],
+            "oomtap1"
+        );
+        assert_eq!(
+            config_json["network-interfaces"][0]["guest_mac"],
+            serde_json::json!("02:fc:00:00:00:01")
+        );
+    }
+
+    #[test]
+    fn allocate_network_lease_is_deterministic() {
+        let lease =
+            allocate_network_lease("172.22.0.0/16", 3, "oomtap", 3128).expect("allocate lease");
+        assert_eq!(lease.tap_name, "oomtap3");
+        assert_eq!(lease.host_ip, Ipv4Addr::new(172, 22, 0, 9));
+        assert_eq!(lease.guest_ip, Ipv4Addr::new(172, 22, 0, 10));
+        assert_eq!(lease.guest_ip_cidr(), "172.22.0.10/30");
+        assert_eq!(lease.host_proxy_url(), "http://172.22.0.9:3128");
+    }
+
+    #[test]
+    fn host_proxy_rejects_non_allowlisted_domain() {
+        let temp = TempDir::new().expect("tempdir");
+        let fake_firecracker = write_fake_firecracker(temp.path());
+        let config = base_runtime_config(temp.path(), &fake_firecracker);
+        let runner = FirecrackerDirectRunner::new(
+            config.runtime_dir.clone(),
+            config
+                .firecracker
+                .clone()
+                .expect("firecracker config should exist"),
+        );
+        let log_path = temp.path().join("network.log");
+        let lease = NetworkLease {
+            tap_name: "oomtap1".to_string(),
+            guest_iface: "eth0".to_string(),
+            host_ip: Ipv4Addr::LOCALHOST,
+            guest_ip: Ipv4Addr::new(127, 0, 0, 2),
+            prefix_len: 30,
+            guest_mac: "02:fc:00:00:00:01".to_string(),
+            proxy_port: 0,
+        };
+        let mut proxy = runner
+            .start_network_proxy(&lease, &["api.openai.com".to_string()], &log_path)
+            .expect("start proxy");
+
+        let mut client = TcpStream::connect(proxy.bind_addr).expect("connect");
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+            .expect("write request");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("read proxy response");
+        proxy.stop();
+
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        let log_contents = fs::read_to_string(&log_path).expect("read network log");
+        assert!(log_contents.contains("hostname not allowlisted"));
     }
 
     #[test]
@@ -1085,6 +1982,7 @@ mod tests {
                         .expect("codex filename")
                         .to_string_lossy()
                         .into_owned(),
+                    codex_auth_file: None,
                     egress_proxy: None,
                     egress_allowed_domains: Vec::new(),
                 },
@@ -1139,6 +2037,7 @@ mod tests {
             &AgentExecutionSpec {
                 provider: AgentProvider::Codex,
                 codex_bin: "/usr/local/bin/codex".to_string(),
+                codex_auth_file: None,
                 egress_proxy: Some("http://proxy.internal:3128".to_string()),
                 egress_allowed_domains: vec![
                     "api.openai.com".to_string(),
@@ -1147,6 +2046,7 @@ mod tests {
             },
             &["/opt/openoman/user-bin".to_string()],
             &[],
+            None,
         );
 
         assert!(env_file.contains("HTTPS_PROXY='http://proxy.internal:3128'"));
@@ -1154,6 +2054,51 @@ mod tests {
         assert!(
             env_file.contains("OPENOMAN_EGRESS_ALLOWED_DOMAINS='api.openai.com,files.openai.com'")
         );
+    }
+
+    #[test]
+    fn render_agent_env_includes_host_proxy_networking() {
+        let lease =
+            allocate_network_lease("172.22.0.0/16", 1, "oomtap", 3128).expect("allocate lease");
+        let env_file = render_agent_env(
+            &AgentExecutionSpec {
+                provider: AgentProvider::Codex,
+                codex_bin: "/usr/local/bin/codex".to_string(),
+                codex_auth_file: None,
+                egress_proxy: None,
+                egress_allowed_domains: vec!["api.openai.com".to_string()],
+            },
+            &[],
+            &[],
+            Some(&lease),
+        );
+
+        assert!(env_file.contains("OPENOMAN_NET_MODE='host-proxy'"));
+        assert!(env_file.contains("OPENOMAN_NET_IFACE='eth0'"));
+        assert!(env_file.contains("OPENOMAN_NET_GUEST_IPV4='172.22.0.2/30'"));
+        assert!(env_file.contains("OPENOMAN_NET_HOST_PROXY_URL='http://172.22.0.1:3128'"));
+        assert!(env_file.contains("HTTPS_PROXY='http://172.22.0.1:3128'"));
+        assert!(env_file.contains("HTTP_PROXY='http://172.22.0.1:3128'"));
+    }
+
+    #[test]
+    fn render_agent_env_includes_codex_auth_file_when_configured() {
+        let env_file = render_agent_env(
+            &AgentExecutionSpec {
+                provider: AgentProvider::Codex,
+                codex_bin: "/usr/local/bin/codex".to_string(),
+                codex_auth_file: Some(PathBuf::from("/host/.codex/auth.json")),
+                egress_proxy: None,
+                egress_allowed_domains: Vec::new(),
+            },
+            &[],
+            &[],
+            None,
+        );
+
+        assert!(env_file.contains(
+            "OPENOMAN_CODEX_AUTH_FILE='/mnt/runtime/openoman-config/codex-auth.json'"
+        ));
     }
 
     fn write_fake_firecracker(root: &Path) -> PathBuf {
@@ -1217,6 +2162,13 @@ exit 0
                     guest_path: PathBuf::from("/opt/openoman/user-bin"),
                     add_to_path: true,
                 }],
+                networking: super::super::FirecrackerNetworkingConfig {
+                    mode: super::super::FirecrackerNetworkingMode::Disabled,
+                    privilege_mode: super::super::FirecrackerNetworkPrivilegeMode::Direct,
+                    tap_name_prefix: "oomtap".to_string(),
+                    proxy_port: 3128,
+                    subnet_cidr: "172.22.0.0/16".to_string(),
+                },
             }),
         }
     }

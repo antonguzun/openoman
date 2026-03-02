@@ -79,6 +79,7 @@ Core now exposes:
     pub struct AgentExecutionSpec {
         pub provider: AgentProvider,
         pub codex_bin: String,
+        pub codex_auth_file: Option<PathBuf>,
         pub egress_proxy: Option<String>,
         pub egress_allowed_domains: Vec<String>,
     }
@@ -92,6 +93,7 @@ CLI config now supports:
     [agent]
     provider = "codex"
     codex_bin = "codex"
+    codex_auth_file = "~/.codex/auth.json"
     egress_allowed_domains = ["api.openai.com"]
     egress_proxy_url = "http://proxy.internal:3128"
 
@@ -100,3 +102,4 @@ Revision note (2026-03-01): Created Epic 6 ExecPlan and updated it inline during
 
 Revision note (2026-03-01): Updated plan after review feedback to require submit-time instructions and pass them to sandbox agent execution.
 Revision note (2026-03-02): Updated the documented agent contract to include the optional `egress_allowed_domains` list used by the current guest runtime wiring.
+Revision note (2026-03-02): Updated the documented agent contract to include the optional `codex_auth_file` passthrough used to stage a host Codex login into the guest runtime.

@@ -13,6 +13,27 @@ pub enum FirecrackerMode {
     Jailer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirecrackerNetworkingMode {
+    Disabled,
+    HostProxy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirecrackerNetworkPrivilegeMode {
+    Sudo,
+    Direct,
+}
+
+#[derive(Debug, Clone)]
+pub struct FirecrackerNetworkingConfig {
+    pub mode: FirecrackerNetworkingMode,
+    pub privilege_mode: FirecrackerNetworkPrivilegeMode,
+    pub tap_name_prefix: String,
+    pub proxy_port: u16,
+    pub subnet_cidr: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct UserPackageDir {
     pub host_path: PathBuf,
@@ -29,6 +50,7 @@ pub struct FirecrackerBackendConfig {
     pub rootfs_image_path: PathBuf,
     pub guest_cid_base: u32,
     pub user_package_dirs: Vec<UserPackageDir>,
+    pub networking: FirecrackerNetworkingConfig,
 }
 
 #[derive(Debug, Clone)]
