@@ -6,6 +6,7 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
+use clap::ArgAction;
 use openoman_core::{
     domain::{
         job::{ArtifactRef, Job, JobId, JobState, RepoRef, Revision},
@@ -87,6 +88,8 @@ enum FirecrackerNetCommands {
         host_ip: Ipv4Addr,
         #[arg(long)]
         prefix_len: u8,
+        #[arg(long, action = ArgAction::Set, default_value_t = false)]
+        allow_all: bool,
     },
     Teardown {
         #[arg(long)]
@@ -154,6 +157,11 @@ struct UserPackageDirConfig {
 #[derive(Debug, Deserialize)]
 struct AgentConfig {
     provider: Option<String>,
+    bin: Option<String>,
+    model: Option<String>,
+    auth_file: Option<String>,
+    api_key: Option<String>,
+    api_key_env: Option<String>,
     codex_bin: Option<String>,
     codex_auth_file: Option<String>,
     egress_proxy_url: Option<String>,
@@ -183,11 +191,13 @@ struct AppConfig {
     publishing: Option<PublishingRuntimeConfig>,
 }
 
-#[derive(Debug)]
 struct AgentRuntimeConfig {
     provider: AgentProvider,
-    codex_bin: String,
-    codex_auth_file: Option<PathBuf>,
+    bin: String,
+    model: Option<String>,
+    auth_file: Option<PathBuf>,
+    api_key: Option<String>,
+    api_key_env: Option<String>,
     egress_proxy: Option<String>,
     egress_allowed_domains: Vec<String>,
 }
@@ -202,6 +212,12 @@ struct PublishingRuntimeConfig {
     push_url: Option<String>,
     token: Option<String>,
     curl_bin: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CursorAuthCache {
+    #[serde(rename = "apiKey")]
+    api_key: Option<String>,
 }
 
 const LOG_LIMIT_BYTES: usize = 1024 * 1024;
@@ -307,19 +323,14 @@ fn run() -> Result<(), String> {
             let mut runner = sandbox_backend
                 .create_runner()
                 .map_err(|e| format!("failed to create sandbox runner: {e}"))?;
+            let agent_execution = resolve_agent_execution_spec(&config.agent)?;
             let attempt_spec = AttemptSpec {
                 job_id: job.id.as_str().to_string(),
                 attempt_id,
                 workspace_dir: prepared.sandbox_workspace_dir.clone(),
                 instruction: job.instruction.clone(),
                 limits: config.sandbox.limits.clone(),
-                agent: AgentExecutionSpec {
-                    provider: config.agent.provider,
-                    codex_bin: config.agent.codex_bin.clone(),
-                    codex_auth_file: config.agent.codex_auth_file.clone(),
-                    egress_proxy: config.agent.egress_proxy.clone(),
-                    egress_allowed_domains: config.agent.egress_allowed_domains.clone(),
-                },
+                agent: agent_execution,
             };
 
             let handle = runner
@@ -585,25 +596,16 @@ impl AppConfig {
             .unwrap_or_else(|| "./workspaces/trusted".to_string());
         let agent = agent.unwrap_or(AgentConfig {
             provider: None,
+            bin: None,
+            model: None,
+            auth_file: None,
+            api_key: None,
+            api_key_env: None,
             codex_bin: None,
             codex_auth_file: None,
             egress_proxy_url: None,
             egress_allowed_domains: None,
         });
-        let provider = match agent
-            .provider
-            .unwrap_or_else(|| "codex".to_string())
-            .to_lowercase()
-            .as_str()
-        {
-            "codex" => AgentProvider::Codex,
-            other => {
-                return Err(format!(
-                    "unsupported agent provider '{}'; supported providers: codex",
-                    other
-                ))
-            }
-        };
         let sandbox_backend = match sandbox
             .backend
             .unwrap_or_else(|| "firecracker".to_string())
@@ -623,16 +625,7 @@ impl AppConfig {
             path,
             matches!(sandbox_backend, SandboxBackendKind::Firecracker),
         )?;
-        let agent_runtime = AgentRuntimeConfig {
-            provider,
-            codex_bin: agent.codex_bin.unwrap_or_else(|| "codex".to_string()),
-            codex_auth_file: match agent.codex_auth_file {
-                Some(raw_path) => Some(resolve_config_path(path, &raw_path)?),
-                None => None,
-            },
-            egress_proxy: agent.egress_proxy_url,
-            egress_allowed_domains: normalize_egress_allowed_domains(agent.egress_allowed_domains)?,
-        };
+        let agent_runtime = load_agent_runtime_config(agent, path)?;
         validate_agent_networking_contract(firecracker.as_ref(), &agent_runtime)?;
 
         Ok(Self {
@@ -659,6 +652,188 @@ impl AppConfig {
             publishing: load_publishing_config(publishing, path)?,
         })
     }
+}
+
+fn load_agent_runtime_config(
+    config: AgentConfig,
+    config_path: &Path,
+) -> Result<AgentRuntimeConfig, String> {
+    let provider = parse_agent_provider(config.provider.as_deref())?;
+    let bin = resolve_agent_bin(provider, config.bin.as_deref(), config.codex_bin.as_deref())?;
+    let model = resolve_agent_model(provider, config.model.as_deref())?;
+    let auth_file = resolve_agent_auth_file(
+        provider,
+        config_path,
+        config.auth_file.as_deref(),
+        config.codex_auth_file.as_deref(),
+    )?;
+    let (api_key, api_key_env) = resolve_agent_api_key_config(
+        provider,
+        config.api_key.as_deref(),
+        config.api_key_env.as_deref(),
+    )?;
+
+    Ok(AgentRuntimeConfig {
+        provider,
+        bin,
+        model,
+        auth_file,
+        api_key,
+        api_key_env,
+        egress_proxy: config.egress_proxy_url,
+        egress_allowed_domains: normalize_egress_allowed_domains(config.egress_allowed_domains)?,
+    })
+}
+
+fn parse_agent_provider(raw: Option<&str>) -> Result<AgentProvider, String> {
+    match raw.unwrap_or("codex").trim().to_ascii_lowercase().as_str() {
+        "codex" => Ok(AgentProvider::Codex),
+        "cursor" => Ok(AgentProvider::Cursor),
+        other => Err(format!(
+            "unsupported agent provider '{}'; supported providers: codex, cursor",
+            other
+        )),
+    }
+}
+
+fn resolve_agent_bin(
+    provider: AgentProvider,
+    neutral_bin: Option<&str>,
+    legacy_codex_bin: Option<&str>,
+) -> Result<String, String> {
+    let neutral_bin = normalize_optional_string(neutral_bin, "agent.bin")?;
+    let legacy_codex_bin = normalize_optional_string(legacy_codex_bin, "agent.codex_bin")?;
+
+    match provider {
+        AgentProvider::Codex => match (neutral_bin, legacy_codex_bin) {
+            (Some(bin), Some(legacy_bin)) if bin != legacy_bin => Err(
+                "agent.bin conflicts with legacy agent.codex_bin; set only one value or make them identical"
+                    .to_string(),
+            ),
+            (Some(bin), _) => Ok(bin),
+            (None, Some(bin)) => Ok(bin),
+            (None, None) => Ok("codex".to_string()),
+        },
+        AgentProvider::Cursor => {
+            if legacy_codex_bin.is_some() {
+                return Err(
+                    "agent.codex_bin is a Codex-only compatibility field and cannot be set when agent.provider = \"cursor\""
+                        .to_string(),
+                );
+            }
+            Ok(neutral_bin.unwrap_or_else(|| "cursor-agent".to_string()))
+        }
+    }
+}
+
+fn resolve_agent_model(
+    provider: AgentProvider,
+    model: Option<&str>,
+) -> Result<Option<String>, String> {
+    let model = normalize_optional_string(model, "agent.model")?;
+
+    match provider {
+        AgentProvider::Codex => {
+            if model.is_some() {
+                return Err(
+                    "agent.model is currently supported only when agent.provider = \"cursor\""
+                        .to_string(),
+                );
+            }
+            Ok(None)
+        }
+        AgentProvider::Cursor => Ok(model),
+    }
+}
+
+fn resolve_agent_auth_file(
+    provider: AgentProvider,
+    config_path: &Path,
+    neutral_auth_file: Option<&str>,
+    legacy_codex_auth_file: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    let neutral_auth_file =
+        resolve_optional_config_path(config_path, neutral_auth_file, "agent.auth_file")?;
+    let legacy_codex_auth_file =
+        resolve_optional_config_path(config_path, legacy_codex_auth_file, "agent.codex_auth_file")?;
+
+    match provider {
+        AgentProvider::Codex => match (neutral_auth_file, legacy_codex_auth_file) {
+            (Some(auth_file), Some(legacy_auth_file)) if auth_file != legacy_auth_file => Err(
+                "agent.auth_file conflicts with legacy agent.codex_auth_file; set only one value or make them identical"
+                    .to_string(),
+            ),
+            (Some(auth_file), _) => Ok(Some(auth_file)),
+            (None, Some(auth_file)) => Ok(Some(auth_file)),
+            (None, None) => Ok(None),
+        },
+        AgentProvider::Cursor => {
+            if neutral_auth_file.is_some() || legacy_codex_auth_file.is_some() {
+                return Err(
+                    "agent.auth_file and legacy agent.codex_auth_file are Codex-only fields and cannot be set when agent.provider = \"cursor\""
+                        .to_string(),
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn resolve_agent_api_key_config(
+    provider: AgentProvider,
+    api_key: Option<&str>,
+    api_key_env: Option<&str>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let api_key = normalize_optional_string(api_key, "agent.api_key")?;
+    let api_key_env = normalize_optional_string(api_key_env, "agent.api_key_env")?;
+    match provider {
+        AgentProvider::Codex => {
+            if api_key.is_some() || api_key_env.is_some() {
+                return Err(
+                    "agent.api_key and agent.api_key_env are Cursor-only fields and cannot be set when agent.provider = \"codex\""
+                        .to_string(),
+                );
+            }
+            Ok((None, None))
+        }
+        AgentProvider::Cursor => match (api_key, api_key_env) {
+            (Some(_), Some(_)) => Err(
+                "agent.api_key and agent.api_key_env are mutually exclusive; set only one when agent.provider = \"cursor\""
+                    .to_string(),
+            ),
+            (Some(api_key), None) => Ok((Some(api_key), None)),
+            (None, Some(api_key_env)) => Ok((None, Some(api_key_env))),
+            (None, None) => Err(
+                "agent.api_key or agent.api_key_env is required when agent.provider = \"cursor\""
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn normalize_optional_string(
+    raw: Option<&str>,
+    field_name: &str,
+) -> Result<Option<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let normalized = raw.trim();
+    if normalized.is_empty() {
+        return Err(format!("{field_name} must not be empty"));
+    }
+    Ok(Some(normalized.to_string()))
+}
+
+fn resolve_optional_config_path(
+    config_path: &Path,
+    raw: Option<&str>,
+    field_name: &str,
+) -> Result<Option<PathBuf>, String> {
+    let Some(raw) = normalize_optional_string(raw, field_name)? else {
+        return Ok(None);
+    };
+    resolve_config_path(config_path, &raw).map(Some)
 }
 
 impl PublishingRuntimeConfig {
@@ -711,6 +886,81 @@ fn normalize_egress_allowed_domains(domains: Option<Vec<String>>) -> Result<Vec<
         }
     }
     Ok(normalized)
+}
+
+fn resolve_agent_execution_spec(config: &AgentRuntimeConfig) -> Result<AgentExecutionSpec, String> {
+    let api_key = match config.provider {
+        AgentProvider::Codex => None,
+        AgentProvider::Cursor => {
+            if let Some(api_key) = &config.api_key {
+                Some(api_key.clone())
+            } else {
+                let env_name = config.api_key_env.as_deref().ok_or_else(|| {
+                    "agent.api_key or agent.api_key_env is required when agent.provider = \"cursor\""
+                        .to_string()
+                })?;
+                let value = env::var(env_name).map_err(|_| {
+                    format!("agent.api_key_env references missing environment variable {env_name}")
+                })?;
+                if value.trim().is_empty() {
+                    return Err(format!(
+                        "environment variable {env_name} referenced by agent.api_key_env must not be empty"
+                    ));
+                }
+                Some(value)
+            }
+        }
+    };
+    let auth_file = match config.provider {
+        AgentProvider::Codex => config.auth_file.clone(),
+        AgentProvider::Cursor => api_key
+            .as_deref()
+            .and_then(discover_matching_cursor_auth_cache_path),
+    };
+
+    Ok(AgentExecutionSpec {
+        provider: config.provider,
+        bin: config.bin.clone(),
+        model: config.model.clone(),
+        auth_file,
+        api_key,
+        egress_proxy: config.egress_proxy.clone(),
+        egress_allowed_domains: config.egress_allowed_domains.clone(),
+    })
+}
+
+fn discover_matching_cursor_auth_cache_path(api_key: &str) -> Option<PathBuf> {
+    let home = env::var_os("HOME")?;
+    discover_matching_cursor_auth_cache_path_in_home(api_key, &PathBuf::from(home))
+}
+
+fn discover_matching_cursor_auth_cache_path_in_home(
+    api_key: &str,
+    home: &Path,
+) -> Option<PathBuf> {
+    let auth_path = home.join(".config/cursor/auth.json");
+    let contents = fs::read_to_string(&auth_path).ok()?;
+    let auth_cache: CursorAuthCache = serde_json::from_str(&contents).ok()?;
+    if auth_cache.api_key.as_deref() == Some(api_key) {
+        Some(auth_path)
+    } else {
+        None
+    }
+}
+
+impl std::fmt::Debug for AgentRuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentRuntimeConfig")
+            .field("provider", &self.provider)
+            .field("bin", &self.bin)
+            .field("model", &self.model)
+            .field("auth_file", &self.auth_file)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("api_key_env", &self.api_key_env)
+            .field("egress_proxy", &self.egress_proxy)
+            .field("egress_allowed_domains", &self.egress_allowed_domains)
+            .finish()
+    }
 }
 
 fn load_publishing_config(
@@ -924,16 +1174,18 @@ fn validate_agent_networking_contract(
     firecracker: Option<&FirecrackerBackendConfig>,
     agent: &AgentRuntimeConfig,
 ) -> Result<(), String> {
-    if let Some(auth_file) = &agent.codex_auth_file {
+    const CURSOR_REQUIRED_HOST_PROXY_DOMAIN: &str = "api2.cursor.sh";
+
+    if let Some(auth_file) = &agent.auth_file {
         let metadata = fs::metadata(auth_file).map_err(|e| {
             format!(
-                "agent.codex_auth_file does not exist or is not readable at {}: {e}",
+                "agent.auth_file does not exist or is not readable at {}: {e}",
                 auth_file.display()
             )
         })?;
         if !metadata.is_file() {
             return Err(format!(
-                "agent.codex_auth_file must point to a regular file: {}",
+                "agent.auth_file must point to a regular file: {}",
                 auth_file.display()
             ));
         }
@@ -957,6 +1209,17 @@ fn validate_agent_networking_contract(
             "agent.egress_proxy_url must not be set when sandbox.firecracker.network.mode = \"host-proxy\" because the host proxy is configured automatically"
                 .to_string(),
         );
+    }
+    if agent.provider == AgentProvider::Cursor
+        && !agent.egress_allowed_domains.iter().any(|domain| domain == "*")
+        && !agent
+            .egress_allowed_domains
+            .iter()
+            .any(|domain| domain == CURSOR_REQUIRED_HOST_PROXY_DOMAIN)
+    {
+        return Err(format!(
+            "agent.egress_allowed_domains must include \"{CURSOR_REQUIRED_HOST_PROXY_DOMAIN}\" when agent.provider = \"cursor\" and sandbox.firecracker.network.mode = \"host-proxy\" because Cursor CLI print mode tunnels through that hostname"
+        ));
     }
     Ok(())
 }
@@ -1040,12 +1303,18 @@ fn run_firecracker_net_internal(command: FirecrackerNetCommands) -> Result<(), S
             tap_name,
             host_ip,
             prefix_len,
-        } => firecracker_net_setup(&tap_name, host_ip, prefix_len),
+            allow_all,
+        } => firecracker_net_setup(&tap_name, host_ip, prefix_len, allow_all),
         FirecrackerNetCommands::Teardown { tap_name } => firecracker_net_teardown(&tap_name),
     }
 }
 
-fn firecracker_net_setup(tap_name: &str, host_ip: Ipv4Addr, prefix_len: u8) -> Result<(), String> {
+fn firecracker_net_setup(
+    tap_name: &str,
+    host_ip: Ipv4Addr,
+    prefix_len: u8,
+    allow_all: bool,
+) -> Result<(), String> {
     validate_tap_name(tap_name)?;
     if prefix_len > 30 {
         return Err("prefix_len must be 30 or smaller".to_string());
@@ -1085,11 +1354,16 @@ fn firecracker_net_setup(tap_name: &str, host_ip: Ipv4Addr, prefix_len: u8) -> R
         tap_name.to_string(),
         "up".to_string(),
     ])?;
+    if allow_all {
+        configure_firecracker_nat(tap_name, host_ip, prefix_len)?;
+    }
     Ok(())
 }
 
 fn firecracker_net_teardown(tap_name: &str) -> Result<(), String> {
     validate_tap_name(tap_name)?;
+    let subnet = firecracker_tap_subnet_cidr(tap_name).ok();
+    let _ = teardown_firecracker_nat(subnet.as_deref());
     let output = ProcessCommand::new("ip")
         .args(["link", "delete", "dev", tap_name])
         .output()
@@ -1122,6 +1396,178 @@ fn validate_tap_name(tap_name: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn configure_firecracker_nat(
+    tap_name: &str,
+    host_ip: Ipv4Addr,
+    prefix_len: u8,
+) -> Result<(), String> {
+    let subnet = ipv4_network_cidr(host_ip, prefix_len)?;
+    run_sysctl_command("net.ipv4.ip_forward=1")?;
+    run_iptables_command(&[
+        "-A".to_string(),
+        "FORWARD".to_string(),
+        "-i".to_string(),
+        tap_name.to_string(),
+        "-s".to_string(),
+        subnet.clone(),
+        "-j".to_string(),
+        "ACCEPT".to_string(),
+    ])?;
+    run_iptables_command(&[
+        "-A".to_string(),
+        "FORWARD".to_string(),
+        "-d".to_string(),
+        subnet.clone(),
+        "-m".to_string(),
+        "conntrack".to_string(),
+        "--ctstate".to_string(),
+        "ESTABLISHED,RELATED".to_string(),
+        "-j".to_string(),
+        "ACCEPT".to_string(),
+    ])?;
+    run_iptables_command(&[
+        "-t".to_string(),
+        "nat".to_string(),
+        "-A".to_string(),
+        "POSTROUTING".to_string(),
+        "-s".to_string(),
+        subnet,
+        "-j".to_string(),
+        "MASQUERADE".to_string(),
+    ])?;
+    Ok(())
+}
+
+fn teardown_firecracker_nat(subnet: Option<&str>) -> Result<(), String> {
+    let Some(subnet) = subnet else {
+        return Ok(());
+    };
+    let _ = run_iptables_command_allow_missing(&[
+        "-D".to_string(),
+        "FORWARD".to_string(),
+        "-d".to_string(),
+        subnet.to_string(),
+        "-m".to_string(),
+        "conntrack".to_string(),
+        "--ctstate".to_string(),
+        "ESTABLISHED,RELATED".to_string(),
+        "-j".to_string(),
+        "ACCEPT".to_string(),
+    ]);
+    let _ = run_iptables_command_allow_missing(&[
+        "-D".to_string(),
+        "FORWARD".to_string(),
+        "-s".to_string(),
+        subnet.to_string(),
+        "-j".to_string(),
+        "ACCEPT".to_string(),
+    ]);
+    let _ = run_iptables_command_allow_missing(&[
+        "-t".to_string(),
+        "nat".to_string(),
+        "-D".to_string(),
+        "POSTROUTING".to_string(),
+        "-s".to_string(),
+        subnet.to_string(),
+        "-j".to_string(),
+        "MASQUERADE".to_string(),
+    ]);
+    Ok(())
+}
+
+fn firecracker_tap_subnet_cidr(tap_name: &str) -> Result<String, String> {
+    let output = ProcessCommand::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", tap_name])
+        .output()
+        .map_err(|e| format!("failed to inspect tap device {tap_name}: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("does not exist") || stderr.contains("Cannot find device") {
+            return Err(stderr.trim().to_string());
+        }
+        return Err(format!(
+            "failed to inspect tap device {tap_name}: {}",
+            stderr.trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let cidr = stdout
+        .split_whitespace()
+        .skip_while(|token| *token != "inet")
+        .nth(1)
+        .ok_or_else(|| format!("tap device {tap_name} has no IPv4 address"))?;
+    let (address, prefix_len) = cidr
+        .split_once('/')
+        .ok_or_else(|| format!("tap device {tap_name} reported invalid IPv4 CIDR: {cidr}"))?;
+    let host_ip = address
+        .parse::<Ipv4Addr>()
+        .map_err(|e| format!("invalid tap host IPv4 {address}: {e}"))?;
+    let prefix_len = prefix_len
+        .parse::<u8>()
+        .map_err(|e| format!("invalid tap prefix length {prefix_len}: {e}"))?;
+    ipv4_network_cidr(host_ip, prefix_len)
+}
+
+fn ipv4_network_cidr(host_ip: Ipv4Addr, prefix_len: u8) -> Result<String, String> {
+    if prefix_len > 32 {
+        return Err(format!("invalid IPv4 prefix length {prefix_len}"));
+    }
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << u32::from(32 - prefix_len)
+    };
+    let network = Ipv4Addr::from(u32::from(host_ip) & mask);
+    Ok(format!("{network}/{prefix_len}"))
+}
+
+fn run_sysctl_command(setting: &str) -> Result<(), String> {
+    let output = ProcessCommand::new("sysctl")
+        .args(["-w", setting])
+        .output()
+        .map_err(|e| format!("failed to launch sysctl -w {setting}: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "sysctl -w {setting} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn run_iptables_command(args: &[String]) -> Result<(), String> {
+    let output = ProcessCommand::new("iptables")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to launch iptables {}: {e}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "iptables {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn run_iptables_command_allow_missing(args: &[String]) -> Result<(), String> {
+    let output = ProcessCommand::new("iptables")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to launch iptables {}: {e}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("No chain/target/match by that name")
+        || stderr.contains("Bad rule")
+        || stderr.contains("No such file or directory")
+    {
+        return Ok(());
+    }
+    Err(format!("iptables {} failed: {}", args.join(" "), stderr.trim()))
 }
 
 fn run_ip_command(args: &[String]) -> Result<(), String> {
@@ -1502,8 +1948,8 @@ rootfs_image_path = "./guest/out/rootfs.ext4"
 
 [agent]
 provider = "codex"
-codex_bin = "/usr/local/bin/codex"
-codex_auth_file = "{}"
+bin = "/usr/local/bin/codex"
+auth_file = "{}"
 egress_proxy_url = "http://proxy.internal:3128"
 egress_allowed_domains = ["api.openai.com", " api.openai.com ", "files.openai.com"]
 "#,
@@ -1514,10 +1960,8 @@ egress_allowed_domains = ["api.openai.com", " api.openai.com ", "files.openai.co
 
         let loaded = AppConfig::load(&config_path).expect("load config");
 
-        assert_eq!(
-            loaded.agent.codex_auth_file.as_deref(),
-            Some(auth_path.as_path())
-        );
+        assert_eq!(loaded.agent.bin, "/usr/local/bin/codex");
+        assert_eq!(loaded.agent.auth_file.as_deref(), Some(auth_path.as_path()));
         assert_eq!(
             loaded.agent.egress_proxy.as_deref(),
             Some("http://proxy.internal:3128")
@@ -1561,7 +2005,7 @@ subnet_cidr = "172.30.0.0/16"
 
 [agent]
 provider = "codex"
-codex_bin = "/usr/local/bin/codex"
+bin = "/usr/local/bin/codex"
 egress_allowed_domains = ["api.openai.com"]
 "#,
         )
@@ -1598,6 +2042,17 @@ egress_allowed_domains = ["api.openai.com"]
     }
 
     #[test]
+    fn normalize_egress_allowed_domains_preserves_wildcard() {
+        let domains = normalize_egress_allowed_domains(Some(vec![
+            "*".to_string(),
+            " * ".to_string(),
+        ]))
+        .expect("wildcard should be accepted");
+
+        assert_eq!(domains, vec!["*".to_string()]);
+    }
+
+    #[test]
     fn host_proxy_mode_rejects_manual_proxy_url() {
         let temp = TempDir::new().expect("tempdir");
         let config_path = temp.path().join("config.toml");
@@ -1626,7 +2081,7 @@ mode = "host-proxy"
 
 [agent]
 provider = "codex"
-codex_bin = "/usr/local/bin/codex"
+bin = "/usr/local/bin/codex"
 egress_proxy_url = "http://proxy.internal:3128"
 egress_allowed_domains = ["api.openai.com"]
 "#,
@@ -1639,7 +2094,94 @@ egress_allowed_domains = ["api.openai.com"]
     }
 
     #[test]
-    fn app_config_rejects_missing_codex_auth_file() {
+    fn app_config_loads_legacy_codex_aliases() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        let auth_path = temp.path().join("auth.json");
+        fs::write(&auth_path, "{}").expect("write auth file");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+[agent]
+provider = "codex"
+codex_bin = "/usr/local/bin/codex"
+codex_auth_file = "{}"
+"#,
+                auth_path.display()
+            ),
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        assert_eq!(loaded.agent.bin, "/usr/local/bin/codex");
+        assert_eq!(loaded.agent.model, None);
+        assert_eq!(loaded.agent.auth_file.as_deref(), Some(auth_path.as_path()));
+        assert_eq!(loaded.agent.api_key_env, None);
+    }
+
+    #[test]
+    fn app_config_loads_cursor_provider() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+[agent]
+provider = "cursor"
+bin = "/usr/local/bin/cursor-agent"
+model = "gpt-5"
+api_key = "cursor-test-key"
+egress_allowed_domains = ["api2.cursor.sh"]
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        assert_eq!(loaded.agent.provider, AgentProvider::Cursor);
+        assert_eq!(loaded.agent.bin, "/usr/local/bin/cursor-agent");
+        assert_eq!(loaded.agent.model.as_deref(), Some("gpt-5"));
+        assert_eq!(loaded.agent.api_key.as_deref(), Some("cursor-test-key"));
+        assert_eq!(loaded.agent.api_key_env.as_deref(), None);
+        assert_eq!(loaded.agent.auth_file, None);
+    }
+
+    #[test]
+    fn app_config_rejects_conflicting_codex_bin_fields() {
         let temp = TempDir::new().expect("tempdir");
         let config_path = temp.path().join("config.toml");
         fs::write(
@@ -1664,15 +2206,360 @@ rootfs_image_path = "./guest/out/rootfs.ext4"
 
 [agent]
 provider = "codex"
+bin = "/usr/local/bin/codex"
+codex_bin = "/usr/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        let err = AppConfig::load(&config_path).expect_err("conflicting bin fields should fail");
+        assert!(err.contains("agent.bin conflicts"));
+    }
+
+    #[test]
+    fn app_config_rejects_cursor_without_api_key_or_env() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+[agent]
+provider = "cursor"
+bin = "/usr/local/bin/cursor-agent"
+"#,
+        )
+        .expect("write config");
+
+        let err = AppConfig::load(&config_path).expect_err("missing api_key_env should fail");
+        assert!(err.contains("agent.api_key or agent.api_key_env"));
+        assert!(err.contains("cursor"));
+    }
+
+    #[test]
+    fn app_config_rejects_cursor_with_codex_aliases() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+[agent]
+provider = "cursor"
+bin = "/usr/local/bin/cursor-agent"
+api_key = "cursor-test-key"
 codex_bin = "/usr/local/bin/codex"
-codex_auth_file = "./missing-auth.json"
+"#,
+        )
+        .expect("write config");
+
+        let err = AppConfig::load(&config_path).expect_err("cursor should reject codex aliases");
+        assert!(err.contains("agent.codex_bin"));
+        assert!(err.contains("cursor"));
+    }
+
+    #[test]
+    fn app_config_rejects_cursor_with_both_api_key_and_env() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+[agent]
+provider = "cursor"
+bin = "/usr/local/bin/cursor-agent"
+api_key = "cursor-test-key"
+api_key_env = "OPENOMAN_CURSOR_API_KEY"
+"#,
+        )
+        .expect("write config");
+
+        let err = AppConfig::load(&config_path).expect_err("ambiguous cursor auth should fail");
+        assert!(err.contains("agent.api_key and agent.api_key_env are mutually exclusive"));
+    }
+
+    #[test]
+    fn app_config_rejects_cursor_host_proxy_without_api2_cursor_sh() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+[sandbox.firecracker.network]
+mode = "host-proxy"
+tap_name_prefix = "oomtap"
+subnet_cidr = "172.22.0.0/30"
+
+[agent]
+provider = "cursor"
+bin = "/usr/local/bin/cursor-agent"
+api_key = "cursor-test-key"
+egress_allowed_domains = ["api.cursor.com"]
+"#,
+        )
+        .expect("write config");
+
+        let err =
+            AppConfig::load(&config_path).expect_err("cursor host-proxy should require api2");
+        assert!(err.contains("api2.cursor.sh"));
+        assert!(err.contains("agent.egress_allowed_domains"));
+    }
+
+    #[test]
+    fn app_config_accepts_cursor_host_proxy_wildcard_allowlist() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+[sandbox.firecracker.network]
+mode = "host-proxy"
+tap_name_prefix = "oomtap"
+subnet_cidr = "172.22.0.0/30"
+
+[agent]
+provider = "cursor"
+bin = "/usr/local/bin/cursor-agent"
+api_key = "cursor-test-key"
+egress_allowed_domains = ["*"]
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("wildcard allowlist should load");
+        assert_eq!(loaded.agent.egress_allowed_domains, vec!["*".to_string()]);
+    }
+
+    #[test]
+    fn app_config_rejects_missing_agent_auth_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+auth_file = "./missing-auth.json"
 "#,
         )
         .expect("write config");
 
         let err = AppConfig::load(&config_path).expect_err("missing auth file should fail");
-        assert!(err.contains("agent.codex_auth_file"));
+        assert!(err.contains("agent.auth_file"));
         assert!(err.contains("missing-auth.json"));
+    }
+
+    #[test]
+    fn app_config_rejects_codex_model() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+model = "gpt-5"
+"#,
+        )
+        .expect("write config");
+
+        let err = AppConfig::load(&config_path).expect_err("codex should reject agent.model");
+        assert!(err.contains("agent.model"));
+        assert!(err.contains("cursor"));
+    }
+
+    #[test]
+    fn resolve_agent_execution_spec_uses_configured_cursor_api_key() {
+        let config = AgentRuntimeConfig {
+            provider: AgentProvider::Cursor,
+            bin: "cursor-agent".to_string(),
+            model: Some("gpt-5".to_string()),
+            auth_file: None,
+            api_key: Some("cursor-inline-secret".to_string()),
+            api_key_env: None,
+            egress_proxy: None,
+            egress_allowed_domains: vec!["api2.cursor.sh".to_string()],
+        };
+
+        let spec = resolve_agent_execution_spec(&config)
+            .expect("cursor execution should use inline api key");
+        assert_eq!(spec.model.as_deref(), Some("gpt-5"));
+        assert_eq!(spec.api_key.as_deref(), Some("cursor-inline-secret"));
+    }
+
+    #[test]
+    fn discover_matching_cursor_auth_cache_path_in_home_matches_api_key() {
+        let temp = TempDir::new().expect("tempdir");
+        let auth_dir = temp.path().join(".config/cursor");
+        fs::create_dir_all(&auth_dir).expect("create auth dir");
+        let auth_path = auth_dir.join("auth.json");
+        fs::write(
+            &auth_path,
+            r#"{"apiKey":"cursor-inline-secret","accessToken":"token","refreshToken":"token"}"#,
+        )
+        .expect("write auth file");
+
+        let discovered = discover_matching_cursor_auth_cache_path_in_home(
+            "cursor-inline-secret",
+            temp.path(),
+        );
+        assert_eq!(discovered.as_deref(), Some(auth_path.as_path()));
+    }
+
+    #[test]
+    fn discover_matching_cursor_auth_cache_path_in_home_ignores_mismatched_api_key() {
+        let temp = TempDir::new().expect("tempdir");
+        let auth_dir = temp.path().join(".config/cursor");
+        fs::create_dir_all(&auth_dir).expect("create auth dir");
+        fs::write(
+            auth_dir.join("auth.json"),
+            r#"{"apiKey":"different-secret","accessToken":"token","refreshToken":"token"}"#,
+        )
+        .expect("write auth file");
+
+        let discovered = discover_matching_cursor_auth_cache_path_in_home(
+            "cursor-inline-secret",
+            temp.path(),
+        );
+        assert_eq!(discovered, None);
+    }
+
+    #[test]
+    fn resolve_agent_execution_spec_requires_cursor_host_env() {
+        let config = AgentRuntimeConfig {
+            provider: AgentProvider::Cursor,
+            bin: "cursor-agent".to_string(),
+            model: None,
+            auth_file: None,
+            api_key: None,
+            api_key_env: Some("OPENOMAN_CURSOR_API_KEY_TEST_DOES_NOT_EXIST".to_string()),
+            egress_proxy: None,
+            egress_allowed_domains: vec!["api2.cursor.sh".to_string()],
+        };
+
+        let err = resolve_agent_execution_spec(&config)
+            .expect_err("cursor execution should require an API key env var");
+        assert!(err.contains("agent.api_key_env"));
+        assert!(err.contains("OPENOMAN_CURSOR_API_KEY_TEST_DOES_NOT_EXIST"));
     }
 
     #[test]
@@ -1701,7 +2588,7 @@ rootfs_image_path = "./guest/out/rootfs.ext4"
 
 [agent]
 provider = "codex"
-codex_bin = "/usr/local/bin/codex"
+bin = "/usr/local/bin/codex"
 
 [publishing]
 provider = "github"

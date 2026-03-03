@@ -27,11 +27,13 @@ pub struct AttemptSpec {
     pub agent: AgentExecutionSpec,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentExecutionSpec {
     pub provider: AgentProvider,
-    pub codex_bin: String,
-    pub codex_auth_file: Option<PathBuf>,
+    pub bin: String,
+    pub model: Option<String>,
+    pub auth_file: Option<PathBuf>,
+    pub api_key: Option<String>,
     pub egress_proxy: Option<String>,
     pub egress_allowed_domains: Vec<String>,
 }
@@ -39,6 +41,21 @@ pub struct AgentExecutionSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentProvider {
     Codex,
+    Cursor,
+}
+
+impl std::fmt::Debug for AgentExecutionSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentExecutionSpec")
+            .field("provider", &self.provider)
+            .field("bin", &self.bin)
+            .field("model", &self.model)
+            .field("auth_file", &self.auth_file)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("egress_proxy", &self.egress_proxy)
+            .field("egress_allowed_domains", &self.egress_allowed_domains)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

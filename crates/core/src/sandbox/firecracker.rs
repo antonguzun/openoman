@@ -295,8 +295,8 @@ impl FirecrackerDirectRunner {
 
         fs::write(config_dir.join("instruction.txt"), &spec.instruction)?;
         fs::write(config_dir.join("package-mounts.tsv"), manifest)?;
-        if let Some(auth_file) = &spec.agent.codex_auth_file {
-            fs::copy(auth_file, config_dir.join("codex-auth.json"))?;
+        if let Some(auth_file) = &spec.agent.auth_file {
+            fs::copy(auth_file, config_dir.join("agent-auth.json"))?;
         }
         fs::write(
             config_dir.join("agent.env"),
@@ -516,6 +516,14 @@ impl FirecrackerDirectRunner {
                 ("--tap-name", lease.tap_name.clone()),
                 ("--host-ip", lease.host_ip.to_string()),
                 ("--prefix-len", lease.prefix_len.to_string()),
+                (
+                    "--allow-all",
+                    if spec.agent.egress_allowed_domains.iter().any(|domain| domain == "*") {
+                        "true".to_string()
+                    } else {
+                        "false".to_string()
+                    },
+                ),
             ],
             &log_path,
         )?;
@@ -1211,7 +1219,7 @@ fn handle_connect_proxy_client(
         );
         return;
     }
-    if !allowed_domains.iter().any(|allowed| allowed == &host) {
+    if !allowlisted_domain_matches(&allowed_domains, &host) {
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
         write_shared_log(
             &log,
@@ -1262,6 +1270,12 @@ fn handle_connect_proxy_client(
     }
 }
 
+fn allowlisted_domain_matches(allowed_domains: &[String], host: &str) -> bool {
+    allowed_domains
+        .iter()
+        .any(|allowed| allowed == "*" || allowed == host)
+}
+
 fn read_connect_proxy_request(stream: &mut TcpStream) -> io::Result<String> {
     let mut request = Vec::new();
     let mut chunk = [0_u8; 1024];
@@ -1270,19 +1284,49 @@ fn read_connect_proxy_request(stream: &mut TcpStream) -> io::Result<String> {
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "connection closed before proxy request headers were complete",
+                format!(
+                    "connection closed before proxy request headers were complete; partial request={}",
+                    format_proxy_request_preview(&request)
+                ),
             ));
         }
         request.extend_from_slice(&chunk[..read]);
-        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+        if proxy_request_headers_complete(&request) {
             return Ok(String::from_utf8_lossy(&request).into_owned());
         }
     }
 
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        "proxy request headers exceeded size limit",
+        format!(
+            "proxy request headers exceeded size limit; partial request={}",
+            format_proxy_request_preview(&request)
+        ),
     ))
+}
+
+fn proxy_request_headers_complete(request: &[u8]) -> bool {
+    request.windows(4).any(|window| window == b"\r\n\r\n")
+        || request.windows(2).any(|window| window == b"\n\n")
+}
+
+fn format_proxy_request_preview(request: &[u8]) -> String {
+    const MAX_PREVIEW_BYTES: usize = 256;
+
+    if request.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    let mut preview = String::new();
+    for &byte in request.iter().take(MAX_PREVIEW_BYTES) {
+        for escaped in std::ascii::escape_default(byte) {
+            preview.push(escaped as char);
+        }
+    }
+    if request.len() > MAX_PREVIEW_BYTES {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn parse_connect_request(request: &str) -> Result<(String, String, u16), &'static str> {
@@ -1448,22 +1492,28 @@ fn render_agent_env(
         "AGENT_PROVIDER={}\n",
         match agent.provider {
             AgentProvider::Codex => "codex",
+            AgentProvider::Cursor => "cursor",
         }
     ));
     env_file.push_str(&format!(
-        "CODEX_BIN={}\n",
-        shell_quote(&resolve_guest_codex_bin(
-            &agent.codex_bin,
-            user_package_dirs
-        ))
+        "AGENT_BIN={}\n",
+        shell_quote(&resolve_guest_agent_bin(&agent.bin, user_package_dirs))
     ));
-    if agent.codex_auth_file.is_some() {
+    if let Some(model) = &agent.model {
+        env_file.push_str(&format!("AGENT_MODEL={}\n", shell_quote(model)));
+    }
+    if agent.auth_file.is_some() {
         env_file
-            .push_str("OPENOMAN_CODEX_AUTH_FILE='/mnt/runtime/openoman-config/codex-auth.json'\n");
+            .push_str("OPENOMAN_AGENT_AUTH_FILE='/mnt/runtime/openoman-config/agent-auth.json'\n");
+    }
+    if let Some(api_key) = &agent.api_key {
+        env_file.push_str(&format!("export CURSOR_API_KEY={}\n", shell_quote(api_key)));
     }
     if let Some(proxy) = &agent.egress_proxy {
-        env_file.push_str(&format!("HTTPS_PROXY={}\n", shell_quote(proxy)));
-        env_file.push_str(&format!("HTTP_PROXY={}\n", shell_quote(proxy)));
+        env_file.push_str(&format!("export HTTPS_PROXY={}\n", shell_quote(proxy)));
+        env_file.push_str(&format!("export HTTP_PROXY={}\n", shell_quote(proxy)));
+        env_file.push_str(&format!("export https_proxy={}\n", shell_quote(proxy)));
+        env_file.push_str(&format!("export http_proxy={}\n", shell_quote(proxy)));
     }
     if !agent.egress_allowed_domains.is_empty() {
         env_file.push_str(&format!(
@@ -1486,11 +1536,33 @@ fn render_agent_env(
             shell_quote(&lease.host_proxy_url())
         ));
         env_file.push_str(&format!(
-            "HTTPS_PROXY={}\n",
+            "OPENOMAN_NET_HOST_IPV4={}\n",
+            shell_quote(&lease.host_ip.to_string())
+        ));
+        if agent.egress_allowed_domains.iter().any(|domain| domain == "*") {
+            env_file.push_str("OPENOMAN_NET_ALLOW_ALL='1'\n");
+            let dns_servers = discover_host_dns_servers();
+            if !dns_servers.is_empty() {
+                env_file.push_str(&format!(
+                    "OPENOMAN_NET_DNS_SERVERS={}\n",
+                    shell_quote(&dns_servers.join(","))
+                ));
+            }
+        }
+        env_file.push_str(&format!(
+            "export HTTPS_PROXY={}\n",
             shell_quote(&lease.host_proxy_url())
         ));
         env_file.push_str(&format!(
-            "HTTP_PROXY={}\n",
+            "export HTTP_PROXY={}\n",
+            shell_quote(&lease.host_proxy_url())
+        ));
+        env_file.push_str(&format!(
+            "export https_proxy={}\n",
+            shell_quote(&lease.host_proxy_url())
+        ));
+        env_file.push_str(&format!(
+            "export http_proxy={}\n",
             shell_quote(&lease.host_proxy_url())
         ));
     }
@@ -1505,17 +1577,49 @@ fn render_agent_env(
     env_file
 }
 
-fn resolve_guest_codex_bin(codex_bin: &str, user_package_dirs: &[UserPackageDir]) -> String {
-    let codex_path = Path::new(codex_bin);
-    if codex_path.is_absolute() {
+fn discover_host_dns_servers() -> Vec<String> {
+    let mut servers = Vec::new();
+
+    for path in ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
+        let Ok(contents) = fs::read_to_string(path) else {
+            continue;
+        };
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with("nameserver ") {
+                continue;
+            }
+            let value = trimmed["nameserver ".len()..].trim();
+            if value.is_empty()
+                || value == "127.0.0.1"
+                || value == "127.0.0.53"
+                || value == "::1"
+            {
+                continue;
+            }
+            if !servers.iter().any(|existing| existing == value) {
+                servers.push(value.to_string());
+            }
+        }
+        if !servers.is_empty() {
+            break;
+        }
+    }
+
+    servers
+}
+
+fn resolve_guest_agent_bin(bin: &str, user_package_dirs: &[UserPackageDir]) -> String {
+    let agent_path = Path::new(bin);
+    if agent_path.is_absolute() {
         for package_dir in user_package_dirs {
-            if let Ok(relative) = codex_path.strip_prefix(&package_dir.host_path) {
+            if let Ok(relative) = agent_path.strip_prefix(&package_dir.host_path) {
                 return package_dir.guest_path.join(relative).display().to_string();
             }
         }
     }
 
-    codex_bin.to_string()
+    bin.to_string()
 }
 
 #[cfg(test)]
@@ -1633,8 +1737,10 @@ mod tests {
                     limits: config.limits.clone(),
                     agent: AgentExecutionSpec {
                         provider: AgentProvider::Codex,
-                        codex_bin: "codex".to_string(),
-                        codex_auth_file: None,
+                        bin: "codex".to_string(),
+                        model: None,
+                        auth_file: None,
+                        api_key: None,
                         egress_proxy: None,
                         egress_allowed_domains: Vec::new(),
                     },
@@ -1659,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_runtime_tree_copies_codex_auth_file_when_configured() {
+    fn stage_runtime_tree_copies_agent_auth_file_when_configured() {
         let temp = TempDir::new().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let auth_file = temp.path().join("auth.json");
@@ -1689,8 +1795,10 @@ mod tests {
                     limits: config.limits.clone(),
                     agent: AgentExecutionSpec {
                         provider: AgentProvider::Codex,
-                        codex_bin: "codex".to_string(),
-                        codex_auth_file: Some(auth_file),
+                        bin: "codex".to_string(),
+                        model: None,
+                        auth_file: Some(auth_file),
+                        api_key: None,
                         egress_proxy: None,
                         egress_allowed_domains: Vec::new(),
                     },
@@ -1703,7 +1811,7 @@ mod tests {
         let auth_contents = Command::new("debugfs")
             .args([
                 "-R",
-                "cat /openoman-config/codex-auth.json",
+                "cat /openoman-config/agent-auth.json",
                 prepared.image_path.to_string_lossy().as_ref(),
             ])
             .output()
@@ -1738,8 +1846,10 @@ mod tests {
                 limits: config.limits.clone(),
                 agent: AgentExecutionSpec {
                     provider: AgentProvider::Codex,
-                    codex_bin: "codex".to_string(),
-                    codex_auth_file: None,
+                    bin: "codex".to_string(),
+                    model: None,
+                    auth_file: None,
+                    api_key: None,
                     egress_proxy: Some("http://proxy.internal:3128".to_string()),
                     egress_allowed_domains: vec!["api.openai.com".to_string()],
                 },
@@ -1806,8 +1916,10 @@ mod tests {
                     limits: config.limits.clone(),
                     agent: AgentExecutionSpec {
                         provider: AgentProvider::Codex,
-                        codex_bin: "codex".to_string(),
-                        codex_auth_file: None,
+                        bin: "codex".to_string(),
+                        model: None,
+                        auth_file: None,
+                        api_key: None,
                         egress_proxy: None,
                         egress_allowed_domains: Vec::new(),
                     },
@@ -1869,8 +1981,10 @@ mod tests {
                     limits: config.limits.clone(),
                     agent: AgentExecutionSpec {
                         provider: AgentProvider::Codex,
-                        codex_bin: "codex".to_string(),
-                        codex_auth_file: None,
+                        bin: "codex".to_string(),
+                        model: None,
+                        auth_file: None,
+                        api_key: None,
                         egress_proxy: None,
                         egress_allowed_domains: vec!["api.openai.com".to_string()],
                     },
@@ -1946,6 +2060,50 @@ mod tests {
     }
 
     #[test]
+    fn host_proxy_wildcard_allows_any_connect_domain() {
+        let temp = TempDir::new().expect("tempdir");
+        let fake_firecracker = write_fake_firecracker(temp.path());
+        let config = base_runtime_config(temp.path(), &fake_firecracker);
+        let runner = FirecrackerDirectRunner::new(
+            config.runtime_dir.clone(),
+            config
+                .firecracker
+                .clone()
+                .expect("firecracker config should exist"),
+        );
+        let log_path = temp.path().join("network.log");
+        let lease = NetworkLease {
+            tap_name: "oomtap1".to_string(),
+            guest_iface: "eth0".to_string(),
+            host_ip: Ipv4Addr::LOCALHOST,
+            guest_ip: Ipv4Addr::new(127, 0, 0, 2),
+            prefix_len: 30,
+            guest_mac: "02:fc:00:00:00:01".to_string(),
+            proxy_port: 0,
+        };
+        let mut proxy = runner
+            .start_network_proxy(&lease, &["*".to_string()], &log_path)
+            .expect("start proxy");
+
+        let mut client = TcpStream::connect(proxy.bind_addr).expect("connect");
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+            .expect("write request");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("read proxy response");
+        proxy.stop();
+
+        assert!(
+            response.starts_with("HTTP/1.1 200 Connection established")
+                || response.starts_with("HTTP/1.1 502 Bad Gateway")
+        );
+        let log_contents = fs::read_to_string(&log_path).expect("read network log");
+        assert!(!log_contents.contains("hostname not allowlisted"));
+    }
+
+    #[test]
     fn direct_runner_smoke_boots_real_firecracker_when_opted_in() {
         if std::env::var("OPENOMAN_FIRECRACKER_E2E").ok().as_deref() != Some("1") {
             return;
@@ -1976,12 +2134,14 @@ mod tests {
                 limits: runtime_config.limits.clone(),
                 agent: AgentExecutionSpec {
                     provider: AgentProvider::Codex,
-                    codex_bin: fake_codex
+                    bin: fake_codex
                         .file_name()
                         .expect("codex filename")
                         .to_string_lossy()
                         .into_owned(),
-                    codex_auth_file: None,
+                    model: None,
+                    auth_file: None,
+                    api_key: None,
                     egress_proxy: None,
                     egress_allowed_domains: Vec::new(),
                 },
@@ -2035,8 +2195,10 @@ mod tests {
         let env_file = render_agent_env(
             &AgentExecutionSpec {
                 provider: AgentProvider::Codex,
-                codex_bin: "/usr/local/bin/codex".to_string(),
-                codex_auth_file: None,
+                bin: "/usr/local/bin/codex".to_string(),
+                model: None,
+                auth_file: None,
+                api_key: None,
                 egress_proxy: Some("http://proxy.internal:3128".to_string()),
                 egress_allowed_domains: vec![
                     "api.openai.com".to_string(),
@@ -2048,8 +2210,10 @@ mod tests {
             None,
         );
 
-        assert!(env_file.contains("HTTPS_PROXY='http://proxy.internal:3128'"));
-        assert!(env_file.contains("HTTP_PROXY='http://proxy.internal:3128'"));
+        assert!(env_file.contains("export HTTPS_PROXY='http://proxy.internal:3128'"));
+        assert!(env_file.contains("export HTTP_PROXY='http://proxy.internal:3128'"));
+        assert!(env_file.contains("export https_proxy='http://proxy.internal:3128'"));
+        assert!(env_file.contains("export http_proxy='http://proxy.internal:3128'"));
         assert!(
             env_file.contains("OPENOMAN_EGRESS_ALLOWED_DOMAINS='api.openai.com,files.openai.com'")
         );
@@ -2062,8 +2226,10 @@ mod tests {
         let env_file = render_agent_env(
             &AgentExecutionSpec {
                 provider: AgentProvider::Codex,
-                codex_bin: "/usr/local/bin/codex".to_string(),
-                codex_auth_file: None,
+                bin: "/usr/local/bin/codex".to_string(),
+                model: None,
+                auth_file: None,
+                api_key: None,
                 egress_proxy: None,
                 egress_allowed_domains: vec!["api.openai.com".to_string()],
             },
@@ -2076,17 +2242,21 @@ mod tests {
         assert!(env_file.contains("OPENOMAN_NET_IFACE='eth0'"));
         assert!(env_file.contains("OPENOMAN_NET_GUEST_IPV4='172.22.0.2/30'"));
         assert!(env_file.contains("OPENOMAN_NET_HOST_PROXY_URL='http://172.22.0.1:3128'"));
-        assert!(env_file.contains("HTTPS_PROXY='http://172.22.0.1:3128'"));
-        assert!(env_file.contains("HTTP_PROXY='http://172.22.0.1:3128'"));
+        assert!(env_file.contains("export HTTPS_PROXY='http://172.22.0.1:3128'"));
+        assert!(env_file.contains("export HTTP_PROXY='http://172.22.0.1:3128'"));
+        assert!(env_file.contains("export https_proxy='http://172.22.0.1:3128'"));
+        assert!(env_file.contains("export http_proxy='http://172.22.0.1:3128'"));
     }
 
     #[test]
-    fn render_agent_env_includes_codex_auth_file_when_configured() {
+    fn render_agent_env_includes_agent_auth_file_when_configured() {
         let env_file = render_agent_env(
             &AgentExecutionSpec {
                 provider: AgentProvider::Codex,
-                codex_bin: "/usr/local/bin/codex".to_string(),
-                codex_auth_file: Some(PathBuf::from("/host/.codex/auth.json")),
+                bin: "/usr/local/bin/codex".to_string(),
+                model: None,
+                auth_file: Some(PathBuf::from("/host/.codex/auth.json")),
+                api_key: None,
                 egress_proxy: None,
                 egress_allowed_domains: Vec::new(),
             },
@@ -2096,7 +2266,49 @@ mod tests {
         );
 
         assert!(env_file
-            .contains("OPENOMAN_CODEX_AUTH_FILE='/mnt/runtime/openoman-config/codex-auth.json'"));
+            .contains("OPENOMAN_AGENT_AUTH_FILE='/mnt/runtime/openoman-config/agent-auth.json'"));
+    }
+
+    #[test]
+    fn render_agent_env_includes_cursor_api_key() {
+        let env_file = render_agent_env(
+            &AgentExecutionSpec {
+                provider: AgentProvider::Cursor,
+                bin: "/usr/local/bin/cursor-agent".to_string(),
+                model: None,
+                auth_file: None,
+                api_key: Some("cursor-secret".to_string()),
+                egress_proxy: None,
+                egress_allowed_domains: vec!["api2.cursor.sh".to_string()],
+            },
+            &[],
+            &[],
+            None,
+        );
+
+        assert!(env_file.contains("AGENT_PROVIDER=cursor"));
+        assert!(env_file.contains("AGENT_BIN='/usr/local/bin/cursor-agent'"));
+        assert!(env_file.contains("export CURSOR_API_KEY='cursor-secret'"));
+    }
+
+    #[test]
+    fn render_agent_env_includes_cursor_model() {
+        let env_file = render_agent_env(
+            &AgentExecutionSpec {
+                provider: AgentProvider::Cursor,
+                bin: "/usr/local/bin/cursor-agent".to_string(),
+                model: Some("gpt-5".to_string()),
+                auth_file: None,
+                api_key: Some("cursor-secret".to_string()),
+                egress_proxy: None,
+                egress_allowed_domains: vec!["api2.cursor.sh".to_string()],
+            },
+            &[],
+            &[],
+            None,
+        );
+
+        assert!(env_file.contains("AGENT_MODEL='gpt-5'"));
     }
 
     fn write_fake_firecracker(root: &Path) -> PathBuf {

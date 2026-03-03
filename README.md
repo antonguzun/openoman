@@ -27,6 +27,27 @@ When a submitted job uses `--publish-policy on_validation_success`, `run` now ap
 
 Startup now validates the configured sandbox backend before any command runs. With the default Firecracker backend, `openoman` will fail fast if required host dependencies such as `firecracker`, `/dev/kvm`, or the configured guest asset paths are unavailable.
 
+## Agent providers
+
+The sandbox agent contract now uses provider-neutral `[agent]` keys:
+
+- `provider = "codex"` or `provider = "cursor"`
+- `bin = "..."` selects the agent binary inside the guest
+- `model = "gpt-5"` is supported for Cursor and is passed as `cursor-agent --model ...`
+- `auth_file = "..."` is Codex-only and stages a host auth file into `/root/.codex/auth.json`
+- `api_key = "crsr_..."` is the preferred Cursor credential path and is injected into the guest as `CURSOR_API_KEY`
+- `api_key_env = "OPENOMAN_CURSOR_API_KEY"` is an optional Cursor alternative that tells `openoman run` which host environment variable to read before injecting `CURSOR_API_KEY` into the guest
+
+Existing Codex configs that still use `codex_bin` and `codex_auth_file` continue to work as compatibility aliases.
+
+Examples:
+
+- Codex:
+  `provider = "codex"`, `bin = "/usr/local/bin/codex"`, `auth_file = "~/.codex/auth.json"`, `egress_allowed_domains = ["api.openai.com"]`
+- Cursor:
+  `provider = "cursor"`, `bin = "cursor-agent"`, `model = "gpt-5"`, `api_key = "crsr_..."`, `egress_allowed_domains = ["api2.cursor.sh"]`
+  For debugging only, `egress_allowed_domains = ["*"]` disables hostname filtering in the host CONNECT proxy.
+
 ## Sandbox backend
 
 The sandbox runtime is now selected from config:

@@ -20,10 +20,48 @@ struct PublishingTestConfig {
     curl_bin: PathBuf,
 }
 
+struct AgentTestConfig<'a> {
+    provider: &'a str,
+    bin: &'a Path,
+    model: Option<&'a str>,
+    api_key: Option<&'a str>,
+    api_key_env: Option<&'a str>,
+}
+
+fn codex_agent<'a>(bin: &'a Path) -> AgentTestConfig<'a> {
+    AgentTestConfig {
+        provider: "codex",
+        bin,
+        model: None,
+        api_key: None,
+        api_key_env: None,
+    }
+}
+
+fn cursor_agent<'a>(bin: &'a Path) -> AgentTestConfig<'a> {
+    AgentTestConfig {
+        provider: "cursor",
+        bin,
+        model: None,
+        api_key: Some("cursor-test-key"),
+        api_key_env: None,
+    }
+}
+
+fn cursor_agent_from_env<'a>(bin: &'a Path) -> AgentTestConfig<'a> {
+    AgentTestConfig {
+        provider: "cursor",
+        bin,
+        model: None,
+        api_key: None,
+        api_key_env: Some("OPENOMAN_CURSOR_API_KEY"),
+    }
+}
+
 fn write_config(
     root: &Path,
     firecracker_bin: &Path,
-    codex_bin: &Path,
+    agent: &AgentTestConfig<'_>,
     publishing: Option<&PublishingTestConfig>,
 ) -> String {
     let config_path = root.join("config.toml");
@@ -51,7 +89,7 @@ fn write_config(
     fs::write(
         &config_path,
         format!(
-            "[core]\ndatabase_path = \"{}\"\n\n[git]\ntrusted_workspace_dir = \"{}\"\n\n[sandbox]\nbackend = \"firecracker\"\nruntime_dir = \"{}\"\ntimeout_seconds = 30\nmemory_mb = 512\ncpu_cores = 1\n\n[sandbox.firecracker]\nmode = \"direct\"\nfirecracker_bin = \"{}\"\njailer_bin = \"{}\"\nkernel_image_path = \"{}\"\nrootfs_image_path = \"{}\"\n\n[agent]\nprovider = \"codex\"\ncodex_bin = \"{}\"\n{}",
+            "[core]\ndatabase_path = \"{}\"\n\n[git]\ntrusted_workspace_dir = \"{}\"\n\n[sandbox]\nbackend = \"firecracker\"\nruntime_dir = \"{}\"\ntimeout_seconds = 30\nmemory_mb = 512\ncpu_cores = 1\n\n[sandbox.firecracker]\nmode = \"direct\"\nfirecracker_bin = \"{}\"\njailer_bin = \"{}\"\nkernel_image_path = \"{}\"\nrootfs_image_path = \"{}\"\n\n[agent]\nprovider = \"{}\"\nbin = \"{}\"\n{}{}{}{}",
             db_path.display().to_string().replace('\\', "\\\\"),
             workspace_path.display().to_string().replace('\\', "\\\\"),
             sandbox_runtime_path.display().to_string().replace('\\', "\\\\"),
@@ -59,7 +97,20 @@ fn write_config(
             firecracker_bin.display().to_string().replace('\\', "\\\\"),
             kernel_path.display().to_string().replace('\\', "\\\\"),
             rootfs_path.display().to_string().replace('\\', "\\\\"),
-            codex_bin.display().to_string().replace('\\', "\\\\"),
+            agent.provider,
+            agent.bin.display().to_string().replace('\\', "\\\\"),
+            agent
+                .model
+                .map(|model| format!("model = \"{model}\"\n"))
+                .unwrap_or_default(),
+            agent
+                .api_key
+                .map(|key| format!("api_key = \"{key}\"\n"))
+                .unwrap_or_default(),
+            agent
+                .api_key_env
+                .map(|name| format!("api_key_env = \"{name}\"\n"))
+                .unwrap_or_default(),
             publishing_block,
         ),
     )
@@ -70,7 +121,7 @@ fn write_config(
 fn write_relative_config(
     root: &Path,
     firecracker_bin: &Path,
-    codex_bin: &Path,
+    agent: &AgentTestConfig<'_>,
     publishing: Option<&PublishingTestConfig>,
 ) -> String {
     let config_path = root.join("config.toml");
@@ -98,7 +149,7 @@ fn write_relative_config(
     fs::write(
         &config_path,
         format!(
-            "[core]\ndatabase_path = \"{}\"\n\n[git]\ntrusted_workspace_dir = \"{}\"\n\n[sandbox]\nbackend = \"firecracker\"\nruntime_dir = \"{}\"\ntimeout_seconds = 30\nmemory_mb = 512\ncpu_cores = 1\n\n[sandbox.firecracker]\nmode = \"direct\"\nfirecracker_bin = \"{}\"\njailer_bin = \"{}\"\nkernel_image_path = \"{}\"\nrootfs_image_path = \"{}\"\n\n[agent]\nprovider = \"codex\"\ncodex_bin = \"{}\"\n{}",
+            "[core]\ndatabase_path = \"{}\"\n\n[git]\ntrusted_workspace_dir = \"{}\"\n\n[sandbox]\nbackend = \"firecracker\"\nruntime_dir = \"{}\"\ntimeout_seconds = 30\nmemory_mb = 512\ncpu_cores = 1\n\n[sandbox.firecracker]\nmode = \"direct\"\nfirecracker_bin = \"{}\"\njailer_bin = \"{}\"\nkernel_image_path = \"{}\"\nrootfs_image_path = \"{}\"\n\n[agent]\nprovider = \"{}\"\nbin = \"{}\"\n{}{}{}{}",
             relativize_path(root, &db_path),
             relativize_path(root, &workspace_path),
             relativize_path(root, &sandbox_runtime_path),
@@ -106,7 +157,20 @@ fn write_relative_config(
             relativize_command_path(root, firecracker_bin),
             relativize_path(root, &kernel_path),
             relativize_path(root, &rootfs_path),
-            relativize_command_path(root, codex_bin),
+            agent.provider,
+            relativize_command_path(root, agent.bin),
+            agent
+                .model
+                .map(|model| format!("model = \"{model}\"\n"))
+                .unwrap_or_default(),
+            agent
+                .api_key
+                .map(|key| format!("api_key = \"{key}\"\n"))
+                .unwrap_or_default(),
+            agent
+                .api_key_env
+                .map(|name| format!("api_key_env = \"{name}\"\n"))
+                .unwrap_or_default(),
             publishing_block,
         ),
     )
@@ -134,7 +198,12 @@ fn submit_then_status_reports_queued_state() {
     let temp = TempDir::new().expect("tempdir");
     let fake_firecracker = write_fake_firecracker(temp.path());
     let fake_codex = write_fake_codex(temp.path());
-    let config = write_config(temp.path(), &fake_firecracker, &fake_codex, None);
+    let config = write_config(
+        temp.path(),
+        &fake_firecracker,
+        &codex_agent(&fake_codex),
+        None,
+    );
 
     let mut submit = cli_cmd();
     let submit_output = submit
@@ -177,7 +246,12 @@ fn submit_then_run_persists_canonical_artifacts() {
     let fake_firecracker = write_fake_firecracker(temp.path());
     let fake_codex = write_fake_codex(temp.path());
     init_fixture_repo(&fixture_repo);
-    let config = write_config(temp.path(), &fake_firecracker, &fake_codex, None);
+    let config = write_config(
+        temp.path(),
+        &fake_firecracker,
+        &codex_agent(&fake_codex),
+        None,
+    );
 
     let job_id = submit_job(&config, &fixture_repo, "add empty line in readme");
 
@@ -242,13 +316,120 @@ fn submit_then_run_persists_canonical_artifacts() {
 }
 
 #[test]
+fn submit_then_run_supports_cursor_provider() {
+    let temp = TempDir::new().expect("tempdir");
+    let fixture_repo = temp.path().join("fixture-repo");
+    let fake_firecracker = write_fake_firecracker(temp.path());
+    let fake_cursor = write_fake_cursor(temp.path());
+    init_fixture_repo(&fixture_repo);
+    let config = write_config(
+        temp.path(),
+        &fake_firecracker,
+        &cursor_agent(&fake_cursor),
+        None,
+    );
+
+    let job_id = submit_job(&config, &fixture_repo, "add empty line in readme");
+
+    let mut run = cli_cmd();
+    run.args(["--config", &config, "run", &job_id])
+        .assert()
+        .success()
+        .stdout(format!("job {job_id} finished with state=succeeded\n"));
+
+    let attempt_dir = temp
+        .path()
+        .join("sandbox-runtime")
+        .join("jobs")
+        .join(&job_id)
+        .join("attempt-1");
+    let report = fs::read_to_string(attempt_dir.join("report.txt")).expect("read report");
+    let logs = fs::read_to_string(attempt_dir.join("logs.txt")).expect("read logs");
+    let patch = fs::read_to_string(attempt_dir.join("patch.diff")).expect("read patch");
+
+    assert!(report.contains("fake cursor completed"));
+    assert!(logs.contains("agent provider: cursor"));
+    assert!(logs.contains("cursor api key present"));
+    assert!(patch.contains("README.md"));
+}
+
+#[test]
+fn submit_then_run_passes_cursor_model() {
+    let temp = TempDir::new().expect("tempdir");
+    let fixture_repo = temp.path().join("fixture-repo");
+    let fake_firecracker = write_fake_firecracker(temp.path());
+    let fake_cursor = write_fake_cursor(temp.path());
+    init_fixture_repo(&fixture_repo);
+    let config = write_config(
+        temp.path(),
+        &fake_firecracker,
+        &AgentTestConfig {
+            provider: "cursor",
+            bin: &fake_cursor,
+            model: Some("gpt-5"),
+            api_key: Some("cursor-test-key"),
+            api_key_env: None,
+        },
+        None,
+    );
+
+    let job_id = submit_job(&config, &fixture_repo, "add empty line in readme");
+
+    let mut run = cli_cmd();
+    run.args(["--config", &config, "run", &job_id])
+        .assert()
+        .success()
+        .stdout(format!("job {job_id} finished with state=succeeded\n"));
+
+    let attempt_dir = temp
+        .path()
+        .join("sandbox-runtime")
+        .join("jobs")
+        .join(&job_id)
+        .join("attempt-1");
+    let logs = fs::read_to_string(attempt_dir.join("logs.txt")).expect("read logs");
+
+    assert!(logs.contains("agent model: gpt-5"));
+}
+
+#[test]
+fn cursor_run_requires_configured_api_key_env() {
+    let temp = TempDir::new().expect("tempdir");
+    let fixture_repo = temp.path().join("fixture-repo");
+    let fake_firecracker = write_fake_firecracker(temp.path());
+    let fake_cursor = write_fake_cursor(temp.path());
+    init_fixture_repo(&fixture_repo);
+    let config = write_config(
+        temp.path(),
+        &fake_firecracker,
+        &cursor_agent_from_env(&fake_cursor),
+        None,
+    );
+
+    let job_id = submit_job(&config, &fixture_repo, "add empty line in readme");
+
+    let mut run = cli_cmd();
+    run.args(["--config", &config, "run", &job_id])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "agent.api_key_env references missing environment variable OPENOMAN_CURSOR_API_KEY",
+        ));
+}
+
+#[test]
 fn logs_print_sandbox_log_contents_when_present() {
     let temp = TempDir::new().expect("tempdir");
     let fixture_repo = temp.path().join("fixture-repo");
     let fake_firecracker = write_fake_firecracker(temp.path());
     let fake_codex = write_fake_codex(temp.path());
     init_fixture_repo(&fixture_repo);
-    let config = write_config(temp.path(), &fake_firecracker, &fake_codex, None);
+    let config = write_config(
+        temp.path(),
+        &fake_firecracker,
+        &codex_agent(&fake_codex),
+        None,
+    );
 
     let job_id = submit_job(&config, &fixture_repo, "add empty line in readme");
 
@@ -274,7 +455,12 @@ fn failing_sandbox_attempt_persists_artifacts_and_marks_job_failed() {
     let fake_firecracker = write_fake_firecracker(temp.path());
     let fake_codex = write_fake_codex(temp.path());
     init_fixture_repo(&fixture_repo);
-    let config = write_config(temp.path(), &fake_firecracker, &fake_codex, None);
+    let config = write_config(
+        temp.path(),
+        &fake_firecracker,
+        &codex_agent(&fake_codex),
+        None,
+    );
 
     let job_id = submit_job(&config, &fixture_repo, "fail after touching readme");
 
@@ -332,7 +518,12 @@ fn jailer_mode_fails_fast_with_clear_error() {
     let temp = TempDir::new().expect("tempdir");
     let fake_firecracker = write_fake_firecracker(temp.path());
     let fake_codex = write_fake_codex(temp.path());
-    let config = write_config(temp.path(), &fake_firecracker, &fake_codex, None);
+    let config = write_config(
+        temp.path(),
+        &fake_firecracker,
+        &codex_agent(&fake_codex),
+        None,
+    );
     let config_contents = fs::read_to_string(&config).expect("read config");
     fs::write(
         &config,
@@ -404,7 +595,7 @@ fn submit_run_and_result_show_github_publish_metadata() {
     let config = write_config(
         temp.path(),
         &fake_firecracker,
-        &fake_codex,
+        &codex_agent(&fake_codex),
         Some(&PublishingTestConfig {
             repo_owner: "acme".to_string(),
             repo_name: "demo".to_string(),
@@ -501,7 +692,7 @@ fn submit_run_with_relative_config_paths_publishes_successfully() {
     let config = write_relative_config(
         temp.path(),
         &fake_firecracker,
-        &fake_codex,
+        &codex_agent(&fake_codex),
         Some(&PublishingTestConfig {
             repo_owner: "acme".to_string(),
             repo_name: "demo".to_string(),
@@ -582,7 +773,12 @@ fn publish_policy_never_skips_pull_request_creation() {
     let fake_firecracker = write_fake_firecracker(temp.path());
     let fake_codex = write_fake_codex(temp.path());
     init_fixture_repo(&fixture_repo);
-    let config = write_config(temp.path(), &fake_firecracker, &fake_codex, None);
+    let config = write_config(
+        temp.path(),
+        &fake_firecracker,
+        &codex_agent(&fake_codex),
+        None,
+    );
 
     let job_id =
         submit_job_with_policy(&config, &fixture_repo, "add empty line in readme", "never");
@@ -711,6 +907,75 @@ echo "fake codex applied instruction"
     script_path
 }
 
+fn write_fake_cursor(root: &Path) -> PathBuf {
+    let script_path = root.join("fake-cursor-agent.sh");
+    fs::write(
+        &script_path,
+        r#"#!/usr/bin/env sh
+set -eu
+if [ "${1:-}" = "--version" ]; then
+  echo "cursor-agent 0.0-test"
+  exit 0
+fi
+if [ "${CURSOR_API_KEY:-}" = "" ]; then
+  echo "missing CURSOR_API_KEY" >&2
+  exit 11
+fi
+print_mode=0
+model=""
+explicit_api_key=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --api-key)
+      explicit_api_key="$2"
+      shift 2
+      ;;
+    -p|--print|-f|--force)
+      shift 1
+      print_mode=1
+      ;;
+    --model)
+      model="$2"
+      shift 2
+      ;;
+    --output-format)
+      shift 2
+      ;;
+    *)
+      instruction="$1"
+      shift 1
+      ;;
+  esac
+done
+if [ "$print_mode" -ne 1 ]; then
+  echo "expected print mode" >&2
+  exit 12
+fi
+if [ "$explicit_api_key" = "" ]; then
+  echo "missing --api-key" >&2
+  exit 14
+fi
+if [ "$explicit_api_key" != "${CURSOR_API_KEY:-}" ]; then
+  echo "--api-key mismatch" >&2
+  exit 15
+fi
+if printf "%s" "${instruction:-}" | grep -q "readme"; then
+  printf "\n" >> README.md
+else
+  printf "agent touched workspace\n" > AGENT_OUTPUT.txt
+fi
+if printf "%s" "${instruction:-}" | grep -q "fail"; then
+  echo "fake cursor failed: ${instruction:-}"
+  exit 13
+fi
+echo "fake cursor completed: ${instruction:-}${model:+ (model=$model)}"
+"#,
+    )
+    .expect("write fake cursor");
+    fs::set_permissions(&script_path, PermissionsExt::from_mode(0o755)).expect("chmod fake cursor");
+    script_path
+}
+
 fn write_fake_firecracker(root: &Path) -> PathBuf {
     let script_path = root.join("fake-firecracker.sh");
     fs::write(
@@ -721,7 +986,9 @@ image="${OPENOMAN_FAKE_RUNTIME_IMAGE:?}"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 debugfs -R "dump -p /openoman-config/instruction.txt $tmpdir/instruction.txt" "$image" >/dev/null 2>&1
+debugfs -R "dump -p /openoman-config/agent.env $tmpdir/agent.env" "$image" >/dev/null 2>&1
 instruction="$(cat "$tmpdir/instruction.txt")"
+. "$tmpdir/agent.env"
 debugfs -R "dump -p /workspace/README.md $tmpdir/README.md" "$image" >/dev/null 2>&1 || true
 if printf "%s" "$instruction" | grep -qi "readme"; then
   printf "\n" >> "$tmpdir/README.md"
@@ -731,8 +998,31 @@ else
   printf "agent touched workspace\n" > "$tmpdir/AGENT_OUTPUT.txt"
   debugfs -w -R "write $tmpdir/AGENT_OUTPUT.txt /workspace/AGENT_OUTPUT.txt" "$image" >/dev/null 2>&1
 fi
-printf "instruction: %s\nfake firecracker completed\n" "$instruction" > "$tmpdir/logs.txt"
-printf "fake firecracker completed: %s\n" "$instruction" > "$tmpdir/report.txt"
+printf "agent provider: %s\nagent bin: %s\nagent model: %s\ninstruction: %s\n" "${AGENT_PROVIDER:-unknown}" "${AGENT_BIN:-missing}" "${AGENT_MODEL:-default}" "$instruction" > "$tmpdir/logs.txt"
+case "${AGENT_PROVIDER:-unknown}" in
+  codex)
+    printf "fake codex completed: %s\n" "$instruction" > "$tmpdir/report.txt"
+    ;;
+  cursor)
+    if [ -z "${CURSOR_API_KEY:-}" ]; then
+      printf "cursor api key missing\n" >> "$tmpdir/logs.txt"
+      printf "fake cursor failed: missing api key for %s\n" "$instruction" > "$tmpdir/report.txt"
+      debugfs -w -R "write $tmpdir/logs.txt /openoman-output/logs.txt" "$image" >/dev/null 2>&1
+      debugfs -w -R "write $tmpdir/report.txt /openoman-output/report.txt" "$image" >/dev/null 2>&1
+      exit 19
+    fi
+    printf "cursor api key present\n" >> "$tmpdir/logs.txt"
+    printf "fake cursor completed: %s\n" "$instruction" > "$tmpdir/report.txt"
+    ;;
+  *)
+    printf "unsupported provider in fake firecracker\n" >> "$tmpdir/logs.txt"
+    printf "fake firecracker failed: unsupported provider %s\n" "${AGENT_PROVIDER:-unknown}" > "$tmpdir/report.txt"
+    debugfs -w -R "write $tmpdir/logs.txt /openoman-output/logs.txt" "$image" >/dev/null 2>&1
+    debugfs -w -R "write $tmpdir/report.txt /openoman-output/report.txt" "$image" >/dev/null 2>&1
+    exit 20
+    ;;
+esac
+printf "fake firecracker completed\n" >> "$tmpdir/logs.txt"
 debugfs -w -R "write $tmpdir/logs.txt /openoman-output/logs.txt" "$image" >/dev/null 2>&1
 debugfs -w -R "write $tmpdir/report.txt /openoman-output/report.txt" "$image" >/dev/null 2>&1
 if printf "%s" "$instruction" | grep -qi "fail"; then
