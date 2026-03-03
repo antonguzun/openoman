@@ -22,3 +22,4 @@ target
 
 workspaces/*
 data/*
+config.toml
