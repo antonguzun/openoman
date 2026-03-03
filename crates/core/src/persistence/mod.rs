@@ -4,7 +4,8 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::domain::{
     job::{
-        ArtifactRef, Attempt, Job, JobId, JobSnapshot, JobState, JobValueError, RepoRef, Revision,
+        ArtifactRef, Attempt, Job, JobId, JobSnapshot, JobState, JobValueError, PublishResult,
+        RepoRef, Revision,
     },
     plugin::{CheckProfile, PluginValueError, PublishPolicy},
 };
@@ -76,7 +77,10 @@ impl SqliteStore {
                 publish_policy TEXT NOT NULL,
                 state TEXT NOT NULL,
                 active_attempt_id INTEGER,
-                validation_succeeded INTEGER NOT NULL
+                validation_succeeded INTEGER NOT NULL,
+                publish_branch_name TEXT,
+                pull_request_url TEXT,
+                pull_request_number INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS attempts (
@@ -133,6 +137,22 @@ impl SqliteStore {
             )?;
         }
 
+        ensure_jobs_column(
+            &conn,
+            "publish_branch_name",
+            "ALTER TABLE jobs ADD COLUMN publish_branch_name TEXT",
+        )?;
+        ensure_jobs_column(
+            &conn,
+            "pull_request_url",
+            "ALTER TABLE jobs ADD COLUMN pull_request_url TEXT",
+        )?;
+        ensure_jobs_column(
+            &conn,
+            "pull_request_number",
+            "ALTER TABLE jobs ADD COLUMN pull_request_number INTEGER",
+        )?;
+
         Ok(())
     }
 
@@ -172,11 +192,23 @@ impl SqliteStore {
         job: &Job,
         artifacts: &[NewArtifactRecord],
     ) -> Result<(), PersistenceError> {
+        self.update_job_with_related_records(job, artifacts, &[])
+    }
+
+    pub fn update_job_with_related_records(
+        &self,
+        job: &Job,
+        artifacts: &[NewArtifactRecord],
+        outbox_events: &[NewOutboxEvent],
+    ) -> Result<(), PersistenceError> {
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
         upsert_job(&tx, job)?;
         for artifact in artifacts {
             insert_artifact_tx(&tx, artifact)?;
+        }
+        for event in outbox_events {
+            insert_outbox_tx(&tx, event)?;
         }
         tx.commit()?;
         Ok(())
@@ -203,7 +235,8 @@ impl JobRepository {
     pub fn load(&self, id: &JobId) -> Result<Option<Job>, PersistenceError> {
         let conn = self.conn.borrow();
         let mut stmt = conn.prepare(
-            "SELECT id, repo_ref, revision, instruction, check_profile, publish_policy, state, active_attempt_id, validation_succeeded
+            "SELECT id, repo_ref, revision, instruction, check_profile, publish_policy, state, active_attempt_id, validation_succeeded,
+                    publish_branch_name, pull_request_url, pull_request_number
              FROM jobs WHERE id = ?1",
         )?;
 
@@ -218,6 +251,9 @@ impl JobRepository {
                 let state: String = row.get(6)?;
                 let active_attempt_id: Option<u32> = row.get(7)?;
                 let validation_succeeded: bool = row.get(8)?;
+                let publish_branch_name: Option<String> = row.get(9)?;
+                let pull_request_url: Option<String> = row.get(10)?;
+                let pull_request_number: Option<u64> = row.get(11)?;
 
                 Ok((
                     id,
@@ -229,6 +265,9 @@ impl JobRepository {
                     state,
                     active_attempt_id,
                     validation_succeeded,
+                    publish_branch_name,
+                    pull_request_url,
+                    pull_request_number,
                 ))
             })
             .optional()?;
@@ -243,6 +282,9 @@ impl JobRepository {
             state,
             active_attempt_id,
             validation_succeeded,
+            publish_branch_name,
+            pull_request_url,
+            pull_request_number,
         )) = row
         else {
             return Ok(None);
@@ -261,6 +303,11 @@ impl JobRepository {
             state: JobState::parse(&state)?,
             attempts,
             artifacts,
+            publish_result: build_publish_result(
+                publish_branch_name,
+                pull_request_url,
+                pull_request_number,
+            )?,
             active_attempt_id,
             validation_succeeded,
         });
@@ -270,9 +317,26 @@ impl JobRepository {
 }
 
 fn upsert_job(tx: &Transaction<'_>, job: &Job) -> Result<(), PersistenceError> {
+    let publish_branch_name = job
+        .publish_result
+        .as_ref()
+        .map(|result| result.branch_name.as_str());
+    let pull_request_url = job
+        .publish_result
+        .as_ref()
+        .map(|result| result.pull_request_url.as_str());
+    let pull_request_number = job
+        .publish_result
+        .as_ref()
+        .map(|result| result.pull_request_number);
+
     tx.execute(
-        "INSERT INTO jobs(id, repo_ref, revision, instruction, check_profile, publish_policy, state, active_attempt_id, validation_succeeded)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO jobs(
+            id, repo_ref, revision, instruction, check_profile, publish_policy, state,
+            active_attempt_id, validation_succeeded, publish_branch_name, pull_request_url,
+            pull_request_number
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(id) DO UPDATE SET
             repo_ref = excluded.repo_ref,
             revision = excluded.revision,
@@ -281,7 +345,10 @@ fn upsert_job(tx: &Transaction<'_>, job: &Job) -> Result<(), PersistenceError> {
             publish_policy = excluded.publish_policy,
             state = excluded.state,
             active_attempt_id = excluded.active_attempt_id,
-            validation_succeeded = excluded.validation_succeeded",
+            validation_succeeded = excluded.validation_succeeded,
+            publish_branch_name = excluded.publish_branch_name,
+            pull_request_url = excluded.pull_request_url,
+            pull_request_number = excluded.pull_request_number",
         params![
             job.id.as_str(),
             job.repo_ref.as_str(),
@@ -292,6 +359,9 @@ fn upsert_job(tx: &Transaction<'_>, job: &Job) -> Result<(), PersistenceError> {
             job.state.as_str(),
             job.active_attempt_id(),
             job.validation_succeeded(),
+            publish_branch_name,
+            pull_request_url,
+            pull_request_number,
         ],
     )?;
 
@@ -349,6 +419,57 @@ fn load_artifact_refs(
         refs.push(ArtifactRef::new(row?)?);
     }
     Ok(refs)
+}
+
+fn ensure_jobs_column(
+    conn: &Connection,
+    column_name: &str,
+    alter_sql: &str,
+) -> Result<(), PersistenceError> {
+    if has_jobs_column(conn, column_name)? {
+        return Ok(());
+    }
+
+    conn.execute(alter_sql, [])?;
+    Ok(())
+}
+
+fn has_jobs_column(conn: &Connection, column_name: &str) -> Result<bool, PersistenceError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(jobs)")?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column?.eq(column_name) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn build_publish_result(
+    branch_name: Option<String>,
+    pull_request_url: Option<String>,
+    pull_request_number: Option<u64>,
+) -> Result<Option<PublishResult>, PersistenceError> {
+    match (branch_name, pull_request_url, pull_request_number) {
+        (None, None, None) => Ok(None),
+        (Some(branch_name), Some(pull_request_url), Some(pull_request_number)) => {
+            Ok(Some(PublishResult {
+                branch_name,
+                pull_request_url,
+                pull_request_number,
+            }))
+        }
+        _ => Err(PersistenceError::Sql(
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "incomplete publish result columns in jobs table",
+                )),
+            ),
+        )),
+    }
 }
 
 pub struct OutboxRepository {
@@ -652,6 +773,41 @@ mod tests {
     }
 
     #[test]
+    fn published_job_round_trips_publish_result() {
+        let db = NamedTempFile::new().expect("temp db");
+        let store = SqliteStore::open(db.path()).expect("open store");
+        let jobs = store.jobs();
+
+        let mut job = submitted_job();
+        jobs.create(&job).expect("insert job");
+
+        job.start_attempt(1).expect("start attempt");
+        job.collect_artifacts(vec![ArtifactRef::new("artifacts/report.txt").expect("ref")])
+            .expect("collect artifacts");
+        job.start_validation().expect("start validation");
+        job.mark_validation_succeeded()
+            .expect("validation should succeed");
+        job.mark_pull_request_created("openoman/job-epic-2", "https://example.test/pr/7", 7)
+            .expect("store publish result");
+        job.mark_succeeded().expect("job should succeed");
+
+        jobs.update(&job).expect("update job");
+
+        let reloaded = jobs
+            .load(&job.id)
+            .expect("load job")
+            .expect("job should exist");
+        assert_eq!(
+            reloaded.publish_result,
+            Some(PublishResult {
+                branch_name: "openoman/job-epic-2".to_string(),
+                pull_request_url: "https://example.test/pr/7".to_string(),
+                pull_request_number: 7,
+            })
+        );
+    }
+
+    #[test]
     fn job_update_and_outbox_insert_are_atomic() {
         let db = NamedTempFile::new().expect("temp db");
         let store = SqliteStore::open(db.path()).expect("open store");
@@ -686,5 +842,50 @@ mod tests {
             .expect("query outbox");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].event_id, "evt-1");
+    }
+
+    #[test]
+    fn job_artifact_and_outbox_updates_commit_atomically() {
+        let db = NamedTempFile::new().expect("temp db");
+        let store = SqliteStore::open(db.path()).expect("open store");
+        let jobs = store.jobs();
+
+        let mut job = submitted_job();
+        jobs.create(&job).expect("create job");
+        job.start_attempt(1).expect("start attempt");
+
+        let artifact = NewArtifactRecord {
+            job_id: job.id.as_str().to_string(),
+            artifact_ref: "sandbox.patch".to_string(),
+            kind: "sandbox.patch".to_string(),
+            path: "/tmp/sandbox.patch".to_string(),
+            content_hash: "abc".to_string(),
+            size_bytes: 3,
+        };
+        let event = NewOutboxEvent {
+            event_id: "evt-pr".to_string(),
+            job_id: job.id.as_str().to_string(),
+            event_type: "job.pr_created".to_string(),
+            payload: "{}".to_string(),
+            status: OutboxStatus::Pending,
+        };
+
+        store
+            .update_job_with_related_records(&job, &[artifact], &[event])
+            .expect("transaction should commit");
+
+        let artifacts = store
+            .artifacts()
+            .list_by_job(job.id.as_str())
+            .expect("artifacts should load");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].artifact_ref, "sandbox.patch");
+
+        let events = store
+            .outbox()
+            .list_by_job(job.id.as_str())
+            .expect("outbox should load");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "job.pr_created");
     }
 }

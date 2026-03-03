@@ -7,19 +7,70 @@ database_path = "./data/openoman.db"
 trusted_workspace_dir = "./workspaces/trusted"
 
 [sandbox]
+# Virtualization backend used for sandbox attempts.
+backend = "firecracker"
 # Base directory where sandbox runs are materialized.
 runtime_dir = "./workspaces/sandboxes"
+# Firecracker resource controls for the direct backend.
+timeout_seconds = 1800
+memory_mb = 2048
+cpu_cores = 2
+
+[sandbox.firecracker]
+# direct works in this release; jailer is reserved for a future hardened mode.
+mode = "direct"
+firecracker_bin = "firecracker"
+jailer_bin = "jailer"
+# Provide host paths to the guest kernel and rootfs assets.
+kernel_image_path = "/opt/openoman/guest/vmlinux"
+rootfs_image_path = "/opt/openoman/guest/rootfs.ext4"
+guest_cid_base = 10000
+
+[sandbox.firecracker.network]
+# disabled: no guest NIC.
+# host-proxy: attach a tap-backed NIC and route guest HTTPS through a host-local allowlisting proxy.
+mode = "host-proxy"
+# sudo: use the hidden openoman helper through sudo for tap lifecycle management.
+# direct: manage tap lifecycle directly when the whole process already has CAP_NET_ADMIN/root.
+privilege_mode = "sudo"
+tap_name_prefix = "oomtap"
+proxy_port = 3128
+subnet_cidr = "172.22.0.0/16"
+
+[[sandbox.firecracker.user_package_dirs]]
+# Optional allowlisted host-user package directory copied into each run.
+host_path = "~/.local/bin"
+guest_path = "/opt/openoman/user-bin"
+add_to_path = true
 
 [agent]
 # Agent provider executed inside sandbox. MVP supports only "codex".
 provider = "codex"
-# Binary looked up in sandbox PATH for Codex execution contract.
-codex_bin = "codex"
-# Optional proxy endpoint used for egress controls inside sandbox.
-egress_proxy_url = "http://proxy.internal:3128"
+# Binary baked into the default guest rootfs build.
+codex_bin = "/usr/local/bin/codex"
+# Optional host auth file copied into the guest as /root/.codex/auth.json.
+# codex_auth_file = "~/.codex/auth.json"
+# Domain allowlist enforced by the host CONNECT proxy in host-proxy networking mode.
+egress_allowed_domains = ["api.openai.com"]
 
 [publishing]
-# Placeholder GitHub settings for future publish support.
+# Trusted GitHub publishing runs only after validation succeeds.
 provider = "github"
 repo_owner = "example"
 repo_name = "example-repo"
+# Defaults to the submitted revision when omitted.
+# base_branch = "main"
+# Prefix used for the pushed branch name, which becomes "<branch_prefix>/<job_id>".
+branch_prefix = "openoman"
+api_base_url = "https://api.github.com"
+# Defaults to https://github.com/<repo_owner>/<repo_name>.git when omitted.
+# push_url = "https://github.com/example/example-repo.git"
+# Prefer an environment variable so the token does not live in this file.
+# `github_token_env` is the local environment variable name that openoman reads.
+# Example: `github_token_env = "OPENOMAN_GITHUB_TOKEN"` means you should export
+# `OPENOMAN_GITHUB_TOKEN=<your token>` before running `openoman`.
+# Create the GitHub personal access token in GitHub Settings -> Developer settings ->
+# Personal access tokens, or see the official docs:
+# https://docs.github.com/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
+github_token_env = "OPENOMAN_GITHUB_TOKEN"
+curl_bin = "curl"

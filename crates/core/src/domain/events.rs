@@ -47,7 +47,7 @@ impl JobEvent {
             Self::ArtifactsCollected { .. } => "job.artifacts_collected",
             Self::ValidationSucceeded { .. } => "job.validation_succeeded",
             Self::ValidationFailed { .. } => "job.validation_failed",
-            Self::PullRequestCreated { .. } => "job.pull_request_created",
+            Self::PullRequestCreated { .. } => "job.pr_created",
             Self::JobSucceeded { .. } => "job.succeeded",
             Self::JobFailed { .. } => "job.failed",
         }
