@@ -126,6 +126,13 @@ pub struct Attempt {
     pub id: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishResult {
+    pub branch_name: String,
+    pub pull_request_url: String,
+    pub pull_request_number: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Job {
     pub id: JobId,
@@ -137,6 +144,7 @@ pub struct Job {
     pub state: JobState,
     pub attempts: Vec<Attempt>,
     pub artifacts: Vec<ArtifactRef>,
+    pub publish_result: Option<PublishResult>,
     active_attempt_id: Option<u32>,
     validation_succeeded: bool,
 }
@@ -152,6 +160,7 @@ pub struct JobSnapshot {
     pub state: JobState,
     pub attempts: Vec<Attempt>,
     pub artifacts: Vec<ArtifactRef>,
+    pub publish_result: Option<PublishResult>,
     pub active_attempt_id: Option<u32>,
     pub validation_succeeded: bool,
 }
@@ -175,6 +184,7 @@ impl Job {
             state: JobState::Queued,
             attempts: vec![],
             artifacts: vec![],
+            publish_result: None,
             active_attempt_id: None,
             validation_succeeded: false,
         };
@@ -193,6 +203,7 @@ impl Job {
             state: snapshot.state,
             attempts: snapshot.attempts,
             artifacts: snapshot.artifacts,
+            publish_result: snapshot.publish_result,
             active_attempt_id: snapshot.active_attempt_id,
             validation_succeeded: snapshot.validation_succeeded,
         }
@@ -297,7 +308,9 @@ impl Job {
 
     pub fn mark_pull_request_created(
         &mut self,
+        branch_name: impl Into<String>,
         url: impl Into<String>,
+        pull_request_number: u64,
     ) -> Result<JobEvent, JobError> {
         let attempt_id = self.active_attempt_id_or_error()?;
         if self.state != JobState::Publishing {
@@ -310,13 +323,41 @@ impl Job {
             return Err(JobError::PublishRequiresValidationSuccess);
         }
 
+        self.publish_result = Some(PublishResult {
+            branch_name: branch_name.into(),
+            pull_request_url: url.into(),
+            pull_request_number,
+        });
         self.state = JobState::Notifying;
 
         Ok(JobEvent::PullRequestCreated {
             job_id: self.id.clone(),
             attempt_id,
-            url: url.into(),
+            url: self
+                .publish_result
+                .as_ref()
+                .expect("publish result stored before event creation")
+                .pull_request_url
+                .clone(),
         })
+    }
+
+    pub fn mark_publish_skipped(&mut self) -> Result<(), JobError> {
+        if self.state != JobState::Publishing {
+            return Err(JobError::InvalidTransition {
+                from: self.state.clone(),
+                to: JobState::Notifying,
+            });
+        }
+        if !self.validation_succeeded {
+            return Err(JobError::PublishRequiresValidationSuccess);
+        }
+        if self.publish_policy != PublishPolicy::Never {
+            return Err(JobError::PublishSkipRequiresNeverPolicy);
+        }
+
+        self.state = JobState::Notifying;
+        Ok(())
     }
 
     pub fn mark_succeeded(&mut self) -> Result<JobEvent, JobError> {
@@ -387,6 +428,7 @@ pub enum JobError {
     ActiveAttemptExists,
     NoActiveAttempt,
     PublishRequiresValidationSuccess,
+    PublishSkipRequiresNeverPolicy,
     TerminalJob,
 }
 
@@ -400,6 +442,9 @@ impl Display for JobError {
             Self::NoActiveAttempt => write!(f, "job does not have an active attempt"),
             Self::PublishRequiresValidationSuccess => {
                 write!(f, "publishing requires successful validation")
+            }
+            Self::PublishSkipRequiresNeverPolicy => {
+                write!(f, "publish skipping requires publish policy never")
             }
             Self::TerminalJob => write!(f, "job is in a terminal state"),
         }
@@ -449,9 +494,17 @@ mod tests {
         assert!(matches!(validation, JobEvent::ValidationSucceeded { .. }));
 
         let pr = job
-            .mark_pull_request_created("https://example.test/pr/1")
+            .mark_pull_request_created("openoman/job-1", "https://example.test/pr/1", 1)
             .expect("pr can be created");
         assert!(matches!(pr, JobEvent::PullRequestCreated { .. }));
+        assert_eq!(
+            job.publish_result,
+            Some(PublishResult {
+                branch_name: "openoman/job-1".to_string(),
+                pull_request_url: "https://example.test/pr/1".to_string(),
+                pull_request_number: 1,
+            })
+        );
 
         let done = job.mark_succeeded().expect("job can succeed");
         assert!(matches!(done, JobEvent::JobSucceeded { .. }));
@@ -487,7 +540,7 @@ mod tests {
         job.start_attempt(1).expect("attempt should start");
 
         let err = job
-            .mark_pull_request_created("https://example.test/pr/1")
+            .mark_pull_request_created("openoman/job-1", "https://example.test/pr/1", 1)
             .expect_err("cannot publish before validation");
 
         assert!(matches!(
@@ -497,5 +550,34 @@ mod tests {
                 to: JobState::Notifying
             }
         ));
+    }
+
+    #[test]
+    fn publish_policy_never_can_skip_pull_request_creation() {
+        let mut job = Job::submit(
+            JobId::new("job-never").expect("valid id"),
+            RepoRef::new("github.com/acme/repo").expect("valid repo"),
+            Revision::new("main").expect("valid revision"),
+            "test instruction".to_string(),
+            CheckProfile::new("unit").expect("valid check profile"),
+            PublishPolicy::Never,
+        )
+        .0;
+
+        job.start_attempt(1).expect("attempt should start");
+        job.collect_artifacts(vec![
+            ArtifactRef::new("artifacts/patch.diff").expect("valid ref")
+        ])
+        .expect("collects artifacts");
+        job.start_validation().expect("validation can start");
+        job.mark_validation_succeeded()
+            .expect("validation succeeds");
+
+        job.mark_publish_skipped()
+            .expect("publish can be skipped for never policy");
+        job.mark_succeeded().expect("job can succeed");
+
+        assert_eq!(job.state, JobState::Succeeded);
+        assert!(job.publish_result.is_none());
     }
 }

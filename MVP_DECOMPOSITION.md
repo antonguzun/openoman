@@ -188,26 +188,6 @@
 
 ---
 
-## Epic 8 — Trusted validation gate (mandatory before publish)
-
-- Implement validation workflow:
-  - Apply patch onto a fresh clean clone (trusted workspace)
-  - Run deterministic validation command(s)
-- Define `CheckProfile` mapping:
-  - MVP: implement at least one profile end-to-end (e.g., `unit`)
-  - Keep structure for `integration/full`
-- Capture validation logs and store as artifacts
-- Update Job transitions:
-  - `Validating` → `Publishing` only on success
-  - On failure: terminal `Failed` (with reason)
-
-**Acceptance:**
-
-- A job cannot be published without validation success
-- Validation results and logs are persisted
-
----
-
 ## Epic 9 — GitHub publishing (branch + PR) (MVP)
 
 - Implement `GitHubPublisher` adapter:
@@ -225,6 +205,8 @@
 **Acceptance:**
 
 - Successful job ends with a GitHub PR created and stored in job result
+
+**Checkpoint:** ✅ Epic 9 completed (trusted publishing now creates a branch, opens a GitHub pull request, persists branch and PR metadata, and emits `job.pr_created`).
 
 ---
 

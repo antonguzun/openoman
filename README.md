@@ -23,6 +23,8 @@ The `openoman` binary provides a minimal local workflow against SQLite:
 
 Configuration is loaded from `--config` and can be overridden with `OPENOMAN_DATABASE_PATH`.
 
+When a submitted job uses `--publish-policy on_validation_success`, `run` now applies the canonical patch to the trusted clone, pushes a branch named `openoman/<job_id>` by default, opens a GitHub pull request, stores the branch plus PR metadata on the job, and emits a `job.pr_created` outbox event. `result <job_id>` prints the stored branch name, pull request number, and pull request URL when publishing succeeded.
+
 Startup now validates the configured sandbox backend before any command runs. With the default Firecracker backend, `openoman` will fail fast if required host dependencies such as `firecracker`, `/dev/kvm`, or the configured guest asset paths are unavailable.
 
 ## Sandbox backend
@@ -50,3 +52,25 @@ Guest asset notes:
 - export a sandbox workspace copy without `.git` metadata
 
 See `crates/core/src/git.rs` for the adapter API and tests.
+
+## GitHub publishing (Epic 9)
+
+Publishing is configured in the trusted host config under `[publishing]`:
+
+- `provider = "github"`
+- `repo_owner` and `repo_name` select the GitHub repository for pull request creation
+- `base_branch` is optional and otherwise defaults to the submitted revision
+- `branch_prefix` defaults to `openoman`
+- `api_base_url` defaults to `https://api.github.com`
+- `push_url` is optional and otherwise defaults to `https://github.com/<owner>/<repo>.git`
+- `github_token_env` or `github_token` supplies the GitHub token used only by the trusted core
+- `curl_bin` defaults to `curl`
+
+`github_token_env` is not a GitHub-provided variable name. It is the environment variable name that OpenOMAN should read on your machine. For example:
+
+- config: `github_token_env = "OPENOMAN_GITHUB_TOKEN"`
+- shell: `export OPENOMAN_GITHUB_TOKEN=ghp_...`
+
+To create the token itself, use GitHub Settings -> Developer settings -> Personal access tokens. Official GitHub docs: https://docs.github.com/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
+
+If a job uses `--publish-policy never`, the trusted publish step is skipped and `result <job_id>` remains a plain success/failure summary without PR metadata.

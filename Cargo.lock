@@ -345,6 +345,7 @@ dependencies = [
  "openoman-core",
  "predicates",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
 ]

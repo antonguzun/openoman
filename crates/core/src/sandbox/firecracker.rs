@@ -1458,9 +1458,8 @@ fn render_agent_env(
         ))
     ));
     if agent.codex_auth_file.is_some() {
-        env_file.push_str(
-            "OPENOMAN_CODEX_AUTH_FILE='/mnt/runtime/openoman-config/codex-auth.json'\n",
-        );
+        env_file
+            .push_str("OPENOMAN_CODEX_AUTH_FILE='/mnt/runtime/openoman-config/codex-auth.json'\n");
     }
     if let Some(proxy) = &agent.egress_proxy {
         env_file.push_str(&format!("HTTPS_PROXY={}\n", shell_quote(proxy)));
@@ -2096,9 +2095,8 @@ mod tests {
             None,
         );
 
-        assert!(env_file.contains(
-            "OPENOMAN_CODEX_AUTH_FILE='/mnt/runtime/openoman-config/codex-auth.json'"
-        ));
+        assert!(env_file
+            .contains("OPENOMAN_CODEX_AUTH_FILE='/mnt/runtime/openoman-config/codex-auth.json'"));
     }
 
     fn write_fake_firecracker(root: &Path) -> PathBuf {

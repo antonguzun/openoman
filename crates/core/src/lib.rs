@@ -1,5 +1,6 @@
 pub mod domain;
 pub mod git;
+pub mod github;
 pub mod persistence;
 pub mod sandbox;
 

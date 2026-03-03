@@ -12,6 +12,7 @@ use openoman_core::{
         plugin::{CheckProfile, PublishPolicy},
     },
     git::{write_canonical_patch, GitAdapter, PreparedWorkspace},
+    github::{GitHubPublisher, GitHubPublisherConfig},
     persistence::{NewArtifactRecord, NewOutboxEvent, OutboxStatus, SqliteStore},
     sandbox::{
         build_sandbox_backend, AgentExecutionSpec, AgentProvider, AttemptSpec,
@@ -99,6 +100,7 @@ struct FileConfig {
     git: Option<GitConfig>,
     sandbox: Option<SandboxConfig>,
     agent: Option<AgentConfig>,
+    publishing: Option<PublishingConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,12 +160,27 @@ struct AgentConfig {
     egress_allowed_domains: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize)]
+struct PublishingConfig {
+    provider: Option<String>,
+    repo_owner: Option<String>,
+    repo_name: Option<String>,
+    base_branch: Option<String>,
+    branch_prefix: Option<String>,
+    api_base_url: Option<String>,
+    push_url: Option<String>,
+    github_token: Option<String>,
+    github_token_env: Option<String>,
+    curl_bin: Option<String>,
+}
+
 #[derive(Debug)]
 struct AppConfig {
     database_path: PathBuf,
     trusted_workspace_dir: PathBuf,
     sandbox: SandboxRuntimeConfig,
     agent: AgentRuntimeConfig,
+    publishing: Option<PublishingRuntimeConfig>,
 }
 
 #[derive(Debug)]
@@ -173,6 +190,18 @@ struct AgentRuntimeConfig {
     codex_auth_file: Option<PathBuf>,
     egress_proxy: Option<String>,
     egress_allowed_domains: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PublishingRuntimeConfig {
+    repo_owner: Option<String>,
+    repo_name: Option<String>,
+    base_branch: Option<String>,
+    branch_prefix: String,
+    api_base_url: String,
+    push_url: Option<String>,
+    token: Option<String>,
+    curl_bin: String,
 }
 
 const LOG_LIMIT_BYTES: usize = 1024 * 1024;
@@ -272,6 +301,7 @@ fn run() -> Result<(), String> {
                 })?;
             let artifact_records = build_workspace_artifact_records(job.id.as_str(), &prepared)?;
             let mut all_artifact_records = artifact_records;
+            let mut outbox_events = Vec::new();
             let attempt_id = 1;
 
             let mut runner = sandbox_backend
@@ -325,6 +355,11 @@ fn run() -> Result<(), String> {
             };
 
             if let Ok(collected) = &collected {
+                let patch_path = collected
+                    .report_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("patch.diff");
                 match build_workspace_result_artifact_records(job.id.as_str(), collected) {
                     Ok(records) => all_artifact_records.extend(records),
                     Err(err) if failure_reason.is_none() => {
@@ -362,11 +397,6 @@ fn run() -> Result<(), String> {
                     Err(_) => {}
                 }
 
-                let patch_path = collected
-                    .report_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join("patch.diff");
                 let patch_result = write_canonical_patch(
                     &prepared.trusted_clone_dir,
                     &collected.modified_workspace_dir,
@@ -410,12 +440,23 @@ fn run() -> Result<(), String> {
             } else {
                 job.start_validation().map_err(|e| e.to_string())?;
                 job.mark_validation_succeeded().map_err(|e| e.to_string())?;
-                job.mark_pull_request_created("https://example.invalid/pr/1")
-                    .map_err(|e| e.to_string())?;
-                job.mark_succeeded().map_err(|e| e.to_string())?;
+                match publish_validated_changes(&config, &mut job, &prepared, &all_artifact_records)
+                {
+                    Ok(Some(event)) => outbox_events.push(event),
+                    Ok(None) => {}
+                    Err(err) => {
+                        failure_reason = Some(err);
+                    }
+                }
+
+                if let Some(reason) = failure_reason.clone() {
+                    job.mark_failed(reason).map_err(|e| e.to_string())?;
+                } else {
+                    job.mark_succeeded().map_err(|e| e.to_string())?;
+                }
             }
             store
-                .update_job_and_insert_artifacts(&job, &all_artifact_records)
+                .update_job_with_related_records(&job, &all_artifact_records, &outbox_events)
                 .map_err(|e| e.to_string())?;
 
             if let Some(reason) = failure_reason {
@@ -499,6 +540,11 @@ fn run() -> Result<(), String> {
                 _ => "in_progress",
             };
             println!("job_id={} result={}", job.id.as_str(), result);
+            if let Some(publish_result) = &job.publish_result {
+                println!("branch={}", publish_result.branch_name);
+                println!("pull_request_number={}", publish_result.pull_request_number);
+                println!("pull_request_url={}", publish_result.pull_request_url);
+            }
         }
         Commands::Internal { .. } => unreachable!("internal commands are handled before config"),
     }
@@ -513,13 +559,20 @@ impl AppConfig {
         let parsed: FileConfig = toml::from_str(&raw)
             .map_err(|e| format!("invalid config file {}: {e}", path.display()))?;
 
-        let file_db = parsed.core.and_then(|c| c.database_path);
+        let FileConfig {
+            core,
+            git,
+            sandbox,
+            agent,
+            publishing,
+        } = parsed;
+        let file_db = core.and_then(|c| c.database_path);
         let env_db = env::var("OPENOMAN_DATABASE_PATH").ok();
         let database_path = env_db.or(file_db).ok_or_else(|| {
             "missing database path; set core.database_path in config file or OPENOMAN_DATABASE_PATH"
                 .to_string()
         })?;
-        let sandbox = parsed.sandbox.unwrap_or(SandboxConfig {
+        let sandbox = sandbox.unwrap_or(SandboxConfig {
             backend: None,
             runtime_dir: None,
             timeout_seconds: None,
@@ -527,11 +580,10 @@ impl AppConfig {
             cpu_cores: None,
             firecracker: None,
         });
-        let trusted_workspace_dir = parsed
-            .git
+        let trusted_workspace_dir = git
             .and_then(|g| g.trusted_workspace_dir)
             .unwrap_or_else(|| "./workspaces/trusted".to_string());
-        let agent = parsed.agent.unwrap_or(AgentConfig {
+        let agent = agent.unwrap_or(AgentConfig {
             provider: None,
             codex_bin: None,
             codex_auth_file: None,
@@ -604,6 +656,43 @@ impl AppConfig {
                 firecracker,
             },
             agent: agent_runtime,
+            publishing: load_publishing_config(publishing, path)?,
+        })
+    }
+}
+
+impl PublishingRuntimeConfig {
+    fn github_config_for_job(&self, revision: &Revision) -> Result<GitHubPublisherConfig, String> {
+        let repo_owner = self
+            .repo_owner
+            .clone()
+            .ok_or_else(|| "publishing.repo_owner is required for GitHub publishing".to_string())?;
+        let repo_name = self
+            .repo_name
+            .clone()
+            .ok_or_else(|| "publishing.repo_name is required for GitHub publishing".to_string())?;
+        let token = self
+            .token
+            .clone()
+            .ok_or_else(|| "publishing.github_token or publishing.github_token_env is required for GitHub publishing".to_string())?;
+        let base_branch = self
+            .base_branch
+            .clone()
+            .unwrap_or_else(|| revision.as_str().to_string());
+        let push_url = match &self.push_url {
+            Some(push_url) => push_url.clone(),
+            None => format!("https://github.com/{repo_owner}/{repo_name}.git"),
+        };
+
+        Ok(GitHubPublisherConfig {
+            api_base_url: self.api_base_url.clone(),
+            repo_owner,
+            repo_name,
+            base_branch,
+            branch_prefix: self.branch_prefix.clone(),
+            push_url,
+            token,
+            curl_bin: self.curl_bin.clone(),
         })
     }
 }
@@ -622,6 +711,78 @@ fn normalize_egress_allowed_domains(domains: Option<Vec<String>>) -> Result<Vec<
         }
     }
     Ok(normalized)
+}
+
+fn load_publishing_config(
+    config: Option<PublishingConfig>,
+    config_path: &Path,
+) -> Result<Option<PublishingRuntimeConfig>, String> {
+    let Some(publishing) = config else {
+        return Ok(None);
+    };
+
+    let provider = publishing
+        .provider
+        .unwrap_or_else(|| "github".to_string())
+        .to_ascii_lowercase();
+    if provider != "github" {
+        return Err(format!(
+            "unsupported publishing provider '{}'; supported providers: github",
+            provider
+        ));
+    }
+
+    let token_from_env = resolve_github_token(
+        publishing.github_token_env.as_deref(),
+        publishing.github_token.clone(),
+    );
+    let push_url = match publishing.push_url {
+        Some(push_url) => Some(resolve_push_url(config_path, &push_url)?),
+        None => None,
+    };
+
+    Ok(Some(PublishingRuntimeConfig {
+        repo_owner: publishing.repo_owner,
+        repo_name: publishing.repo_name,
+        base_branch: publishing.base_branch,
+        branch_prefix: publishing
+            .branch_prefix
+            .unwrap_or_else(|| "openoman".to_string()),
+        api_base_url: publishing
+            .api_base_url
+            .unwrap_or_else(|| "https://api.github.com".to_string()),
+        push_url,
+        token: token_from_env,
+        curl_bin: publishing.curl_bin.unwrap_or_else(|| "curl".to_string()),
+    }))
+}
+
+fn resolve_github_token(
+    github_token_env: Option<&str>,
+    github_token: Option<String>,
+) -> Option<String> {
+    if let Some(token_env) = github_token_env {
+        if let Ok(token) = env::var(token_env) {
+            return Some(token);
+        }
+        if looks_like_github_token(token_env) {
+            return Some(token_env.to_string());
+        }
+    } else if let Ok(token) = env::var("OPENOMAN_GITHUB_TOKEN") {
+        return Some(token);
+    }
+
+    github_token.filter(|token| !token.trim().is_empty())
+}
+
+fn looks_like_github_token(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with("ghp_")
+        || trimmed.starts_with("github_pat_")
+        || trimmed.starts_with("gho_")
+        || trimmed.starts_with("ghu_")
+        || trimmed.starts_with("ghs_")
+        || trimmed.starts_with("ghr_")
 }
 
 fn load_firecracker_config(
@@ -978,17 +1139,29 @@ fn run_ip_command(args: &[String]) -> Result<(), String> {
     ))
 }
 
+fn resolve_push_url(config_path: &Path, raw: &str) -> Result<String, String> {
+    if raw.contains("://") || raw.starts_with("git@") {
+        return Ok(raw.to_string());
+    }
+
+    Ok(resolve_config_path(config_path, raw)?.display().to_string())
+}
+
 fn resolve_config_path(config_path: &Path, raw: &str) -> Result<PathBuf, String> {
     let expanded = expand_home(raw)?;
     if expanded.is_absolute() {
         return Ok(expanded);
     }
 
-    let base_dir = config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
-    Ok(base_dir.join(expanded))
+    let base_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let absolute_base_dir = if base_dir.is_absolute() {
+        base_dir.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|e| format!("failed to resolve current directory for config paths: {e}"))?
+            .join(base_dir)
+    };
+    Ok(absolute_base_dir.join(expanded))
 }
 
 fn expand_home(raw: &str) -> Result<PathBuf, String> {
@@ -1133,6 +1306,86 @@ fn ensure_patch_size(path: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn publish_validated_changes(
+    config: &AppConfig,
+    job: &mut Job,
+    prepared: &PreparedWorkspace,
+    artifact_records: &[NewArtifactRecord],
+) -> Result<Option<NewOutboxEvent>, String> {
+    match job.publish_policy {
+        PublishPolicy::Never => {
+            job.mark_publish_skipped().map_err(|e| e.to_string())?;
+            Ok(None)
+        }
+        PublishPolicy::OnValidationSuccess => {
+            let publishing = config
+                .publishing
+                .as_ref()
+                .ok_or_else(|| "publishing configuration is required for publish_policy = on_validation_success".to_string())?;
+            let patch_record = artifact_records
+                .iter()
+                .find(|artifact| artifact.artifact_ref == "sandbox.patch")
+                .ok_or_else(|| {
+                    "sandbox.patch artifact is required before publishing".to_string()
+                })?;
+            let publisher = GitHubPublisher::new(publishing.github_config_for_job(&job.revision)?);
+            let published = publisher
+                .publish_patch(
+                    job.id.as_str(),
+                    &job.instruction,
+                    &prepared.trusted_clone_dir,
+                    Path::new(&patch_record.path),
+                )
+                .map_err(|e| format!("failed to publish validated changes: {e}"))?;
+            let event = job
+                .mark_pull_request_created(
+                    published.branch_name.clone(),
+                    published.pull_request_url.clone(),
+                    published.pull_request_number,
+                )
+                .map_err(|e| e.to_string())?;
+            let publish_result = job
+                .publish_result
+                .as_ref()
+                .ok_or_else(|| "publish result missing after pull request creation".to_string())?;
+
+            Ok(Some(build_pull_request_created_outbox_event(
+                job.id.as_str(),
+                &event.event_type().to_string(),
+                publish_result,
+            )?))
+        }
+    }
+}
+
+fn build_pull_request_created_outbox_event(
+    job_id: &str,
+    event_type: &str,
+    publish_result: &openoman_core::domain::job::PublishResult,
+) -> Result<NewOutboxEvent, String> {
+    #[derive(serde::Serialize)]
+    struct PullRequestPayload<'a> {
+        branch_name: &'a str,
+        pull_request_number: u64,
+        pull_request_url: &'a str,
+    }
+
+    let payload = serde_json::to_string(&PullRequestPayload {
+        branch_name: &publish_result.branch_name,
+        pull_request_number: publish_result.pull_request_number,
+        pull_request_url: &publish_result.pull_request_url,
+    })
+    .map_err(|e| format!("failed to serialize pull request payload: {e}"))?;
+
+    Ok(NewOutboxEvent {
+        event_id: format!("{job_id}-pr-created"),
+        job_id: job_id.to_string(),
+        event_type: event_type.to_string(),
+        payload,
+        status: OutboxStatus::Pending,
+    })
 }
 
 struct TreeFingerprint {
@@ -1420,5 +1673,47 @@ codex_auth_file = "./missing-auth.json"
         let err = AppConfig::load(&config_path).expect_err("missing auth file should fail");
         assert!(err.contains("agent.codex_auth_file"));
         assert!(err.contains("missing-auth.json"));
+    }
+
+    #[test]
+    fn app_config_accepts_raw_github_token_in_github_token_env_field() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+[agent]
+provider = "codex"
+codex_bin = "/usr/local/bin/codex"
+
+[publishing]
+provider = "github"
+repo_owner = "antonguzun"
+repo_name = "kickfoss"
+github_token_env = "github_pat_example123"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        let publishing = loaded.publishing.expect("publishing config");
+        assert_eq!(publishing.token.as_deref(), Some("github_pat_example123"));
     }
 }
