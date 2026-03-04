@@ -1,0 +1,10 @@
+title = "OpenOMAN local secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Generated guest rootfs artifacts"
+paths = [
+  '''^guest/out/''',
+]

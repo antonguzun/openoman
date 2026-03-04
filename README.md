@@ -10,6 +10,24 @@ Run all local quality checks from the repository root:
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all-targets --all-features`
 
+## Git Hooks
+
+This repository ships a repo-managed `pre-commit` hook for secret scanning.
+
+Enable it once per clone from the repository root:
+
+- `git config core.hooksPath .githooks`
+
+The hook requires `gitleaks` to be installed and available on `PATH`. It scans staged content only, so it blocks newly introduced secrets without rescanning the entire working tree on each commit.
+
+You can run the scanner manually from the repository root:
+
+- `gitleaks dir . --config .gitleaks.toml`
+
+If the hook reports a false positive, narrow the allowlist in `.gitleaks.toml` deliberately instead of bypassing it routinely. Emergency bypass remains available through:
+
+- `git commit --no-verify`
+
 ## CLI (Epic 3 MVP surface)
 
 The `openoman` binary provides a minimal local workflow against SQLite:

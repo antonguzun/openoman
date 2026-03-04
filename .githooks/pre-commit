@@ -1,0 +1,57 @@
+#!/usr/bin/env sh
+
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+config_path="$repo_root/.gitleaks.toml"
+
+tmpdir=$(mktemp -d)
+scan_root="$tmpdir/staged"
+paths_file="$tmpdir/staged-paths"
+mkdir -p "$scan_root"
+trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+git diff --cached --name-only --diff-filter=ACMR -z >"$paths_file"
+
+if [ ! -s "$paths_file" ]; then
+    exit 0
+fi
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "gitleaks is required for secret scanning." >&2
+    echo "Install gitleaks, ensure it is on PATH, and enable repo hooks with:" >&2
+    echo "  git config core.hooksPath .githooks" >&2
+    exit 1
+fi
+
+git checkout-index --stdin -z --prefix="$scan_root/" <"$paths_file"
+
+if [ ! -d "$scan_root" ]; then
+    exit 0
+fi
+
+if find "$scan_root" -type f -print -quit | grep -q .; then
+    :
+else
+    exit 0
+fi
+
+if (
+    cd "$scan_root"
+    if gitleaks dir --help >/dev/null 2>&1; then
+        exec gitleaks dir . --config "$config_path"
+    fi
+
+    if gitleaks detect --help >/dev/null 2>&1; then
+        exec gitleaks detect --no-git --source . --config "$config_path"
+    fi
+
+    echo "Unsupported gitleaks CLI. Expected either 'gitleaks dir' or 'gitleaks detect'." >&2
+    exit 1
+); then
+    exit 0
+else
+    status=$?
+    echo "Secret scan failed. Remove the secret from staged changes or update the gitleaks allowlist deliberately." >&2
+    exit "$status"
+fi
