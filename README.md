@@ -46,7 +46,7 @@ Examples:
   `provider = "codex"`, `bin = "/usr/local/bin/codex"`, `auth_file = "~/.codex/auth.json"`, `egress_allowed_domains = ["api.openai.com"]`
 - Cursor:
   `provider = "cursor"`, `bin = "cursor-agent"`, `model = "gpt-5"`, `api_key = "crsr_..."`, `egress_allowed_domains = ["api2.cursor.sh"]`
-  For debugging only, `egress_allowed_domains = ["*"]` disables hostname filtering in the host CONNECT proxy.
+  For debugging only, `egress_allowed_domains = ["*"]` disables hostname filtering and enables broader guest egress via the host.
 
 ## Sandbox backend
 

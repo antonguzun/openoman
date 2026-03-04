@@ -518,10 +518,9 @@ impl FirecrackerDirectRunner {
                 ("--prefix-len", lease.prefix_len.to_string()),
                 (
                     "--allow-all",
-                    if spec.agent.egress_allowed_domains.iter().any(|domain| domain == "*") {
-                        "true".to_string()
-                    } else {
-                        "false".to_string()
+                    match host_proxy_egress_policy(&spec.agent.egress_allowed_domains) {
+                        HostProxyEgressPolicy::AllowAllDebug => "true".to_string(),
+                        HostProxyEgressPolicy::Restricted(_) => "false".to_string(),
                     },
                 ),
             ],
@@ -1271,9 +1270,10 @@ fn handle_connect_proxy_client(
 }
 
 fn allowlisted_domain_matches(allowed_domains: &[String], host: &str) -> bool {
-    allowed_domains
-        .iter()
-        .any(|allowed| allowed == "*" || allowed == host)
+    match host_proxy_egress_policy(allowed_domains) {
+        HostProxyEgressPolicy::AllowAllDebug => true,
+        HostProxyEgressPolicy::Restricted(domains) => domains.iter().any(|allowed| allowed == host),
+    }
 }
 
 fn read_connect_proxy_request(stream: &mut TcpStream) -> io::Result<String> {
@@ -1481,12 +1481,26 @@ fn u32_to_ipv4(address: u32) -> Ipv4Addr {
     Ipv4Addr::from(address.to_be_bytes())
 }
 
+enum HostProxyEgressPolicy<'a> {
+    Restricted(&'a [String]),
+    AllowAllDebug,
+}
+
+fn host_proxy_egress_policy(domains: &[String]) -> HostProxyEgressPolicy<'_> {
+    if domains.iter().any(|domain| domain == "*") {
+        HostProxyEgressPolicy::AllowAllDebug
+    } else {
+        HostProxyEgressPolicy::Restricted(domains)
+    }
+}
+
 fn render_agent_env(
     agent: &AgentExecutionSpec,
     guest_path_entries: &[String],
     user_package_dirs: &[UserPackageDir],
     network_lease: Option<&NetworkLease>,
 ) -> String {
+    let egress_policy = host_proxy_egress_policy(&agent.egress_allowed_domains);
     let mut env_file = String::new();
     env_file.push_str(&format!(
         "AGENT_PROVIDER={}\n",
@@ -1539,7 +1553,8 @@ fn render_agent_env(
             "OPENOMAN_NET_HOST_IPV4={}\n",
             shell_quote(&lease.host_ip.to_string())
         ));
-        if agent.egress_allowed_domains.iter().any(|domain| domain == "*") {
+        if matches!(egress_policy, HostProxyEgressPolicy::AllowAllDebug) {
+            // `*` is a debugging override: bypass the CONNECT allowlist with host NAT + guest DNS.
             env_file.push_str("OPENOMAN_NET_ALLOW_ALL='1'\n");
             let dns_servers = discover_host_dns_servers();
             if !dns_servers.is_empty() {
@@ -1590,11 +1605,7 @@ fn discover_host_dns_servers() -> Vec<String> {
                 continue;
             }
             let value = trimmed["nameserver ".len()..].trim();
-            if value.is_empty()
-                || value == "127.0.0.1"
-                || value == "127.0.0.53"
-                || value == "::1"
-            {
+            if value.is_empty() || value == "127.0.0.1" || value == "127.0.0.53" || value == "::1" {
                 continue;
             }
             if !servers.iter().any(|existing| existing == value) {
@@ -2246,6 +2257,29 @@ mod tests {
         assert!(env_file.contains("export HTTP_PROXY='http://172.22.0.1:3128'"));
         assert!(env_file.contains("export https_proxy='http://172.22.0.1:3128'"));
         assert!(env_file.contains("export http_proxy='http://172.22.0.1:3128'"));
+    }
+
+    #[test]
+    fn render_agent_env_includes_host_proxy_debug_networking_markers() {
+        let lease =
+            allocate_network_lease("172.22.0.0/16", 1, "oomtap", 3128).expect("allocate lease");
+        let env_file = render_agent_env(
+            &AgentExecutionSpec {
+                provider: AgentProvider::Cursor,
+                bin: "/usr/local/bin/cursor-agent".to_string(),
+                model: None,
+                auth_file: None,
+                api_key: Some("cursor-secret".to_string()),
+                egress_proxy: None,
+                egress_allowed_domains: vec!["*".to_string()],
+            },
+            &[],
+            &[],
+            Some(&lease),
+        );
+
+        assert!(env_file.contains("OPENOMAN_NET_ALLOW_ALL='1'"));
+        assert!(env_file.contains("OPENOMAN_NET_HOST_IPV4='172.22.0.1'"));
     }
 
     #[test]

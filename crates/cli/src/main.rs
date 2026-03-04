@@ -5,8 +5,8 @@ use std::{
     process::{self, Command as ProcessCommand, Stdio},
 };
 
-use clap::{Parser, Subcommand};
 use clap::ArgAction;
+use clap::{Parser, Subcommand};
 use openoman_core::{
     domain::{
         job::{ArtifactRef, Job, JobId, JobState, RepoRef, Revision},
@@ -218,6 +218,17 @@ struct PublishingRuntimeConfig {
 struct CursorAuthCache {
     #[serde(rename = "apiKey")]
     api_key: Option<String>,
+}
+
+#[derive(Debug)]
+struct ResolvedCursorExecutionInputs {
+    api_key: String,
+    staged_auth_file: Option<PathBuf>,
+}
+
+enum AgentEgressPolicy<'a> {
+    Restricted(&'a [String]),
+    AllowAllDebug,
 }
 
 const LOG_LIMIT_BYTES: usize = 1024 * 1024;
@@ -888,34 +899,21 @@ fn normalize_egress_allowed_domains(domains: Option<Vec<String>>) -> Result<Vec<
     Ok(normalized)
 }
 
+fn agent_egress_policy(domains: &[String]) -> AgentEgressPolicy<'_> {
+    if domains.iter().any(|domain| domain == "*") {
+        AgentEgressPolicy::AllowAllDebug
+    } else {
+        AgentEgressPolicy::Restricted(domains)
+    }
+}
+
 fn resolve_agent_execution_spec(config: &AgentRuntimeConfig) -> Result<AgentExecutionSpec, String> {
-    let api_key = match config.provider {
-        AgentProvider::Codex => None,
+    let (api_key, auth_file) = match config.provider {
+        AgentProvider::Codex => (None, config.auth_file.clone()),
         AgentProvider::Cursor => {
-            if let Some(api_key) = &config.api_key {
-                Some(api_key.clone())
-            } else {
-                let env_name = config.api_key_env.as_deref().ok_or_else(|| {
-                    "agent.api_key or agent.api_key_env is required when agent.provider = \"cursor\""
-                        .to_string()
-                })?;
-                let value = env::var(env_name).map_err(|_| {
-                    format!("agent.api_key_env references missing environment variable {env_name}")
-                })?;
-                if value.trim().is_empty() {
-                    return Err(format!(
-                        "environment variable {env_name} referenced by agent.api_key_env must not be empty"
-                    ));
-                }
-                Some(value)
-            }
+            let resolved = resolve_cursor_execution_inputs(config)?;
+            (Some(resolved.api_key), resolved.staged_auth_file)
         }
-    };
-    let auth_file = match config.provider {
-        AgentProvider::Codex => config.auth_file.clone(),
-        AgentProvider::Cursor => api_key
-            .as_deref()
-            .and_then(discover_matching_cursor_auth_cache_path),
     };
 
     Ok(AgentExecutionSpec {
@@ -929,15 +927,42 @@ fn resolve_agent_execution_spec(config: &AgentRuntimeConfig) -> Result<AgentExec
     })
 }
 
+fn resolve_cursor_execution_inputs(
+    config: &AgentRuntimeConfig,
+) -> Result<ResolvedCursorExecutionInputs, String> {
+    let api_key = if let Some(api_key) = &config.api_key {
+        api_key.clone()
+    } else {
+        let env_name = config.api_key_env.as_deref().ok_or_else(|| {
+            "agent.api_key or agent.api_key_env is required when agent.provider = \"cursor\""
+                .to_string()
+        })?;
+        let value = env::var(env_name).map_err(|_| {
+            format!("agent.api_key_env references missing environment variable {env_name}")
+        })?;
+        if value.trim().is_empty() {
+            return Err(format!(
+                "environment variable {env_name} referenced by agent.api_key_env must not be empty"
+            ));
+        }
+        value
+    };
+
+    // Cursor can reuse the host CLI's cached auth state when it matches the configured API key.
+    let staged_auth_file = discover_matching_cursor_auth_cache_path(&api_key);
+
+    Ok(ResolvedCursorExecutionInputs {
+        api_key,
+        staged_auth_file,
+    })
+}
+
 fn discover_matching_cursor_auth_cache_path(api_key: &str) -> Option<PathBuf> {
     let home = env::var_os("HOME")?;
     discover_matching_cursor_auth_cache_path_in_home(api_key, &PathBuf::from(home))
 }
 
-fn discover_matching_cursor_auth_cache_path_in_home(
-    api_key: &str,
-    home: &Path,
-) -> Option<PathBuf> {
+fn discover_matching_cursor_auth_cache_path_in_home(api_key: &str, home: &Path) -> Option<PathBuf> {
     let auth_path = home.join(".config/cursor/auth.json");
     let contents = fs::read_to_string(&auth_path).ok()?;
     let auth_cache: CursorAuthCache = serde_json::from_str(&contents).ok()?;
@@ -1210,16 +1235,19 @@ fn validate_agent_networking_contract(
                 .to_string(),
         );
     }
-    if agent.provider == AgentProvider::Cursor
-        && !agent.egress_allowed_domains.iter().any(|domain| domain == "*")
-        && !agent
-            .egress_allowed_domains
-            .iter()
-            .any(|domain| domain == CURSOR_REQUIRED_HOST_PROXY_DOMAIN)
-    {
-        return Err(format!(
-            "agent.egress_allowed_domains must include \"{CURSOR_REQUIRED_HOST_PROXY_DOMAIN}\" when agent.provider = \"cursor\" and sandbox.firecracker.network.mode = \"host-proxy\" because Cursor CLI print mode tunnels through that hostname"
-        ));
+    if agent.provider == AgentProvider::Cursor {
+        match agent_egress_policy(&agent.egress_allowed_domains) {
+            AgentEgressPolicy::AllowAllDebug => {}
+            AgentEgressPolicy::Restricted(domains)
+                if domains
+                    .iter()
+                    .any(|domain| domain == CURSOR_REQUIRED_HOST_PROXY_DOMAIN) => {}
+            AgentEgressPolicy::Restricted(_) => {
+                return Err(format!(
+                    "agent.egress_allowed_domains must include \"{CURSOR_REQUIRED_HOST_PROXY_DOMAIN}\" when agent.provider = \"cursor\" and sandbox.firecracker.network.mode = \"host-proxy\" because Cursor CLI print mode tunnels through that hostname"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1567,7 +1595,11 @@ fn run_iptables_command_allow_missing(args: &[String]) -> Result<(), String> {
     {
         return Ok(());
     }
-    Err(format!("iptables {} failed: {}", args.join(" "), stderr.trim()))
+    Err(format!(
+        "iptables {} failed: {}",
+        args.join(" "),
+        stderr.trim()
+    ))
 }
 
 fn run_ip_command(args: &[String]) -> Result<(), String> {
@@ -2043,11 +2075,9 @@ egress_allowed_domains = ["api.openai.com"]
 
     #[test]
     fn normalize_egress_allowed_domains_preserves_wildcard() {
-        let domains = normalize_egress_allowed_domains(Some(vec![
-            "*".to_string(),
-            " * ".to_string(),
-        ]))
-        .expect("wildcard should be accepted");
+        let domains =
+            normalize_egress_allowed_domains(Some(vec!["*".to_string(), " * ".to_string()]))
+                .expect("wildcard should be accepted");
 
         assert_eq!(domains, vec!["*".to_string()]);
     }
@@ -2365,8 +2395,7 @@ egress_allowed_domains = ["api.cursor.com"]
         )
         .expect("write config");
 
-        let err =
-            AppConfig::load(&config_path).expect_err("cursor host-proxy should require api2");
+        let err = AppConfig::load(&config_path).expect_err("cursor host-proxy should require api2");
         assert!(err.contains("api2.cursor.sh"));
         assert!(err.contains("agent.egress_allowed_domains"));
     }
@@ -2518,10 +2547,8 @@ model = "gpt-5"
         )
         .expect("write auth file");
 
-        let discovered = discover_matching_cursor_auth_cache_path_in_home(
-            "cursor-inline-secret",
-            temp.path(),
-        );
+        let discovered =
+            discover_matching_cursor_auth_cache_path_in_home("cursor-inline-secret", temp.path());
         assert_eq!(discovered.as_deref(), Some(auth_path.as_path()));
     }
 
@@ -2536,10 +2563,8 @@ model = "gpt-5"
         )
         .expect("write auth file");
 
-        let discovered = discover_matching_cursor_auth_cache_path_in_home(
-            "cursor-inline-secret",
-            temp.path(),
-        );
+        let discovered =
+            discover_matching_cursor_auth_cache_path_in_home("cursor-inline-secret", temp.path());
         assert_eq!(discovered, None);
     }
 

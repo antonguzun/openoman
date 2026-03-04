@@ -67,7 +67,7 @@ egress_allowed_domains = ["api.openai.com"]
 # api_key = "crsr_..."
 # Or: api_key_env = "OPENOMAN_CURSOR_API_KEY"
 # egress_allowed_domains = ["api2.cursor.sh"]
-# For debugging only, disable hostname filtering in the host CONNECT proxy:
+# For debugging only, disable hostname filtering and enable broader guest egress via the host:
 # egress_allowed_domains = ["*"]
 
 [publishing]

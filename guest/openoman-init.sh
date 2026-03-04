@@ -98,6 +98,52 @@ log_command_argv() {
   done
 }
 
+log_command_redacting_api_key() {
+  log_label="$1"
+  shift
+  printf "%s" "$log_label"
+  separator=""
+  redact_next=0
+  while [ "$#" -gt 0 ]; do
+    printf "%s" "$separator"
+    if [ "$redact_next" -eq 1 ]; then
+      quote_log_arg "$(redact_secret "$1")"
+      redact_next=0
+    else
+      quote_log_arg "$1"
+      if [ "$1" = "--api-key" ]; then
+        redact_next=1
+      fi
+    fi
+    separator=" "
+    shift
+  done
+  printf "\n"
+}
+
+log_command_argv_redacting_api_key() {
+  log_label="$1"
+  shift
+  echo "$log_label"
+  arg_index=0
+  redact_next=0
+  while [ "$#" -gt 0 ]; do
+    printf "  argv[%s]=" "$arg_index"
+    if [ "$redact_next" -eq 1 ]; then
+      quote_log_arg "$(redact_secret "$1")"
+      redact_next=0
+    else
+      quote_log_arg "$1"
+      if [ "$1" = "--api-key" ]; then
+        redact_next=1
+      fi
+    fi
+    printf "\n"
+    arg_index=$((arg_index + 1))
+    shift
+  done
+}
+
 if command -v ip >/dev/null 2>&1; then
   OPENOMAN_IP_BIN="$(command -v ip)"
 elif command -v busybox >/dev/null 2>&1; then
@@ -267,117 +313,31 @@ case "$AGENT_PROVIDER" in
         echo "cursor --version failed; skipping cursor exec"
         agent_status=$cursor_version_status
       else
+        cursor_auth_mode=""
         echo "running cursor print mode in $WORKSPACE_DIR"
         if [ -n "${OPENOMAN_AGENT_AUTH_FILE:-}" ]; then
-          echo "cursor auth mode: staged auth file"
-          unset CURSOR_API_KEY || true
-          if [ -n "${AGENT_MODEL:-}" ]; then
-            log_command \
-              "cursor command: " \
-              "$AGENT_BIN" \
-              -p \
-              -f \
-              --output-format \
-              text \
-              --model \
-              "$AGENT_MODEL" \
-              "$instruction"
-            log_command_argv \
-              "cursor command argv:" \
-              "$AGENT_BIN" \
-              -p \
-              -f \
-              --output-format \
-              text \
-              --model \
-              "$AGENT_MODEL" \
-              "$instruction"
-          else
-            log_command \
-              "cursor command: " \
-              "$AGENT_BIN" \
-              -p \
-              -f \
-              --output-format \
-              text \
-              "$instruction"
-            log_command_argv \
-              "cursor command argv:" \
-              "$AGENT_BIN" \
-              -p \
-              -f \
-              --output-format \
-              text \
-              "$instruction"
-          fi
+          cursor_auth_mode="staged auth file"
         else
-          redacted_cursor_api_key="$(redact_secret "$CURSOR_API_KEY")"
-          echo "cursor auth mode: api key"
-          echo "cursor api key (redacted): $redacted_cursor_api_key"
-          echo "cursor api key length: ${#CURSOR_API_KEY}"
-          if [ -n "${AGENT_MODEL:-}" ]; then
-            log_command \
-              "cursor command: " \
-              "$AGENT_BIN" \
-              --api-key \
-              "$redacted_cursor_api_key" \
-              -p \
-              -f \
-              --output-format \
-              text \
-              --model \
-              "$AGENT_MODEL" \
-              "$instruction"
-            log_command_argv \
-              "cursor command argv:" \
-              "$AGENT_BIN" \
-              --api-key \
-              "$redacted_cursor_api_key" \
-              -p \
-              -f \
-              --output-format \
-              text \
-              --model \
-              "$AGENT_MODEL" \
-              "$instruction"
-          else
-            log_command \
-              "cursor command: " \
-              "$AGENT_BIN" \
-              --api-key \
-              "$redacted_cursor_api_key" \
-              -p \
-              -f \
-              --output-format \
-              text \
-              "$instruction"
-            log_command_argv \
-              "cursor command argv:" \
-              "$AGENT_BIN" \
-              --api-key \
-              "$redacted_cursor_api_key" \
-              -p \
-              -f \
-              --output-format \
-              text \
-              "$instruction"
-          fi
+          cursor_auth_mode="api key"
         fi
+        set -- "$AGENT_BIN"
+        if [ "$cursor_auth_mode" = "api key" ]; then
+          set -- "$@" --api-key "$CURSOR_API_KEY"
+        fi
+        set -- "$@" -p -f --output-format text
+        if [ -n "${AGENT_MODEL:-}" ]; then
+          set -- "$@" --model "$AGENT_MODEL"
+        fi
+        set -- "$@" "$instruction"
+        echo "cursor auth mode: $cursor_auth_mode"
+        log_command_redacting_api_key "cursor command: " "$@"
+        log_command_argv_redacting_api_key "cursor command argv:" "$@"
         (
           cd "$WORKSPACE_DIR"
-          if [ -n "${OPENOMAN_AGENT_AUTH_FILE:-}" ]; then
-            if [ -n "${AGENT_MODEL:-}" ]; then
-              "$AGENT_BIN" -p -f --output-format text --model "$AGENT_MODEL" "$instruction"
-            else
-              "$AGENT_BIN" -p -f --output-format text "$instruction"
-            fi
-          else
-            if [ -n "${AGENT_MODEL:-}" ]; then
-              "$AGENT_BIN" --api-key "$CURSOR_API_KEY" -p -f --output-format text --model "$AGENT_MODEL" "$instruction"
-            else
-              "$AGENT_BIN" --api-key "$CURSOR_API_KEY" -p -f --output-format text "$instruction"
-            fi
+          if [ "$cursor_auth_mode" = "staged auth file" ]; then
+            unset CURSOR_API_KEY || true
           fi
+          "$@"
         ) > "$OUTPUT_DIR/report.txt" || agent_status=$?
         echo "cursor exec exit status: $agent_status"
       fi
