@@ -47,8 +47,8 @@ trap 'rm -rf "$TMPDIR"' EXIT
 ROOTFS_TREE="$TMPDIR/rootfs-tree"
 mkdir -p "$ROOTFS_TREE" "$OUTPUT_DIR"
 
-IMAGE_REF="${OPENOMAN_GUEST_IMAGE:-alpine:3.20}"
-GUEST_SETUP_CMD="${OPENOMAN_GUEST_SETUP_CMD:-apk add --no-cache bash ca-certificates git nodejs npm ripgrep strace && npm install -g @openai/codex && command -v node >/dev/null && command -v codex >/dev/null && command -v strace >/dev/null}"
+IMAGE_REF="${OPENOMAN_GUEST_IMAGE:-debian:bookworm-slim}"
+GUEST_SETUP_CMD="${OPENOMAN_GUEST_SETUP_CMD:-apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bash ca-certificates curl git iproute2 nodejs npm ripgrep strace && npm install -g @openai/codex && curl -fsSL https://cursor.com/install | bash && export PATH=\$HOME/.local/bin:\$PATH && command -v node >/dev/null && command -v codex >/dev/null && command -v cursor-agent >/dev/null && command -v strace >/dev/null && command -v ip >/dev/null && apt-get clean && rm -rf /var/lib/apt/lists/*}"
 CONTAINER_ID="$($CONTAINER_ENGINE create "$IMAGE_REF" sh -c "$GUEST_SETUP_CMD")"
 trap '$CONTAINER_ENGINE rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true; rm -rf "$TMPDIR"' EXIT
 

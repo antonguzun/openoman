@@ -44,14 +44,31 @@ guest_path = "/opt/openoman/user-bin"
 add_to_path = true
 
 [agent]
-# Agent provider executed inside sandbox. MVP supports only "codex".
+# Agent provider executed inside the sandbox. Supported providers: "codex", "cursor".
 provider = "codex"
-# Binary baked into the default guest rootfs build.
-codex_bin = "/usr/local/bin/codex"
-# Optional host auth file copied into the guest as /root/.codex/auth.json.
+# Preferred provider-neutral command path.
+bin = "/usr/local/bin/codex"
+# Codex-only optional host auth file copied into the guest as /root/.codex/auth.json.
+# auth_file = "~/.codex/auth.json"
+# Cursor-only inline API key copied into the guest as CURSOR_API_KEY.
+# api_key = "crsr_..."
+# Optional alternative: host environment variable name whose value will be injected into the guest
+# as CURSOR_API_KEY at `openoman run` time.
+# api_key_env = "OPENOMAN_CURSOR_API_KEY"
+# Legacy Codex-only aliases still accepted for backward compatibility:
+# codex_bin = "/usr/local/bin/codex"
 # codex_auth_file = "~/.codex/auth.json"
 # Domain allowlist enforced by the host CONNECT proxy in host-proxy networking mode.
 egress_allowed_domains = ["api.openai.com"]
+# For Cursor, switch the provider/bin and use Cursor's API domain instead:
+# provider = "cursor"
+# bin = "cursor-agent"
+# model = "gpt-5"
+# api_key = "crsr_..."
+# Or: api_key_env = "OPENOMAN_CURSOR_API_KEY"
+# egress_allowed_domains = ["api2.cursor.sh"]
+# For debugging only, disable hostname filtering and enable broader guest egress via the host:
+# egress_allowed_domains = ["*"]
 
 [publishing]
 # Trusted GitHub publishing runs only after validation succeeds.

@@ -20,7 +20,7 @@ The rootfs therefore needs to contain `/sbin/openoman-init`. The checked-in [`op
 
 - mount `/dev/vdb` at `/mnt/runtime`
 - load `/mnt/runtime/openoman-config/agent.env`
-- optionally copy a staged Codex auth file to `/root/.codex/auth.json`
+- optionally copy a staged provider auth file into the location expected by the selected CLI
 - bind configured package directories into the guest filesystem
 - optionally configure `eth0` with a static `/30` address and export a host-local HTTP CONNECT proxy
 - run the agent inside `/mnt/runtime/workspace` with Firecracker as the outer sandbox boundary
@@ -52,7 +52,7 @@ Set `OPENOMAN_CONTAINER_ENGINE=docker` or `OPENOMAN_CONTAINER_ENGINE=podman` if 
 - downloads an uncompressed Firecracker-compatible kernel into `./guest/out/vmlinux`
 - downloads the matching published kernel config into `./guest/out/vmlinux.config`
 - builds a root filesystem image with `openoman-init.sh` injected as `/sbin/openoman-init` into `./guest/out/rootfs.ext4`
-- by default, installs guest-side `node`, `npm`, `git`, `ripgrep`, and `@openai/codex`, so `/usr/local/bin/codex` exists inside the guest image without host bind mounts
+- by default, installs guest-side `node`, `npm`, `git`, `ripgrep`, `@openai/codex`, and Cursor's `cursor-agent`, so both CLIs exist inside the guest image without host bind mounts
 
 The default kernel download URL now points at Firecracker's official `firecracker-ci` guest kernel for the local architecture. The script also downloads the published sidecar config and refuses the build if it does not contain `CONFIG_HW_RANDOM_VIRTIO=y`, because the current guest Node/Codex workload stalls without that driver.
 
@@ -61,7 +61,7 @@ On `x86_64`, the default is `https://s3.amazonaws.com/spec.ccfc.min/firecracker-
 If you need a different guest package set, override the container setup step:
 
 ```sh
-OPENOMAN_GUEST_SETUP_CMD='apk add --no-cache nodejs npm && npm install -g @openai/codex'
+OPENOMAN_GUEST_SETUP_CMD='apk add --no-cache bash curl nodejs npm && npm install -g @openai/codex && curl -fsSL https://cursor.com/install | bash'
 ./guest/build-rootfs.sh ./guest/out
 ```
 
@@ -99,7 +99,7 @@ cargo test -p openoman-core direct_runner_smoke_boots_real_firecracker_when_opte
 
 ## Host-proxy networking
 
-Direct Firecracker mode now supports a host-proxy networking path for real Codex/API traffic:
+Direct Firecracker mode now supports a host-proxy networking path for real agent/API traffic:
 
 - `sandbox.firecracker.network.mode = "host-proxy"`
 - the host creates one tap device per run
@@ -111,7 +111,7 @@ This keeps guest egress constrained to the host proxy path instead of giving the
 
 `privilege_mode = "sudo"` is the default because creating the tap device requires host network privileges. `openoman run` calls `sudo -v` once before the attempt starts, then uses a hidden internal helper for tap setup and teardown. Use `privilege_mode = "direct"` only when the whole `openoman` process already runs with the required capabilities.
 
-The current guest kernel does not enable Linux Landlock (`CONFIG_SECURITY_LANDLOCK` is off in the pinned Firecracker kernel config), so the guest init script runs `codex exec` with `--dangerously-bypass-approvals-and-sandbox`. That is intentional here: Firecracker is already the actual isolation boundary for the untrusted workload.
+The current guest kernel does not enable Linux Landlock (`CONFIG_SECURITY_LANDLOCK` is off in the pinned Firecracker kernel config). The Codex branch therefore runs `codex exec` with `--dangerously-bypass-approvals-and-sandbox`, and the Cursor branch relies on Firecracker itself rather than an inner sandbox. That is intentional here: Firecracker is already the actual isolation boundary for the untrusted workload.
 
 ## Limitations
 
