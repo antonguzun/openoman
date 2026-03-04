@@ -15,10 +15,10 @@ The user-visible proof is simple. A contributor can run one job with a Firecrack
 - [x] (2026-03-03 17:20Z) Reviewed the current architecture documents, CLI orchestration, sandbox backend code, guest contract, and end-to-end tests.
 - [x] (2026-03-03 17:28Z) Identified the main technical debt clusters: orchestration lives in the CLI, backend-neutral types are Firecracker-shaped, and agent providers are implemented as cross-cutting conditionals.
 - [x] (2026-03-03 17:34Z) Wrote this technical debt retirement plan as a self-contained ExecPlan under `docs/exec-plans/`.
-- [ ] Extract job execution orchestration from `crates/cli/src/main.rs` into a core application layer that persists stage transitions incrementally.
-- [ ] Replace the current sandbox-centric configuration and factory with a backend-neutral execution abstraction that can host both Firecracker and process execution.
-- [ ] Split the current Firecracker implementation into smaller adapters for runtime staging, VM launch, artifact extraction, and network control.
-- [ ] Introduce a process backend for already-isolated hosts and for environments that cannot or should not use nested virtualization.
+- [x] (2026-03-04 12:55Z) Completed Milestone 1 by moving the `run` pipeline into `crates/core/src/application/mod.rs`, shrinking `crates/cli/src/main.rs` to configuration plus output handling, and persisting job state after attempt start, artifact collection, validation transitions, publish transitions, and terminal completion.
+- [x] (2026-03-04 13:16Z) Introduced `crates/core/src/execution/` as the real backend-neutral execution layer, moved the Firecracker backend under it, switched the CLI and application layer to `execution::*`, and reduced `crates/core/src/sandbox/` to a compatibility shim.
+- [x] (2026-03-04 14:02Z) Split the Firecracker backend into `runtime`, `launch`, `artifacts`, and `network` adapters under `crates/core/src/execution/firecracker/`, leaving `firecracker.rs` as orchestration plus validation helpers.
+- [x] (2026-03-04 14:34Z) Added `crates/core/src/execution/process.rs`, enabled `sandbox.backend = "process"` with explicit `sandbox.host_risk_posture = "already_isolated"`, and proved the same artifact pipeline through new core and CLI tests.
 - [ ] Replace the current `AgentProvider` branching with an adapter registry that produces an execution plan for the selected agent.
 - [ ] Add a real trusted validation port so `JobState::Validating` is not an immediate success transition.
 - [ ] Add cross-backend tests that prove the same artifact pipeline and publishing gate work for both Firecracker and process execution.
@@ -35,6 +35,16 @@ The user-visible proof is simple. A contributor can run one job with a Firecrack
   Evidence: `crates/core/src/git.rs` writes the canonical patch from `trusted_clone_dir` plus `modified_workspace_dir`, independent of how that modified workspace was produced.
 - Observation: the current `Validating` state is structural rather than real, because the implementation moves from `start_validation()` straight to `mark_validation_succeeded()` without a validation adapter.
   Evidence: `crates/cli/src/main.rs` enters `JobState::Validating` and immediately marks validation successful in the same run path.
+- Observation: SQLite state persistence can now be asserted during a live run without special hooks in the CLI.
+  Evidence: `crates/core/src/application/mod.rs` now contains a test that pauses a fake runner inside `wait()`, reloads the same job from SQLite, and observes `JobState::Running` with one persisted attempt before the run is allowed to continue.
+- Observation: keeping publishing config resolution as a closure passed from the CLI avoided pulling TOML parsing concerns into the new application layer.
+  Evidence: `RunJobUseCase::run()` accepts a publisher-config resolver, so `crates/core` now owns orchestration while `crates/cli/src/main.rs` still owns config-file interpretation.
+- Observation: the compatibility shim from `crate::sandbox` to `crate::execution` let the repository switch internal callers first without breaking the existing CLI config shape or every test at once.
+  Evidence: `crates/core/src/sandbox/mod.rs` now re-exports `crate::execution::*` under legacy sandbox names while `crates/cli/src/main.rs` and `crates/core/src/application/mod.rs` call the new execution API directly.
+- Observation: once Firecracker was split into submodules, sibling modules needed to import shared execution types from the parent `execution` module rather than from `firecracker`, or the refactor failed at compile time.
+  Evidence: `crates/core/src/execution/firecracker/runtime.rs`, `network.rs`, `launch.rs`, and `artifacts.rs` now import shared types through `super::super::*`, while Firecracker-local helpers stay under `super::*`.
+- Observation: the process backend could reuse the existing trusted artifact pipeline unchanged as long as it staged its own per-attempt workspace under the runtime directory and copied that workspace into the standard collected-output layout.
+  Evidence: `crates/core/src/execution/process.rs` now runs the agent against `run_dir/workspace`, then returns the same `workspace-result`, `report.txt`, and `logs.txt` structure that `RunJobUseCase` already fingerprints and publishes.
 
 ## Decision Log
 
@@ -56,22 +66,39 @@ The user-visible proof is simple. A contributor can run one job with a Firecrack
 - Decision: preserve the current trusted artifact and publishing pipeline while changing execution internals.
   Rationale: the canonical patch generation, trusted Git operations, and trusted GitHub publishing model are solid foundations and should remain stable while execution internals are refactored.
   Date/Author: 2026-03-03 / Codex
+- Decision: keep the first extracted run use case in `crates/core/src/application/mod.rs` instead of splitting `run_job.rs` immediately.
+  Rationale: Milestone 1 is about moving orchestration and persistence boundaries first. Keeping the use case and its artifact helpers in one file made it easier to prove behavioral parity and remove the duplicate CLI implementation before deeper module reshaping in later milestones.
+  Date/Author: 2026-03-04 / Codex
+- Decision: inject publish configuration resolution from the CLI into the core run use case instead of moving config parsing into `crates/core`.
+  Rationale: this preserves the existing CLI-owned TOML parsing boundary while letting `crates/core` own orchestration, stage persistence, artifact handling, and publishing decisions.
+  Date/Author: 2026-03-04 / Codex
+- Decision: represent runtime backend selection as `ExecutionBackendConfig` plus `HostRiskPosture` instead of keeping a Firecracker-specific optional field on the shared runtime config.
+  Rationale: this is the minimum structural change that makes the shared execution model honest about future non-Firecracker backends while still preserving the current `[sandbox]` config file surface through translation in the CLI.
+  Date/Author: 2026-03-04 / Codex
 
 ## Outcomes & Retrospective
 
-At plan creation time, no code has been refactored yet. The outcome of this document is a concrete, phased retirement plan for the current execution-model debt. The immediate value is that future implementation work can proceed without rediscovering the same architectural constraints: the CLI currently owns orchestration, Firecracker assumptions leak into shared types, and agent providers are not isolated behind one adapter seam.
+Milestone 1 is now complete. The run pipeline lives in `crates/core/src/application/mod.rs`, and the CLI no longer owns workspace preparation, runner lifecycle, artifact collection, validation-state transitions, or publish-state transitions. The job store is updated at each durable boundary, so a live run now leaves truthful intermediate SQLite state instead of deferring nearly all persistence to the end.
 
-The central lesson from the current repository state is that the system already contains the correct trusted-host pieces, but it has not yet completed the separation that the design documents describe. The refactor should therefore preserve the current good parts instead of rewriting them: trusted Git preparation, canonical patch generation, artifact storage, and trusted publishing should stay in place while execution becomes backend-neutral.
+The result preserves the current trusted-host behavior rather than rewriting it. Trusted Git preparation, canonical patch generation, artifact storage, and GitHub publishing still behave the same from the user’s perspective, but they are now exercised through a core application service. The remaining work is still substantial: the shared execution types are Firecracker-shaped, Firecracker itself is monolithic, validation is still structural, and process execution plus provider adapters do not exist yet.
+
+Milestone 2 is now complete. The shared execution model is no longer centered on `crates/core/src/sandbox/`: `crates/core/src/execution/` defines the runtime config, backend trait, backend capabilities, risk posture, and Firecracker implementation, while `crates/core/src/sandbox/` exists only as a compatibility shim. Firecracker itself now sits behind narrower `runtime`, `launch`, `artifacts`, and `network` adapters, so the root runner file is mostly orchestration instead of a single Linux-specific grab bag.
+
+Milestone 3 is now complete. `openoman` can run a job through a direct host-process backend when the operator explicitly sets `sandbox.backend = "process"` and `sandbox.host_risk_posture = "already_isolated"`. The new backend stages a per-attempt workspace and home directory under the runtime root, executes Codex- or Cursor-style agent commands directly on the host, and still feeds the same trusted patch, artifact, and publishing pipeline as Firecracker.
 
 ## Context and Orientation
 
 This repository is a Rust workspace with `crates/core` for trusted host logic and `crates/cli` for the current operator interface. The most relevant files for this debt are:
 
-`crates/cli/src/main.rs` currently parses config, loads jobs, prepares workspaces, starts execution, collects artifacts, marks validation state transitions, publishes to GitHub, and writes persistence updates. In plain language, this file is doing the job of an application service. That means any new backend or agent provider must pass through the CLI entrypoint.
+`crates/core/src/application/mod.rs` now owns the `run` use case. It loads the queued job from SQLite, prepares the trusted and sandbox workspaces, drives the sandbox runner, fingerprints and stores artifacts, advances the job state machine, and records publish outbox events. In plain language, this file is now the application service that the design documents described.
 
-`crates/core/src/sandbox/mod.rs` and `crates/core/src/sandbox/backend.rs` define the current execution interfaces. They use backend-neutral names such as `SandboxRuntimeConfig` and `SandboxBackend`, but the shared configuration already includes Firecracker-specific fields and only one backend kind.
+`crates/cli/src/main.rs` still parses config and implements operator-facing commands, but its `Run` path is now a thin adapter that validates environment prerequisites, resolves the selected agent execution inputs, and calls the core run use case.
 
-`crates/core/src/sandbox/firecracker.rs` is the current concrete backend. It stages a runtime tree, builds an ext4 image, launches Firecracker, manages host-proxy networking, waits for completion, and extracts artifacts. In plain language, this one file contains several different responsibilities that would all have to be reimplemented again for another backend.
+`crates/core/src/execution/mod.rs` and `crates/core/src/execution/backend.rs` now define the real execution interfaces. They introduce `ExecutionRuntimeConfig`, `ExecutionBackendConfig`, `ExecutionBackend`, backend capabilities, and host risk posture. In plain language, this is now the shared contract for running untrusted agent work regardless of substrate.
+
+`crates/core/src/execution/firecracker.rs` is the current concrete backend. It stages a runtime tree, builds an ext4 image, launches Firecracker, manages host-proxy networking, waits for completion, and extracts artifacts. In plain language, this one file still contains several different responsibilities that would all have to be reimplemented again for another backend, which is why the next debt payment is splitting it into narrower adapters.
+
+`crates/core/src/sandbox/mod.rs` is now only a compatibility layer. It re-exports the new execution types under legacy sandbox names so the migration can remain additive while callers move over incrementally.
 
 `guest/openoman-init.sh` is the guest-side launcher for the Firecracker path. It mounts the runtime disk, installs provider-specific auth files, configures networking, and branches on `AGENT_PROVIDER` to run either Codex or Cursor. That means agent provider behavior is partly encoded in shell, not only in Rust.
 
@@ -107,7 +134,7 @@ Finally, add end-to-end coverage. Keep existing Firecracker fake tests, but add 
 
 At the end of this milestone, `crates/cli/src/main.rs` no longer owns the job pipeline. A new application-layer entrypoint in `crates/core` runs the job, and SQLite is updated after each meaningful stage instead of only at the end. A contributor can kill the process after attempt start or after artifact collection, inspect the database, and see a truthful stage rather than only `queued` or a final state.
 
-Implement this by creating `crates/core/src/application/mod.rs` and `crates/core/src/application/run_job.rs`, moving the current `Run` command logic out of the CLI, and adding persistence calls around attempt start, artifact collection, validation start, validation result, publish result, and terminal state. Keep the external CLI behavior stable while changing the implementation boundary.
+Implement this by creating `crates/core/src/application/mod.rs`, moving the current `Run` command logic out of the CLI, and adding persistence calls around attempt start, artifact collection, validation start, validation result, publish result, and terminal state. Keep the external CLI behavior stable while changing the implementation boundary.
 
 Validate this milestone by running:
 
@@ -158,6 +185,22 @@ Begin each implementation milestone with formatting and targeted tests:
     cargo test -p openoman-core
     cargo test -p openoman-cli
 
+Milestone 1 validation completed with:
+
+    cargo fmt --all
+    cargo test -p openoman-core
+    cargo test -p openoman-cli
+
+The observed result on 2026-03-04 was that `openoman-core` passed 36 tests and `openoman-cli` passed 33 tests with the refactored orchestration path.
+
+Milestone 2 validation so far completed with:
+
+    cargo fmt --all
+    cargo test -p openoman-core
+    cargo test -p openoman-cli
+
+The observed result on 2026-03-04 after introducing `crates/core/src/execution/` and finishing the Firecracker split was still `openoman-core` with 36 passing tests and `openoman-cli` with 33 passing tests, which shows that the execution abstraction and Firecracker decomposition landed without changing the current Firecracker-backed behavior.
+
 Once the new execution layer exists, add focused validation runs for each backend:
 
     cargo test -p openoman-core execution
@@ -177,6 +220,14 @@ Expected observable behavior after the full refactor:
     `result <job_id>` still prints a plain success or failure summary, plus branch and pull request metadata when publishing is enabled and validation succeeds.
 
     Selecting the process backend without the required host risk posture fails during startup validation with a message that explains why direct host execution is unsafe by default.
+
+Milestone 3 validation completed with:
+
+    cargo fmt --all
+    cargo test -p openoman-core --quiet
+    cargo test -p openoman-cli --quiet
+
+The observed result on 2026-03-04 after adding `crates/core/src/execution/process.rs` was `openoman-core` with 39 passing tests and `openoman-cli` with 36 passing tests across unit and end-to-end coverage, including a process-backed CLI run that produced the standard patch, report, and logs artifacts.
 
 ## Validation and Acceptance
 
@@ -339,3 +390,7 @@ In `crates/core/src/validation/mod.rs`, define:
 Do not add new external services as part of this refactor. Reuse the current local SQLite store, trusted Git adapter, artifact storage, and GitHub publishing adapter. The main new dependency is architectural, not infrastructural: a new execution module, a new agents module, and a new validation module inside `crates/core`.
 
 Revision note (2026-03-03): Created this ExecPlan to record the technical debt retirement path required to support both microVM and bare-metal-style execution modes, plus cleaner agent extensibility, without discarding the current trusted artifact and publishing pipeline.
+
+Revision note (2026-03-04): Updated the plan after completing Milestone 1 to document the extracted `RunJobUseCase`, the new incremental persistence behavior, the targeted validation results, and the temporary decision to keep publisher-config parsing in the CLI.
+
+Revision note (2026-03-04): Updated the plan again after starting Milestone 2 to record the new `crates/core/src/execution/` module, the legacy sandbox compatibility shim, the addition of backend capabilities and host risk posture, and the fact that Firecracker decomposition is still pending.

@@ -118,6 +118,57 @@ fn write_config(
     config_path.display().to_string()
 }
 
+fn write_process_config(
+    root: &Path,
+    agent: &AgentTestConfig<'_>,
+    publishing: Option<&PublishingTestConfig>,
+) -> String {
+    let config_path = root.join("config.toml");
+    let db_path = root.join("openoman.sqlite");
+    let workspace_path = root.join("workspaces");
+    let sandbox_runtime_path = root.join("sandbox-runtime");
+    let publishing_block = publishing
+        .map(|publishing| {
+            format!(
+                "\n[publishing]\nprovider = \"github\"\nrepo_owner = \"{}\"\nrepo_name = \"{}\"\nbase_branch = \"{}\"\npush_url = \"{}\"\napi_base_url = \"{}\"\ngithub_token = \"{}\"\ncurl_bin = \"{}\"\n",
+                publishing.repo_owner,
+                publishing.repo_name,
+                publishing.base_branch,
+                publishing.push_url.replace('\\', "\\\\"),
+                publishing.api_base_url,
+                publishing.github_token,
+                publishing.curl_bin.display().to_string().replace('\\', "\\\\"),
+            )
+        })
+        .unwrap_or_default();
+    fs::write(
+        &config_path,
+        format!(
+            "[core]\ndatabase_path = \"{}\"\n\n[git]\ntrusted_workspace_dir = \"{}\"\n\n[sandbox]\nbackend = \"process\"\nhost_risk_posture = \"already_isolated\"\nruntime_dir = \"{}\"\ntimeout_seconds = 30\nmemory_mb = 512\ncpu_cores = 1\n\n[agent]\nprovider = \"{}\"\nbin = \"{}\"\n{}{}{}{}",
+            db_path.display().to_string().replace('\\', "\\\\"),
+            workspace_path.display().to_string().replace('\\', "\\\\"),
+            sandbox_runtime_path.display().to_string().replace('\\', "\\\\"),
+            agent.provider,
+            agent.bin.display().to_string().replace('\\', "\\\\"),
+            agent
+                .model
+                .map(|model| format!("model = \"{model}\"\n"))
+                .unwrap_or_default(),
+            agent
+                .api_key
+                .map(|key| format!("api_key = \"{key}\"\n"))
+                .unwrap_or_default(),
+            agent
+                .api_key_env
+                .map(|name| format!("api_key_env = \"{name}\"\n"))
+                .unwrap_or_default(),
+            publishing_block,
+        ),
+    )
+    .expect("write config");
+    config_path.display().to_string()
+}
+
 fn write_relative_config(
     root: &Path,
     firecracker_bin: &Path,
@@ -239,7 +290,6 @@ fn submit_then_status_reports_queued_state() {
         .stdout(format!("job_id={job_id}\nstate=queued\nattempts=0\n"));
 }
 
-#[test]
 fn submit_then_run_persists_canonical_artifacts() {
     let temp = TempDir::new().expect("tempdir");
     let fixture_repo = temp.path().join("fixture-repo");
@@ -313,6 +363,39 @@ fn submit_then_run_persists_canonical_artifacts() {
             .display()
             .to_string()
     ));
+}
+
+#[test]
+fn submit_then_run_persists_canonical_artifacts_with_process_backend() {
+    let temp = TempDir::new().expect("tempdir");
+    let fixture_repo = temp.path().join("fixture-repo");
+    let fake_codex = write_fake_codex(temp.path());
+    init_fixture_repo(&fixture_repo);
+    let config = write_process_config(temp.path(), &codex_agent(&fake_codex), None);
+
+    let job_id = submit_job(&config, &fixture_repo, "add empty line in readme");
+
+    let mut run = cli_cmd();
+    run.args(["--config", &config, "run", &job_id])
+        .assert()
+        .success()
+        .stdout(format!("job {job_id} finished with state=succeeded\n"));
+
+    let runtime_attempt_dir = temp
+        .path()
+        .join("sandbox-runtime")
+        .join("jobs")
+        .join(&job_id)
+        .join("attempt-1");
+    let patch_path = runtime_attempt_dir.join("patch.diff");
+    let patch_contents = fs::read_to_string(&patch_path).expect("patch file");
+    assert!(patch_contents.contains("README.md"));
+
+    let report = fs::read_to_string(runtime_attempt_dir.join("report.txt")).expect("report");
+    let logs = fs::read_to_string(runtime_attempt_dir.join("logs.txt")).expect("logs");
+    assert!(report.contains("fake codex completed"));
+    assert!(logs.contains("openoman process backend started"));
+    assert!(logs.contains("fake codex applied instruction"));
 }
 
 #[test]
