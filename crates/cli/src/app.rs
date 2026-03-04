@@ -6,7 +6,7 @@ use std::{
 
 use clap::Parser;
 use openoman_core::{
-    application::{RunJobError, RunJobUseCase},
+    application::{RunJobArtifactLimits, RunJobError, RunJobUseCase},
     domain::{
         job::{Job, JobId, JobState, RepoRef, Revision},
         plugin::{CheckProfile, PublishPolicy},
@@ -150,9 +150,11 @@ fn run_job(
         execution_backend,
         config.execution.limits.clone(),
         agent_execution,
-        LOG_LIMIT_BYTES,
-        REPORT_LIMIT_BYTES,
-        PATCH_LIMIT_BYTES,
+        RunJobArtifactLimits {
+            log_limit_bytes: LOG_LIMIT_BYTES,
+            report_limit_bytes: REPORT_LIMIT_BYTES,
+            patch_limit_bytes: PATCH_LIMIT_BYTES,
+        },
     );
     let outcome = run_job
         .run(&job_id, |job| {

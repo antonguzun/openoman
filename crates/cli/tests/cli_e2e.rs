@@ -28,7 +28,7 @@ struct AgentTestConfig<'a> {
     api_key_env: Option<&'a str>,
 }
 
-fn codex_agent<'a>(bin: &'a Path) -> AgentTestConfig<'a> {
+fn codex_agent(bin: &Path) -> AgentTestConfig<'_> {
     AgentTestConfig {
         provider: "codex",
         bin,
@@ -38,7 +38,7 @@ fn codex_agent<'a>(bin: &'a Path) -> AgentTestConfig<'a> {
     }
 }
 
-fn cursor_agent<'a>(bin: &'a Path) -> AgentTestConfig<'a> {
+fn cursor_agent(bin: &Path) -> AgentTestConfig<'_> {
     AgentTestConfig {
         provider: "cursor",
         bin,
@@ -48,7 +48,7 @@ fn cursor_agent<'a>(bin: &'a Path) -> AgentTestConfig<'a> {
     }
 }
 
-fn cursor_agent_from_env<'a>(bin: &'a Path) -> AgentTestConfig<'a> {
+fn cursor_agent_from_env(bin: &Path) -> AgentTestConfig<'_> {
     AgentTestConfig {
         provider: "cursor",
         bin,

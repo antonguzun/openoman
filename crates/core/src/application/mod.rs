@@ -22,9 +22,14 @@ pub struct RunJobUseCase {
     execution_backend: Box<dyn ExecutionBackend>,
     limits: ResourceLimits,
     agent_execution: AgentExecutionSpec,
-    log_limit_bytes: usize,
-    report_limit_bytes: usize,
-    patch_limit_bytes: u64,
+    artifact_limits: RunJobArtifactLimits,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RunJobArtifactLimits {
+    pub log_limit_bytes: usize,
+    pub report_limit_bytes: usize,
+    pub patch_limit_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -49,9 +54,7 @@ impl RunJobUseCase {
         execution_backend: Box<dyn ExecutionBackend>,
         limits: ResourceLimits,
         agent_execution: AgentExecutionSpec,
-        log_limit_bytes: usize,
-        report_limit_bytes: usize,
-        patch_limit_bytes: u64,
+        artifact_limits: RunJobArtifactLimits,
     ) -> Self {
         Self {
             store,
@@ -59,9 +62,7 @@ impl RunJobUseCase {
             execution_backend,
             limits,
             agent_execution,
-            log_limit_bytes,
-            report_limit_bytes,
-            patch_limit_bytes,
+            artifact_limits,
         }
     }
 
@@ -170,13 +171,17 @@ impl RunJobUseCase {
                 Err(_) => {}
             }
 
-            if let Err(err) = prepare_text_artifact(&collected.logs_path, self.log_limit_bytes) {
+            if let Err(err) =
+                prepare_text_artifact(&collected.logs_path, self.artifact_limits.log_limit_bytes)
+            {
                 if failure_reason.is_none() {
                     failure_reason = Some(format!("failed to prepare sandbox logs: {err}"));
                 }
             }
-            if let Err(err) = prepare_text_artifact(&collected.report_path, self.report_limit_bytes)
-            {
+            if let Err(err) = prepare_text_artifact(
+                &collected.report_path,
+                self.artifact_limits.report_limit_bytes,
+            ) {
                 if failure_reason.is_none() {
                     failure_reason = Some(format!("failed to prepare sandbox report: {err}"));
                 }
@@ -202,7 +207,7 @@ impl RunJobUseCase {
                 &patch_path,
             )
             .map_err(|e| format!("failed to generate canonical patch: {e}"))
-            .and_then(|_| ensure_patch_size(&patch_path, self.patch_limit_bytes))
+            .and_then(|_| ensure_patch_size(&patch_path, self.artifact_limits.patch_limit_bytes))
             .and_then(|_| {
                 build_file_artifact_record(job.id.as_str(), "sandbox.patch", &patch_path)
             });
@@ -373,7 +378,7 @@ where
 
             Ok(Some(build_pull_request_created_outbox_event(
                 job.id.as_str(),
-                &event.event_type().to_string(),
+                event.event_type(),
                 publish_result,
             )?))
         }
@@ -827,9 +832,11 @@ mod tests {
                 )),
                 limits(),
                 agent_execution(),
-                1024 * 1024,
-                256 * 1024,
-                5 * 1024 * 1024,
+                RunJobArtifactLimits {
+                    log_limit_bytes: 1024 * 1024,
+                    report_limit_bytes: 256 * 1024,
+                    patch_limit_bytes: 5 * 1024 * 1024,
+                },
             );
 
             use_case.run(&JobId::new(job_id).expect("job id"), |_| Ok(None))
@@ -891,9 +898,11 @@ mod tests {
             )),
             limits(),
             agent_execution(),
-            1024 * 1024,
-            256 * 1024,
-            5 * 1024 * 1024,
+            RunJobArtifactLimits {
+                log_limit_bytes: 1024 * 1024,
+                report_limit_bytes: 256 * 1024,
+                patch_limit_bytes: 5 * 1024 * 1024,
+            },
         );
 
         let outcome = use_case
