@@ -20,7 +20,7 @@ use std::{
 };
 
 #[cfg(test)]
-use super::{AgentExecutionSpec, AgentProvider};
+use super::AgentExecutionSpec;
 
 use super::{
     AttemptSpec, CollectedExecutionOutput, ExecutionBackend, ExecutionBackendCapabilities,
@@ -685,7 +685,7 @@ mod tests {
                     instruction: "noop".to_string(),
                     limits: config.limits.clone(),
                     agent: AgentExecutionSpec {
-                        provider: AgentProvider::Codex,
+                        provider: "codex".to_string(),
                         bin: "codex".to_string(),
                         model: None,
                         auth_file: None,
@@ -743,7 +743,7 @@ mod tests {
                     instruction: "noop".to_string(),
                     limits: config.limits.clone(),
                     agent: AgentExecutionSpec {
-                        provider: AgentProvider::Codex,
+                        provider: "codex".to_string(),
                         bin: "codex".to_string(),
                         model: None,
                         auth_file: Some(auth_file),
@@ -794,7 +794,7 @@ mod tests {
                 instruction: "append blank line to readme".to_string(),
                 limits: config.limits.clone(),
                 agent: AgentExecutionSpec {
-                    provider: AgentProvider::Codex,
+                    provider: "codex".to_string(),
                     bin: "codex".to_string(),
                     model: None,
                     auth_file: None,
@@ -864,7 +864,7 @@ mod tests {
                     instruction: "noop".to_string(),
                     limits: config.limits.clone(),
                     agent: AgentExecutionSpec {
-                        provider: AgentProvider::Codex,
+                        provider: "codex".to_string(),
                         bin: "codex".to_string(),
                         model: None,
                         auth_file: None,
@@ -928,7 +928,7 @@ mod tests {
                     instruction: "noop".to_string(),
                     limits: config.limits.clone(),
                     agent: AgentExecutionSpec {
-                        provider: AgentProvider::Codex,
+                        provider: "codex".to_string(),
                         bin: "codex".to_string(),
                         model: None,
                         auth_file: None,
@@ -1081,7 +1081,7 @@ mod tests {
                 instruction: "append blank line to readme".to_string(),
                 limits: runtime_config.limits.clone(),
                 agent: AgentExecutionSpec {
-                    provider: AgentProvider::Codex,
+                    provider: "codex".to_string(),
                     bin: fake_codex
                         .file_name()
                         .expect("codex filename")
@@ -1142,7 +1142,7 @@ mod tests {
     fn render_agent_env_includes_allowed_domains() {
         let env_file = render_agent_env(
             &AgentExecutionSpec {
-                provider: AgentProvider::Codex,
+                provider: "codex".to_string(),
                 bin: "/usr/local/bin/codex".to_string(),
                 model: None,
                 auth_file: None,
@@ -1153,10 +1153,12 @@ mod tests {
                     "files.openai.com".to_string(),
                 ],
             },
+            "append blank line",
             &["/opt/openoman/user-bin".to_string()],
             &[],
             None,
-        );
+        )
+        .expect("render agent env");
 
         assert!(env_file.contains("export HTTPS_PROXY='http://proxy.internal:3128'"));
         assert!(env_file.contains("export HTTP_PROXY='http://proxy.internal:3128'"));
@@ -1173,7 +1175,7 @@ mod tests {
             allocate_network_lease("172.22.0.0/16", 1, "oomtap", 3128).expect("allocate lease");
         let env_file = render_agent_env(
             &AgentExecutionSpec {
-                provider: AgentProvider::Codex,
+                provider: "codex".to_string(),
                 bin: "/usr/local/bin/codex".to_string(),
                 model: None,
                 auth_file: None,
@@ -1181,10 +1183,12 @@ mod tests {
                 egress_proxy: None,
                 egress_allowed_domains: vec!["api.openai.com".to_string()],
             },
+            "append blank line",
             &[],
             &[],
             Some(&lease),
-        );
+        )
+        .expect("render agent env");
 
         assert!(env_file.contains("OPENOMAN_NET_MODE='host-proxy'"));
         assert!(env_file.contains("OPENOMAN_NET_IFACE='eth0'"));
@@ -1202,7 +1206,7 @@ mod tests {
             allocate_network_lease("172.22.0.0/16", 1, "oomtap", 3128).expect("allocate lease");
         let env_file = render_agent_env(
             &AgentExecutionSpec {
-                provider: AgentProvider::Cursor,
+                provider: "cursor".to_string(),
                 bin: "/usr/local/bin/cursor-agent".to_string(),
                 model: None,
                 auth_file: None,
@@ -1210,10 +1214,12 @@ mod tests {
                 egress_proxy: None,
                 egress_allowed_domains: vec!["*".to_string()],
             },
+            "append blank line",
             &[],
             &[],
             Some(&lease),
-        );
+        )
+        .expect("render agent env");
 
         assert!(env_file.contains("OPENOMAN_NET_ALLOW_ALL='1'"));
         assert!(env_file.contains("OPENOMAN_NET_HOST_IPV4='172.22.0.1'"));
@@ -1223,7 +1229,7 @@ mod tests {
     fn render_agent_env_includes_agent_auth_file_when_configured() {
         let env_file = render_agent_env(
             &AgentExecutionSpec {
-                provider: AgentProvider::Codex,
+                provider: "codex".to_string(),
                 bin: "/usr/local/bin/codex".to_string(),
                 model: None,
                 auth_file: Some(PathBuf::from("/host/.codex/auth.json")),
@@ -1231,20 +1237,23 @@ mod tests {
                 egress_proxy: None,
                 egress_allowed_domains: Vec::new(),
             },
+            "append blank line",
             &[],
             &[],
             None,
-        );
+        )
+        .expect("render agent env");
 
         assert!(env_file
             .contains("OPENOMAN_AGENT_AUTH_FILE='/mnt/runtime/openoman-config/agent-auth.json'"));
+        assert!(env_file.contains("OPENOMAN_AGENT_AUTH_INSTALL_PATH='/root/.codex/auth.json'"));
     }
 
     #[test]
     fn render_agent_env_includes_cursor_api_key() {
         let env_file = render_agent_env(
             &AgentExecutionSpec {
-                provider: AgentProvider::Cursor,
+                provider: "cursor".to_string(),
                 bin: "/usr/local/bin/cursor-agent".to_string(),
                 model: None,
                 auth_file: None,
@@ -1252,21 +1261,25 @@ mod tests {
                 egress_proxy: None,
                 egress_allowed_domains: vec!["api2.cursor.sh".to_string()],
             },
+            "append blank line",
             &[],
             &[],
             None,
-        );
+        )
+        .expect("render agent env");
 
-        assert!(env_file.contains("AGENT_PROVIDER=cursor"));
+        assert!(env_file.contains("AGENT_PROVIDER='cursor'"));
         assert!(env_file.contains("AGENT_BIN='/usr/local/bin/cursor-agent'"));
         assert!(env_file.contains("export CURSOR_API_KEY='cursor-secret'"));
+        assert!(env_file.contains("OPENOMAN_AGENT_ARG_COUNT='7'"));
+        assert!(env_file.contains("OPENOMAN_AGENT_REPORT_MODE='stdout'"));
     }
 
     #[test]
     fn render_agent_env_includes_cursor_model() {
         let env_file = render_agent_env(
             &AgentExecutionSpec {
-                provider: AgentProvider::Cursor,
+                provider: "cursor".to_string(),
                 bin: "/usr/local/bin/cursor-agent".to_string(),
                 model: Some("gpt-5".to_string()),
                 auth_file: None,
@@ -1274,12 +1287,16 @@ mod tests {
                 egress_proxy: None,
                 egress_allowed_domains: vec!["api2.cursor.sh".to_string()],
             },
+            "append blank line",
             &[],
             &[],
             None,
-        );
+        )
+        .expect("render agent env");
 
         assert!(env_file.contains("AGENT_MODEL='gpt-5'"));
+        assert!(env_file.contains("OPENOMAN_AGENT_ARG_COUNT='9'"));
+        assert!(env_file.contains("OPENOMAN_AGENT_ARG_007='gpt-5'"));
     }
 
     fn write_fake_firecracker(root: &Path) -> PathBuf {

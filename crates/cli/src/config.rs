@@ -6,12 +6,18 @@ use std::{
 };
 
 use openoman_core::{
+    agents::{
+        load_agent_runtime_config as core_load_agent_runtime_config,
+        resolve_agent_execution_spec as core_resolve_agent_execution_spec,
+        validate_agent_networking_contract as core_validate_agent_networking_contract,
+        AgentRuntimeConfig, AgentRuntimeConfigInput,
+    },
     domain::job::Revision,
     execution::{
-        AgentExecutionSpec, AgentProvider, ExecutionBackendConfig, ExecutionBackendKind,
-        ExecutionRuntimeConfig, FirecrackerBackendConfig, FirecrackerMode,
-        FirecrackerNetworkPrivilegeMode, FirecrackerNetworkingConfig, FirecrackerNetworkingMode,
-        HostRiskPosture, ResourceLimits, UserPackageDir,
+        AgentExecutionSpec, ExecutionBackendConfig, ExecutionBackendKind, ExecutionRuntimeConfig,
+        FirecrackerBackendConfig, FirecrackerMode, FirecrackerNetworkPrivilegeMode,
+        FirecrackerNetworkingConfig, FirecrackerNetworkingMode, HostRiskPosture, ResourceLimits,
+        UserPackageDir,
     },
     github::GitHubPublisherConfig,
 };
@@ -112,17 +118,6 @@ pub(crate) struct AppConfig {
     pub(crate) publishing: Option<PublishingRuntimeConfig>,
 }
 
-pub(crate) struct AgentRuntimeConfig {
-    provider: AgentProvider,
-    bin: String,
-    model: Option<String>,
-    auth_file: Option<PathBuf>,
-    api_key: Option<String>,
-    api_key_env: Option<String>,
-    egress_proxy: Option<String>,
-    egress_allowed_domains: Vec<String>,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct PublishingRuntimeConfig {
     repo_owner: Option<String>,
@@ -133,23 +128,6 @@ pub(crate) struct PublishingRuntimeConfig {
     push_url: Option<String>,
     token: Option<String>,
     curl_bin: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CursorAuthCache {
-    #[serde(rename = "apiKey")]
-    api_key: Option<String>,
-}
-
-#[derive(Debug)]
-struct ResolvedCursorExecutionInputs {
-    api_key: String,
-    staged_auth_file: Option<PathBuf>,
-}
-
-enum AgentEgressPolicy<'a> {
-    Restricted(&'a [String]),
-    AllowAllDebug,
 }
 
 impl AppConfig {
@@ -294,157 +272,29 @@ fn load_agent_runtime_config(
     config: AgentConfig,
     config_path: &Path,
 ) -> Result<AgentRuntimeConfig, String> {
-    let provider = parse_agent_provider(config.provider.as_deref())?;
-    let bin = resolve_agent_bin(provider, config.bin.as_deref(), config.codex_bin.as_deref())?;
-    let model = resolve_agent_model(provider, config.model.as_deref())?;
-    let auth_file = resolve_agent_auth_file(
-        provider,
-        config_path,
-        config.auth_file.as_deref(),
-        config.codex_auth_file.as_deref(),
-    )?;
-    let (api_key, api_key_env) = resolve_agent_api_key_config(
-        provider,
-        config.api_key.as_deref(),
-        config.api_key_env.as_deref(),
-    )?;
-
-    Ok(AgentRuntimeConfig {
-        provider,
-        bin,
-        model,
-        auth_file,
-        api_key,
-        api_key_env,
+    core_load_agent_runtime_config(AgentRuntimeConfigInput {
+        provider: config.provider,
+        bin: normalize_optional_string(config.bin.as_deref(), "agent.bin")?,
+        model: normalize_optional_string(config.model.as_deref(), "agent.model")?,
+        auth_file: resolve_optional_config_path(
+            config_path,
+            config.auth_file.as_deref(),
+            "agent.auth_file",
+        )?,
+        api_key: normalize_optional_string(config.api_key.as_deref(), "agent.api_key")?,
+        api_key_env: normalize_optional_string(config.api_key_env.as_deref(), "agent.api_key_env")?,
+        legacy_codex_bin: normalize_optional_string(
+            config.codex_bin.as_deref(),
+            "agent.codex_bin",
+        )?,
+        legacy_codex_auth_file: resolve_optional_config_path(
+            config_path,
+            config.codex_auth_file.as_deref(),
+            "agent.codex_auth_file",
+        )?,
         egress_proxy: config.egress_proxy_url,
         egress_allowed_domains: normalize_egress_allowed_domains(config.egress_allowed_domains)?,
     })
-}
-
-fn parse_agent_provider(raw: Option<&str>) -> Result<AgentProvider, String> {
-    match raw.unwrap_or("codex").trim().to_ascii_lowercase().as_str() {
-        "codex" => Ok(AgentProvider::Codex),
-        "cursor" => Ok(AgentProvider::Cursor),
-        other => Err(format!(
-            "unsupported agent provider '{}'; supported providers: codex, cursor",
-            other
-        )),
-    }
-}
-
-fn resolve_agent_bin(
-    provider: AgentProvider,
-    neutral_bin: Option<&str>,
-    legacy_codex_bin: Option<&str>,
-) -> Result<String, String> {
-    let neutral_bin = normalize_optional_string(neutral_bin, "agent.bin")?;
-    let legacy_codex_bin = normalize_optional_string(legacy_codex_bin, "agent.codex_bin")?;
-
-    match provider {
-        AgentProvider::Codex => match (neutral_bin, legacy_codex_bin) {
-            (Some(bin), Some(legacy_bin)) if bin != legacy_bin => Err(
-                "agent.bin conflicts with legacy agent.codex_bin; set only one value or make them identical"
-                    .to_string(),
-            ),
-            (Some(bin), _) => Ok(bin),
-            (None, Some(bin)) => Ok(bin),
-            (None, None) => Ok("codex".to_string()),
-        },
-        AgentProvider::Cursor => {
-            if legacy_codex_bin.is_some() {
-                return Err(
-                    "agent.codex_bin is a Codex-only compatibility field and cannot be set when agent.provider = \"cursor\""
-                        .to_string(),
-                );
-            }
-            Ok(neutral_bin.unwrap_or_else(|| "cursor-agent".to_string()))
-        }
-    }
-}
-
-fn resolve_agent_model(
-    provider: AgentProvider,
-    model: Option<&str>,
-) -> Result<Option<String>, String> {
-    let model = normalize_optional_string(model, "agent.model")?;
-
-    match provider {
-        AgentProvider::Codex => {
-            if model.is_some() {
-                return Err(
-                    "agent.model is currently supported only when agent.provider = \"cursor\""
-                        .to_string(),
-                );
-            }
-            Ok(None)
-        }
-        AgentProvider::Cursor => Ok(model),
-    }
-}
-
-fn resolve_agent_auth_file(
-    provider: AgentProvider,
-    config_path: &Path,
-    neutral_auth_file: Option<&str>,
-    legacy_codex_auth_file: Option<&str>,
-) -> Result<Option<PathBuf>, String> {
-    let neutral_auth_file =
-        resolve_optional_config_path(config_path, neutral_auth_file, "agent.auth_file")?;
-    let legacy_codex_auth_file =
-        resolve_optional_config_path(config_path, legacy_codex_auth_file, "agent.codex_auth_file")?;
-
-    match provider {
-        AgentProvider::Codex => match (neutral_auth_file, legacy_codex_auth_file) {
-            (Some(auth_file), Some(legacy_auth_file)) if auth_file != legacy_auth_file => Err(
-                "agent.auth_file conflicts with legacy agent.codex_auth_file; set only one value or make them identical"
-                    .to_string(),
-            ),
-            (Some(auth_file), _) => Ok(Some(auth_file)),
-            (None, Some(auth_file)) => Ok(Some(auth_file)),
-            (None, None) => Ok(None),
-        },
-        AgentProvider::Cursor => {
-            if neutral_auth_file.is_some() || legacy_codex_auth_file.is_some() {
-                return Err(
-                    "agent.auth_file and legacy agent.codex_auth_file are Codex-only fields and cannot be set when agent.provider = \"cursor\""
-                        .to_string(),
-                );
-            }
-            Ok(None)
-        }
-    }
-}
-
-fn resolve_agent_api_key_config(
-    provider: AgentProvider,
-    api_key: Option<&str>,
-    api_key_env: Option<&str>,
-) -> Result<(Option<String>, Option<String>), String> {
-    let api_key = normalize_optional_string(api_key, "agent.api_key")?;
-    let api_key_env = normalize_optional_string(api_key_env, "agent.api_key_env")?;
-    match provider {
-        AgentProvider::Codex => {
-            if api_key.is_some() || api_key_env.is_some() {
-                return Err(
-                    "agent.api_key and agent.api_key_env are Cursor-only fields and cannot be set when agent.provider = \"codex\""
-                        .to_string(),
-                );
-            }
-            Ok((None, None))
-        }
-        AgentProvider::Cursor => match (api_key, api_key_env) {
-            (Some(_), Some(_)) => Err(
-                "agent.api_key and agent.api_key_env are mutually exclusive; set only one when agent.provider = \"cursor\""
-                    .to_string(),
-            ),
-            (Some(api_key), None) => Ok((Some(api_key), None)),
-            (None, Some(api_key_env)) => Ok((None, Some(api_key_env))),
-            (None, None) => Err(
-                "agent.api_key or agent.api_key_env is required when agent.provider = \"cursor\""
-                    .to_string(),
-            ),
-        },
-    }
 }
 
 fn normalize_optional_string(
@@ -527,94 +377,15 @@ fn normalize_egress_allowed_domains(domains: Option<Vec<String>>) -> Result<Vec<
     Ok(normalized)
 }
 
-fn agent_egress_policy(domains: &[String]) -> AgentEgressPolicy<'_> {
-    if domains.iter().any(|domain| domain == "*") {
-        AgentEgressPolicy::AllowAllDebug
-    } else {
-        AgentEgressPolicy::Restricted(domains)
-    }
-}
-
 pub(crate) fn resolve_agent_execution_spec(
     config: &AgentRuntimeConfig,
 ) -> Result<AgentExecutionSpec, String> {
-    let (api_key, auth_file) = match config.provider {
-        AgentProvider::Codex => (None, config.auth_file.clone()),
-        AgentProvider::Cursor => {
-            let resolved = resolve_cursor_execution_inputs(config)?;
-            (Some(resolved.api_key), resolved.staged_auth_file)
-        }
-    };
-
-    Ok(AgentExecutionSpec {
-        provider: config.provider,
-        bin: config.bin.clone(),
-        model: config.model.clone(),
-        auth_file,
-        api_key,
-        egress_proxy: config.egress_proxy.clone(),
-        egress_allowed_domains: config.egress_allowed_domains.clone(),
-    })
+    core_resolve_agent_execution_spec(config)
 }
 
-fn resolve_cursor_execution_inputs(
-    config: &AgentRuntimeConfig,
-) -> Result<ResolvedCursorExecutionInputs, String> {
-    let api_key = if let Some(api_key) = &config.api_key {
-        api_key.clone()
-    } else {
-        let env_name = config.api_key_env.as_deref().ok_or_else(|| {
-            "agent.api_key or agent.api_key_env is required when agent.provider = \"cursor\""
-                .to_string()
-        })?;
-        let value = env::var(env_name).map_err(|_| {
-            format!("agent.api_key_env references missing environment variable {env_name}")
-        })?;
-        if value.trim().is_empty() {
-            return Err(format!(
-                "environment variable {env_name} referenced by agent.api_key_env must not be empty"
-            ));
-        }
-        value
-    };
-
-    let staged_auth_file = discover_matching_cursor_auth_cache_path(&api_key);
-
-    Ok(ResolvedCursorExecutionInputs {
-        api_key,
-        staged_auth_file,
-    })
-}
-
-fn discover_matching_cursor_auth_cache_path(api_key: &str) -> Option<PathBuf> {
-    let home = env::var_os("HOME")?;
-    discover_matching_cursor_auth_cache_path_in_home(api_key, &PathBuf::from(home))
-}
-
+#[cfg(test)]
 fn discover_matching_cursor_auth_cache_path_in_home(api_key: &str, home: &Path) -> Option<PathBuf> {
-    let auth_path = home.join(".config/cursor/auth.json");
-    let contents = fs::read_to_string(&auth_path).ok()?;
-    let auth_cache: CursorAuthCache = serde_json::from_str(&contents).ok()?;
-    if auth_cache.api_key.as_deref() == Some(api_key) {
-        Some(auth_path)
-    } else {
-        None
-    }
-}
-
-impl std::fmt::Debug for AgentRuntimeConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentRuntimeConfig")
-            .field("provider", &self.provider)
-            .field("bin", &self.bin)
-            .field("model", &self.model)
-            .field("auth_file", &self.auth_file)
-            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
-            .field("api_key_env", &self.api_key_env)
-            .field("egress_proxy", &self.egress_proxy)
-            .field("egress_allowed_domains", &self.egress_allowed_domains)
-            .finish()
-    }
+    openoman_core::agents::discover_matching_cursor_auth_cache_path_in_home(api_key, home)
 }
 
 fn load_publishing_config(
@@ -828,57 +599,7 @@ fn validate_agent_networking_contract(
     firecracker: Option<&FirecrackerBackendConfig>,
     agent: &AgentRuntimeConfig,
 ) -> Result<(), String> {
-    const CURSOR_REQUIRED_HOST_PROXY_DOMAIN: &str = "api2.cursor.sh";
-
-    if let Some(auth_file) = &agent.auth_file {
-        let metadata = fs::metadata(auth_file).map_err(|e| {
-            format!(
-                "agent.auth_file does not exist or is not readable at {}: {e}",
-                auth_file.display()
-            )
-        })?;
-        if !metadata.is_file() {
-            return Err(format!(
-                "agent.auth_file must point to a regular file: {}",
-                auth_file.display()
-            ));
-        }
-    }
-
-    let Some(firecracker) = firecracker else {
-        return Ok(());
-    };
-    if firecracker.networking.mode != FirecrackerNetworkingMode::HostProxy {
-        return Ok(());
-    }
-
-    if agent.egress_allowed_domains.is_empty() {
-        return Err(
-            "agent.egress_allowed_domains must include at least one domain when sandbox.firecracker.network.mode = \"host-proxy\""
-                .to_string(),
-        );
-    }
-    if agent.egress_proxy.is_some() {
-        return Err(
-            "agent.egress_proxy_url must not be set when sandbox.firecracker.network.mode = \"host-proxy\" because the host proxy is configured automatically"
-                .to_string(),
-        );
-    }
-    if agent.provider == AgentProvider::Cursor {
-        match agent_egress_policy(&agent.egress_allowed_domains) {
-            AgentEgressPolicy::AllowAllDebug => {}
-            AgentEgressPolicy::Restricted(domains)
-                if domains
-                    .iter()
-                    .any(|domain| domain == CURSOR_REQUIRED_HOST_PROXY_DOMAIN) => {}
-            AgentEgressPolicy::Restricted(_) => {
-                return Err(format!(
-                    "agent.egress_allowed_domains must include \"{CURSOR_REQUIRED_HOST_PROXY_DOMAIN}\" when agent.provider = \"cursor\" and sandbox.firecracker.network.mode = \"host-proxy\" because Cursor CLI print mode tunnels through that hostname"
-                ));
-            }
-        }
-    }
-    Ok(())
+    core_validate_agent_networking_contract(firecracker, agent)
 }
 
 fn validate_tap_name_prefix(prefix: &str) -> Result<(), String> {
@@ -1308,7 +1029,7 @@ egress_allowed_domains = ["api2.cursor.sh"]
         .expect("write config");
 
         let loaded = AppConfig::load(&config_path).expect("load config");
-        assert_eq!(loaded.agent.provider, AgentProvider::Cursor);
+        assert_eq!(loaded.agent.provider, "cursor");
         assert_eq!(loaded.agent.bin, "/usr/local/bin/cursor-agent");
         assert_eq!(loaded.agent.model.as_deref(), Some("gpt-5"));
         assert_eq!(loaded.agent.api_key.as_deref(), Some("cursor-test-key"));
@@ -1625,7 +1346,7 @@ model = "gpt-5"
     #[test]
     fn resolve_agent_execution_spec_uses_configured_cursor_api_key() {
         let config = AgentRuntimeConfig {
-            provider: AgentProvider::Cursor,
+            provider: "cursor".to_string(),
             bin: "cursor-agent".to_string(),
             model: Some("gpt-5".to_string()),
             auth_file: None,
@@ -1677,7 +1398,7 @@ model = "gpt-5"
     #[test]
     fn resolve_agent_execution_spec_requires_cursor_host_env() {
         let config = AgentRuntimeConfig {
-            provider: AgentProvider::Cursor,
+            provider: "cursor".to_string(),
             bin: "cursor-agent".to_string(),
             model: None,
             auth_file: None,

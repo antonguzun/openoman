@@ -612,9 +612,9 @@ mod tests {
             plugin::CheckProfile,
         },
         execution::{
-            AgentProvider, CollectedExecutionOutput, ExecutionBackendCapabilities,
-            ExecutionBackendKind, ExecutionError, ExecutionExitStatus, ExecutionHandle,
-            ExecutionIsolation, ExecutionRunner, ResourceLimits,
+            CollectedExecutionOutput, ExecutionBackendCapabilities, ExecutionBackendKind,
+            ExecutionError, ExecutionExitStatus, ExecutionHandle, ExecutionIsolation,
+            ExecutionRunner, ResourceLimits,
         },
         persistence::ArtifactRecord,
     };
@@ -933,7 +933,7 @@ mod tests {
 
     fn agent_execution() -> AgentExecutionSpec {
         AgentExecutionSpec {
-            provider: AgentProvider::Codex,
+            provider: "codex".to_string(),
             bin: "codex".to_string(),
             model: None,
             auth_file: None,

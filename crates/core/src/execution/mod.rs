@@ -31,19 +31,13 @@ pub struct AttemptSpec {
 
 #[derive(Clone)]
 pub struct AgentExecutionSpec {
-    pub provider: AgentProvider,
+    pub provider: String,
     pub bin: String,
     pub model: Option<String>,
     pub auth_file: Option<PathBuf>,
     pub api_key: Option<String>,
     pub egress_proxy: Option<String>,
     pub egress_allowed_domains: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentProvider {
-    Codex,
-    Cursor,
 }
 
 impl std::fmt::Debug for AgentExecutionSpec {

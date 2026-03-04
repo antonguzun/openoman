@@ -28,10 +28,10 @@ echo "openoman guest init started"
 
 . /mnt/runtime/openoman-config/agent.env
 
-echo "agent provider: $AGENT_PROVIDER"
+echo "agent provider: ${OPENOMAN_AGENT_ID:-${AGENT_PROVIDER:-unknown}}"
 echo "workspace dir: $WORKSPACE_DIR"
 echo "output dir: $OUTPUT_DIR"
-echo "agent bin: ${AGENT_BIN:-}"
+echo "agent bin: ${OPENOMAN_AGENT_BIN:-${AGENT_BIN:-}}"
 if [ -n "${AGENT_MODEL:-}" ]; then
   echo "agent model: $AGENT_MODEL"
 fi
@@ -153,18 +153,12 @@ else
   exit 1
 fi
 
-if [ "$AGENT_PROVIDER" = "codex" ] && [ -n "${OPENOMAN_AGENT_AUTH_FILE:-}" ]; then
-  echo "installing codex auth file from $OPENOMAN_AGENT_AUTH_FILE"
-  mkdir -p /root/.codex
-  cp "$OPENOMAN_AGENT_AUTH_FILE" /root/.codex/auth.json
-  chmod 600 /root/.codex/auth.json
-fi
-
-if [ "$AGENT_PROVIDER" = "cursor" ] && [ -n "${OPENOMAN_AGENT_AUTH_FILE:-}" ]; then
-  echo "installing cursor auth file from $OPENOMAN_AGENT_AUTH_FILE"
-  mkdir -p /root/.config/cursor
-  cp "$OPENOMAN_AGENT_AUTH_FILE" /root/.config/cursor/auth.json
-  chmod 600 /root/.config/cursor/auth.json
+if [ -n "${OPENOMAN_AGENT_AUTH_FILE:-}" ] && [ -n "${OPENOMAN_AGENT_AUTH_INSTALL_PATH:-}" ]; then
+  echo "installing staged agent auth file to $OPENOMAN_AGENT_AUTH_INSTALL_PATH"
+  install_dir="$(dirname "$OPENOMAN_AGENT_AUTH_INSTALL_PATH")"
+  mkdir -p "$install_dir"
+  cp "$OPENOMAN_AGENT_AUTH_FILE" "$OPENOMAN_AGENT_AUTH_INSTALL_PATH"
+  chmod 600 "$OPENOMAN_AGENT_AUTH_INSTALL_PATH"
 fi
 
 if [ "${OPENOMAN_NET_MODE:-}" = "host-proxy" ]; then
@@ -221,136 +215,76 @@ fi
 
 echo "effective PATH: $PATH"
 
-instruction="$(cat "$INSTRUCTION_FILE")"
 agent_status=0
 
-case "$AGENT_PROVIDER" in
-  codex)
-    echo "checking codex availability"
-    if command -v "$AGENT_BIN" >/dev/null 2>&1; then
-      resolved_codex="$(command -v "$AGENT_BIN" || true)"
-      echo "resolved codex path: ${resolved_codex:-$AGENT_BIN}"
-      codex_target="$(readlink -f "$AGENT_BIN" 2>/dev/null || true)"
-      echo "resolved codex target: ${codex_target:-unresolved}"
-      codex_probe_failed=0
-      echo "checking node availability"
-      if command -v node >/dev/null 2>&1; then
-        resolved_node="$(command -v node || true)"
-        echo "resolved node path: ${resolved_node:-node}"
-        echo "running node --version"
-        node --version || true
-        if [ -n "$codex_target" ] && [ -f "$codex_target" ]; then
-          if command -v timeout >/dev/null 2>&1 && command -v strace >/dev/null 2>&1; then
-            trace_prefix="$OUTPUT_DIR/node-codex-strace"
-            rm -f "${trace_prefix}"*
-            echo "running timed strace on node codex entrypoint --version"
-            if timeout -k 1 10 strace -ff -tt -s 200 -o "$trace_prefix" node "$codex_target" --version; then
-              probe_status=0
-            else
-              probe_status=$?
-            fi
-            echo "timed node codex probe exit status: $probe_status"
-            for trace_file in "${trace_prefix}"*; do
-              [ -f "$trace_file" ] || continue
-              echo "trace tail: $trace_file"
-              tail -n 40 "$trace_file" || true
-            done
-            if [ "$probe_status" -ne 0 ]; then
-              echo "node codex entrypoint probe failed; skipping codex exec"
-              agent_status=$probe_status
-              codex_probe_failed=1
-            fi
-          fi
-        fi
-      else
-        echo "node binary not found"
-        agent_status=127
-        codex_probe_failed=1
-      fi
-      if [ "$codex_probe_failed" -eq 0 ]; then
-        echo "running timed codex --version"
-        if timeout -k 1 10 "$AGENT_BIN" --version; then
-          codex_version_status=0
-        else
-          codex_version_status=$?
-        fi
-        echo "timed codex --version exit status: $codex_version_status"
-        if [ "$codex_version_status" -ne 0 ]; then
-          echo "codex --version failed; skipping codex exec"
-          agent_status=$codex_version_status
-          codex_probe_failed=1
-        fi
-      fi
-      if [ "$codex_probe_failed" -eq 0 ]; then
-        echo "running codex exec in $WORKSPACE_DIR"
-        "$AGENT_BIN" exec --dangerously-bypass-approvals-and-sandbox --color never -C "$WORKSPACE_DIR" -o "$OUTPUT_DIR/report.txt" "$instruction" || agent_status=$?
-        echo "codex exec exit status: $agent_status"
-      fi
+agent_bin="${OPENOMAN_AGENT_BIN:-${AGENT_BIN:-}}"
+if [ -z "$agent_bin" ]; then
+  echo "agent binary is not configured"
+  agent_status=127
+elif ! command -v "$agent_bin" >/dev/null 2>&1; then
+  echo "agent binary not found: $agent_bin"
+  agent_status=127
+else
+  resolved_agent="$(command -v "$agent_bin" || true)"
+  echo "resolved agent path: ${resolved_agent:-$agent_bin}"
+fi
+
+if [ "$agent_status" -eq 0 ]; then
+  version_arg_count="${OPENOMAN_AGENT_VERSION_ARG_COUNT:-0}"
+  set -- "$agent_bin"
+  index=0
+  while [ "$index" -lt "$version_arg_count" ]; do
+    index_key="$(printf '%03d' "$index")"
+    eval "arg_value=\${OPENOMAN_AGENT_VERSION_ARG_${index_key}:-}"
+    set -- "$@" "$arg_value"
+    index=$((index + 1))
+  done
+  if [ "$version_arg_count" -gt 0 ]; then
+    echo "running timed agent version probe"
+    if timeout -k 1 10 "$@"; then
+      agent_version_status=0
     else
-      echo "codex binary not found: $AGENT_BIN"
-      agent_status=127
+      agent_version_status=$?
     fi
-    ;;
-  cursor)
-    echo "checking cursor availability"
-    if [ -z "${CURSOR_API_KEY:-}" ]; then
-      if [ -z "${OPENOMAN_AGENT_AUTH_FILE:-}" ]; then
-        echo "CURSOR_API_KEY is not set and no staged cursor auth file is available; skipping cursor exec"
-        agent_status=127
-      fi
+    echo "timed agent version probe exit status: $agent_version_status"
+    if [ "$agent_version_status" -ne 0 ]; then
+      echo "agent version probe failed; skipping agent exec"
+      agent_status=$agent_version_status
     fi
-    if [ "$agent_status" -eq 0 ] && command -v "$AGENT_BIN" >/dev/null 2>&1; then
-      resolved_cursor="$(command -v "$AGENT_BIN" || true)"
-      echo "resolved cursor path: ${resolved_cursor:-$AGENT_BIN}"
-      echo "running timed cursor --version"
-      if timeout -k 1 10 "$AGENT_BIN" --version; then
-        cursor_version_status=0
-      else
-        cursor_version_status=$?
-      fi
-        echo "timed cursor --version exit status: $cursor_version_status"
-      if [ "$cursor_version_status" -ne 0 ]; then
-        echo "cursor --version failed; skipping cursor exec"
-        agent_status=$cursor_version_status
-      else
-        cursor_auth_mode=""
-        echo "running cursor print mode in $WORKSPACE_DIR"
-        if [ -n "${OPENOMAN_AGENT_AUTH_FILE:-}" ]; then
-          cursor_auth_mode="staged auth file"
-        else
-          cursor_auth_mode="api key"
-        fi
-        set -- "$AGENT_BIN"
-        if [ "$cursor_auth_mode" = "api key" ]; then
-          set -- "$@" --api-key "$CURSOR_API_KEY"
-        fi
-        set -- "$@" -p -f --output-format text
-        if [ -n "${AGENT_MODEL:-}" ]; then
-          set -- "$@" --model "$AGENT_MODEL"
-        fi
-        set -- "$@" "$instruction"
-        echo "cursor auth mode: $cursor_auth_mode"
-        log_command_redacting_api_key "cursor command: " "$@"
-        log_command_argv_redacting_api_key "cursor command argv:" "$@"
-        (
-          cd "$WORKSPACE_DIR"
-          if [ "$cursor_auth_mode" = "staged auth file" ]; then
-            unset CURSOR_API_KEY || true
-          fi
-          "$@"
-        ) > "$OUTPUT_DIR/report.txt" || agent_status=$?
-        echo "cursor exec exit status: $agent_status"
-      fi
-    else
-      echo "cursor binary not found: $AGENT_BIN"
-      agent_status=127
-    fi
-    ;;
-  *)
-    echo "unsupported agent provider: $AGENT_PROVIDER"
-    agent_status=127
-    ;;
-esac
+  fi
+fi
+
+if [ "$agent_status" -eq 0 ]; then
+  arg_count="${OPENOMAN_AGENT_ARG_COUNT:-0}"
+  set -- "$agent_bin"
+  index=0
+  while [ "$index" -lt "$arg_count" ]; do
+    index_key="$(printf '%03d' "$index")"
+    eval "arg_value=\${OPENOMAN_AGENT_ARG_${index_key}:-}"
+    set -- "$@" "$arg_value"
+    index=$((index + 1))
+  done
+  echo "running agent in ${OPENOMAN_AGENT_WORKDIR:-$WORKSPACE_DIR}"
+  if [ "${OPENOMAN_AGENT_REDACT_API_KEY_ARGS:-0}" = "1" ]; then
+    log_command_redacting_api_key "agent command: " "$@"
+    log_command_argv_redacting_api_key "agent command argv:" "$@"
+  else
+    log_command "agent command: " "$@"
+    log_command_argv "agent command argv:" "$@"
+  fi
+  if [ "${OPENOMAN_AGENT_REPORT_MODE:-file}" = "stdout" ]; then
+    (
+      cd "${OPENOMAN_AGENT_WORKDIR:-$WORKSPACE_DIR}"
+      "$@"
+    ) > "$OUTPUT_DIR/report.txt" || agent_status=$?
+  else
+    (
+      cd "${OPENOMAN_AGENT_WORKDIR:-$WORKSPACE_DIR}"
+      "$@"
+    ) || agent_status=$?
+  fi
+  echo "agent exec exit status: $agent_status"
+fi
 
 if [ ! -f "$OUTPUT_DIR/report.txt" ]; then
   echo "Sandbox execution completed without report output." > "$OUTPUT_DIR/report.txt"

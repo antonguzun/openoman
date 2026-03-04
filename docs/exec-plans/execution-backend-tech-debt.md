@@ -19,7 +19,9 @@ The user-visible proof is simple. A contributor can run one job with a Firecrack
 - [x] (2026-03-04 13:16Z) Introduced `crates/core/src/execution/` as the real backend-neutral execution layer, moved the Firecracker backend under it, switched the CLI and application layer to `execution::*`, and reduced `crates/core/src/sandbox/` to a compatibility shim.
 - [x] (2026-03-04 14:02Z) Split the Firecracker backend into `runtime`, `launch`, `artifacts`, and `network` adapters under `crates/core/src/execution/firecracker/`, leaving `firecracker.rs` as orchestration plus validation helpers.
 - [x] (2026-03-04 14:34Z) Added `crates/core/src/execution/process.rs`, enabled `sandbox.backend = "process"` with explicit `sandbox.host_risk_posture = "already_isolated"`, and proved the same artifact pipeline through new core and CLI tests.
-- [ ] Replace the current `AgentProvider` branching with an adapter registry that produces an execution plan for the selected agent.
+- [x] (2026-03-04 15:38Z) Started Milestone 4 by adding `crates/core/src/agents/mod.rs` with shared `AgentLaunchPlan` builders for Codex and Cursor, refactoring both the process backend and the Firecracker guest contract to consume that plan, and restoring the full core and CLI test suites to green.
+- [x] (2026-03-04 16:23Z) Continued Milestone 4 by moving provider parsing, per-provider config validation, Cursor auth resolution, and host-proxy requirements out of `crates/cli/src/config.rs` into the shared `crates/core/src/agents/mod.rs` registry, while keeping CLI config-file parsing as a thin normalization layer.
+- [x] (2026-03-04 17:42Z) Completed Milestone 4 by replacing `AgentProvider` enum routing with a provider-string adapter registry in `crates/core/src/agents/mod.rs`, switching `AgentExecutionSpec`/`AgentRuntimeConfig` to provider IDs, and adding a registry-based fake-provider test that builds runtime config, execution spec, and launch plan without touching shared orchestration.
 - [ ] Add a real trusted validation port so `JobState::Validating` is not an immediate success transition.
 - [ ] Add cross-backend tests that prove the same artifact pipeline and publishing gate work for both Firecracker and process execution.
 
@@ -45,6 +47,12 @@ The user-visible proof is simple. A contributor can run one job with a Firecrack
   Evidence: `crates/core/src/execution/firecracker/runtime.rs`, `network.rs`, `launch.rs`, and `artifacts.rs` now import shared types through `super::super::*`, while Firecracker-local helpers stay under `super::*`.
 - Observation: the process backend could reuse the existing trusted artifact pipeline unchanged as long as it staged its own per-attempt workspace under the runtime directory and copied that workspace into the standard collected-output layout.
   Evidence: `crates/core/src/execution/process.rs` now runs the agent against `run_dir/workspace`, then returns the same `workspace-result`, `report.txt`, and `logs.txt` structure that `RunJobUseCase` already fingerprints and publishes.
+- Observation: once provider launch behavior was reduced to a shared launch-plan contract, the remaining backend-specific difference was mainly how report output is captured, not how provider arguments are assembled.
+  Evidence: `crates/core/src/agents/mod.rs` now builds `AgentLaunchPlan`, while both `crates/core/src/execution/process.rs` and `crates/core/src/execution/firecracker/runtime.rs` consume the same args/env/auth-path data and only diverge on `AgentReportMode` handling.
+- Observation: after moving provider config rules into `crates/core/src/agents/mod.rs`, the CLI still owns TOML decoding and path normalization, but it no longer knows which fields are Codex-only, Cursor-only, or which host-proxy domains Cursor requires.
+  Evidence: `crates/cli/src/config.rs` now delegates runtime config loading, execution-spec resolution, and agent networking validation to `openoman_core::agents::*`, while the provider-specific error strings and auth-cache lookup now live in `crates/core/src/agents/mod.rs`.
+- Observation: once provider identity became a plain string, every execution/backend call site that only needed a lookup key stayed unchanged, while tests that asserted enum variants had to be updated to assert provider IDs.
+  Evidence: `crates/core/src/execution/mod.rs` now stores `AgentExecutionSpec.provider: String`, and both `crates/core` and `crates/cli` tests now check values like `"cursor"` instead of `AgentProvider::Cursor`.
 
 ## Decision Log
 
@@ -66,6 +74,9 @@ The user-visible proof is simple. A contributor can run one job with a Firecrack
 - Decision: preserve the current trusted artifact and publishing pipeline while changing execution internals.
   Rationale: the canonical patch generation, trusted Git operations, and trusted GitHub publishing model are solid foundations and should remain stable while execution internals are refactored.
   Date/Author: 2026-03-03 / Codex
+- Decision: keep the external agent config shape and `AgentProvider` enum in place for the first Milestone 4 slice, while moving launch construction behind a shared agent adapter module.
+  Rationale: this extracts the cross-cutting provider behavior from the process backend, Firecracker env renderer, and guest init script without coupling the refactor to a wider CLI config migration in the same step.
+  Date/Author: 2026-03-04 / Codex
 - Decision: keep the first extracted run use case in `crates/core/src/application/mod.rs` instead of splitting `run_job.rs` immediately.
   Rationale: Milestone 1 is about moving orchestration and persistence boundaries first. Keeping the use case and its artifact helpers in one file made it easier to prove behavioral parity and remove the duplicate CLI implementation before deeper module reshaping in later milestones.
   Date/Author: 2026-03-04 / Codex
@@ -74,6 +85,9 @@ The user-visible proof is simple. A contributor can run one job with a Firecrack
   Date/Author: 2026-03-04 / Codex
 - Decision: represent runtime backend selection as `ExecutionBackendConfig` plus `HostRiskPosture` instead of keeping a Firecracker-specific optional field on the shared runtime config.
   Rationale: this is the minimum structural change that makes the shared execution model honest about future non-Firecracker backends while still preserving the current `[sandbox]` config file surface through translation in the CLI.
+  Date/Author: 2026-03-04 / Codex
+- Decision: move provider selection from an enum to registry-validated provider IDs and keep a default built-in registry for Codex and Cursor.
+  Rationale: Milestone 4 is about making providers adapter-driven, and string IDs remove enum coupling from shared execution contracts while still preserving deterministic validation and user-facing error messages for unsupported providers.
   Date/Author: 2026-03-04 / Codex
 
 ## Outcomes & Retrospective
@@ -85,6 +99,8 @@ The result preserves the current trusted-host behavior rather than rewriting it.
 Milestone 2 is now complete. The shared execution model is no longer centered on `crates/core/src/sandbox/`: `crates/core/src/execution/` defines the runtime config, backend trait, backend capabilities, risk posture, and Firecracker implementation, while `crates/core/src/sandbox/` exists only as a compatibility shim. Firecracker itself now sits behind narrower `runtime`, `launch`, `artifacts`, and `network` adapters, so the root runner file is mostly orchestration instead of a single Linux-specific grab bag.
 
 Milestone 3 is now complete. `openoman` can run a job through a direct host-process backend when the operator explicitly sets `sandbox.backend = "process"` and `sandbox.host_risk_posture = "already_isolated"`. The new backend stages a per-attempt workspace and home directory under the runtime root, executes Codex- or Cursor-style agent commands directly on the host, and still feeds the same trusted patch, artifact, and publishing pipeline as Firecracker.
+
+Milestone 4 is now complete. Agent launch behavior now flows through a provider-id registry in `crates/core/src/agents/mod.rs` instead of enum branches spread across runtime configuration and execution spec wiring. `AgentExecutionSpec` now carries a provider string key, built-in adapters for Codex and Cursor are registered in one place, and tests include a fake adapter proving that a new provider can be added to the registry and exercised through runtime-config loading, execution-spec resolution, and launch-plan construction without editing the run pipeline.
 
 ## Context and Orientation
 
@@ -228,6 +244,14 @@ Milestone 3 validation completed with:
     cargo test -p openoman-cli --quiet
 
 The observed result on 2026-03-04 after adding `crates/core/src/execution/process.rs` was `openoman-core` with 39 passing tests and `openoman-cli` with 36 passing tests across unit and end-to-end coverage, including a process-backed CLI run that produced the standard patch, report, and logs artifacts.
+
+Milestone 4 validation completed with:
+
+    cargo fmt --all
+    cargo test -p openoman-core --quiet
+    cargo test -p openoman-cli --quiet
+
+The observed result on 2026-03-04 after switching to provider-id registry wiring was `openoman-core` with 45 passing tests and `openoman-cli` with 36 passing tests, including a new core test that registers a fake provider adapter and exercises runtime-config loading, execution-spec resolution, and launch-plan construction through the shared registry seam.
 
 ## Validation and Acceptance
 
@@ -394,3 +418,5 @@ Revision note (2026-03-03): Created this ExecPlan to record the technical debt r
 Revision note (2026-03-04): Updated the plan after completing Milestone 1 to document the extracted `RunJobUseCase`, the new incremental persistence behavior, the targeted validation results, and the temporary decision to keep publisher-config parsing in the CLI.
 
 Revision note (2026-03-04): Updated the plan again after starting Milestone 2 to record the new `crates/core/src/execution/` module, the legacy sandbox compatibility shim, the addition of backend capabilities and host risk posture, and the fact that Firecracker decomposition is still pending.
+
+Revision note (2026-03-04): Updated the plan after finishing Milestone 4 to document the provider-id adapter registry, removal of `AgentProvider` enum coupling from shared execution contracts, and the new fake-provider registry test coverage.

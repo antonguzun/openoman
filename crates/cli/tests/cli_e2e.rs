@@ -290,6 +290,7 @@ fn submit_then_status_reports_queued_state() {
         .stdout(format!("job_id={job_id}\nstate=queued\nattempts=0\n"));
 }
 
+#[test]
 fn submit_then_run_persists_canonical_artifacts() {
     let temp = TempDir::new().expect("tempdir");
     let fixture_repo = temp.path().join("fixture-repo");
@@ -977,11 +978,11 @@ else
   printf "agent touched workspace\n" > AGENT_OUTPUT.txt
 fi
 if printf "%s" "$instruction" | grep -q "fail"; then
-  printf "fake codex failed: %s\n" "$instruction" > "../$report"
+  printf "fake codex failed: %s\n" "$instruction" > "$report"
   echo "fake codex simulated failure"
   exit 9
 fi
-printf "fake codex completed: %s\n" "$instruction" > "../$report"
+printf "fake codex completed: %s\n" "$instruction" > "$report"
 echo "fake codex applied instruction"
 "#,
     )

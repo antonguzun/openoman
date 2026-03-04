@@ -8,10 +8,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::agents::{
+    auth_install_path, build_launch_plan, AgentLaunchContext, AgentLaunchPlan, AgentReportMode,
+};
+
 use super::{
-    AgentProvider, AttemptSpec, CollectedExecutionOutput, ExecutionBackend,
-    ExecutionBackendCapabilities, ExecutionBackendKind, ExecutionError, ExecutionExitStatus,
-    ExecutionHandle, ExecutionIsolation, ExecutionRunner, ExecutionRuntimeConfig, HostRiskPosture,
+    AttemptSpec, CollectedExecutionOutput, ExecutionBackend, ExecutionBackendCapabilities,
+    ExecutionBackendKind, ExecutionError, ExecutionExitStatus, ExecutionHandle, ExecutionIsolation,
+    ExecutionRunner, ExecutionRuntimeConfig, HostRiskPosture,
 };
 
 #[derive(Debug)]
@@ -116,16 +120,17 @@ impl ProcessRunner {
     fn install_agent_auth_file(
         &self,
         spec: &AttemptSpec,
+        plan: &AgentLaunchPlan,
         home_dir: &Path,
     ) -> Result<(), ExecutionError> {
         let Some(auth_file) = &spec.agent.auth_file else {
             return Ok(());
         };
-
-        let destination = match spec.agent.provider {
-            AgentProvider::Codex => home_dir.join(".codex").join("auth.json"),
-            AgentProvider::Cursor => home_dir.join(".config").join("cursor").join("auth.json"),
+        let Some(relative_target) = &plan.auth_file_home_relative_path else {
+            return Ok(());
         };
+
+        let destination = auth_install_path(home_dir, relative_target);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -145,20 +150,12 @@ impl ProcessRunner {
     fn write_log_preamble(
         &self,
         spec: &AttemptSpec,
+        plan: &AgentLaunchPlan,
         log_path: &Path,
     ) -> Result<(), ExecutionError> {
         Self::append_log_line(log_path, "openoman process backend started")?;
-        Self::append_log_line(
-            log_path,
-            &format!(
-                "agent provider: {}",
-                match spec.agent.provider {
-                    AgentProvider::Codex => "codex",
-                    AgentProvider::Cursor => "cursor",
-                }
-            ),
-        )?;
-        Self::append_log_line(log_path, &format!("agent bin: {}", spec.agent.bin))?;
+        Self::append_log_line(log_path, &format!("agent provider: {}", plan.provider_id))?;
+        Self::append_log_line(log_path, &format!("agent bin: {}", plan.binary))?;
         Self::append_log_line(log_path, &format!("instruction: {}", spec.instruction))?;
         if let Some(model) = &spec.agent.model {
             Self::append_log_line(log_path, &format!("agent model: {model}"))?;
@@ -183,14 +180,25 @@ impl ProcessRunner {
         spec: &AttemptSpec,
         handle: &ExecutionHandle,
     ) -> Result<Child, ExecutionError> {
-        let workspace_dir = Self::workspace_dir(handle);
         let home_dir = Self::home_dir(handle);
         let report_path = Self::report_path(handle);
         let logs_path = Self::logs_path(handle);
+        let workspace_dir = Self::workspace_dir(handle);
+        let report_path_string = report_path.display().to_string();
+        let workspace_dir_string = workspace_dir.display().to_string();
+        let plan = build_launch_plan(
+            &spec.agent,
+            AgentLaunchContext {
+                binary: &spec.agent.bin,
+                workspace_dir: &workspace_dir_string,
+                report_path: &report_path_string,
+                instruction: &spec.instruction,
+            },
+        )?;
 
-        let executable = resolve_command_path(&spec.agent.bin)?;
-        self.install_agent_auth_file(spec, &home_dir)?;
-        self.write_log_preamble(spec, &logs_path)?;
+        let executable = resolve_command_path(&plan.binary)?;
+        self.install_agent_auth_file(spec, &plan, &home_dir)?;
+        self.write_log_preamble(spec, &plan, &logs_path)?;
 
         let mut command = Command::new(executable);
         let path =
@@ -219,53 +227,23 @@ impl ProcessRunner {
             command.env("https_proxy", proxy);
             command.env("http_proxy", proxy);
         }
+        for (key, value) in &plan.env {
+            command.env(key, value);
+        }
 
-        match spec.agent.provider {
-            AgentProvider::Codex => {
-                let logs_file = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&logs_path)?;
-                command.current_dir(&handle.run_dir);
-                command.arg("exec");
-                command.arg("--dangerously-bypass-approvals-and-sandbox");
-                command.arg("--color");
-                command.arg("never");
-                command.arg("-C");
-                command.arg(&workspace_dir);
-                command.arg("-o");
-                command.arg("report.txt");
-                command.arg(&spec.instruction);
+        let logs_file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&logs_path)?;
+        command.current_dir(Path::new(&plan.working_directory));
+        command.args(&plan.args);
+        match plan.report_mode {
+            AgentReportMode::File => {
                 command.stdout(Stdio::from(logs_file.try_clone()?));
                 command.stderr(Stdio::from(logs_file));
             }
-            AgentProvider::Cursor => {
-                let logs_file = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&logs_path)?;
+            AgentReportMode::Stdout => {
                 let report_file = fs::File::create(&report_path)?;
-                command.current_dir(&workspace_dir);
-                if spec.agent.auth_file.is_none() {
-                    let api_key = spec.agent.api_key.as_ref().ok_or_else(|| {
-                        ExecutionError::InvalidConfig(
-                            "cursor process execution requires an api key or staged auth file"
-                                .to_string(),
-                        )
-                    })?;
-                    command.env("CURSOR_API_KEY", api_key);
-                    command.arg("--api-key");
-                    command.arg(api_key);
-                }
-                command.arg("-p");
-                command.arg("-f");
-                command.arg("--output-format");
-                command.arg("text");
-                if let Some(model) = &spec.agent.model {
-                    command.arg("--model");
-                    command.arg(model);
-                }
-                command.arg(&spec.instruction);
                 command.stdout(Stdio::from(report_file));
                 command.stderr(Stdio::from(logs_file));
             }
@@ -586,7 +564,7 @@ mod tests {
                 instruction: "append blank line to readme".to_string(),
                 limits: config.limits.clone(),
                 agent: super::super::AgentExecutionSpec {
-                    provider: AgentProvider::Codex,
+                    provider: "codex".to_string(),
                     bin: fake_codex.display().to_string(),
                     model: None,
                     auth_file: None,
@@ -637,7 +615,7 @@ mod tests {
                 instruction: "append blank line to readme".to_string(),
                 limits: config.limits.clone(),
                 agent: super::super::AgentExecutionSpec {
-                    provider: AgentProvider::Cursor,
+                    provider: "cursor".to_string(),
                     bin: fake_cursor.display().to_string(),
                     model: Some("gpt-5".to_string()),
                     auth_file: None,
@@ -706,7 +684,7 @@ while [ "$#" -gt 0 ]; do
 done
 cd "$workdir"
 printf "\n" >> README.md
-printf "fake codex completed: %s\n" "$instruction" > "../$report"
+printf "fake codex completed: %s\n" "$instruction" > "$report"
 echo "fake codex applied instruction"
 "#,
         )

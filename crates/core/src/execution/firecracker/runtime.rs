@@ -4,9 +4,11 @@ use std::{
     process::Command,
 };
 
+use crate::agents::{build_launch_plan, AgentLaunchContext, AgentLaunchPlan, AgentReportMode};
+
 use super::super::{
-    shell_quote, AgentExecutionSpec, AgentProvider, AttemptSpec, ExecutionError,
-    FirecrackerBackendConfig, UserPackageDir,
+    shell_quote, AgentExecutionSpec, AttemptSpec, ExecutionError, FirecrackerBackendConfig,
+    UserPackageDir,
 };
 use super::{
     network::{host_proxy_egress_policy, HostProxyEgressPolicy, NetworkLease},
@@ -70,10 +72,11 @@ impl<'a> FirecrackerRuntimeStager<'a> {
             config_dir.join("agent.env"),
             render_agent_env(
                 &spec.agent,
+                &spec.instruction,
                 &guest_path_entries,
                 &self.firecracker.user_package_dirs,
                 network_lease,
-            ),
+            )?,
         )?;
         fs::write(
             config_dir.join("guest-init-contract.txt"),
@@ -105,23 +108,28 @@ pub(super) struct PreparedRuntimeTree {
 
 pub(super) fn render_agent_env(
     agent: &AgentExecutionSpec,
+    instruction: &str,
     guest_path_entries: &[String],
     user_package_dirs: &[UserPackageDir],
     network_lease: Option<&NetworkLease>,
-) -> String {
+) -> Result<String, ExecutionError> {
     let egress_policy = host_proxy_egress_policy(&agent.egress_allowed_domains);
+    let resolved_bin = resolve_guest_agent_bin(&agent.bin, user_package_dirs);
+    let launch_plan = build_launch_plan(
+        agent,
+        AgentLaunchContext {
+            binary: &resolved_bin,
+            workspace_dir: "/mnt/runtime/workspace",
+            report_path: "/mnt/runtime/openoman-output/report.txt",
+            instruction,
+        },
+    )?;
     let mut env_file = String::new();
     env_file.push_str(&format!(
         "AGENT_PROVIDER={}\n",
-        match agent.provider {
-            AgentProvider::Codex => "codex",
-            AgentProvider::Cursor => "cursor",
-        }
+        shell_quote(launch_plan.provider_id)
     ));
-    env_file.push_str(&format!(
-        "AGENT_BIN={}\n",
-        shell_quote(&resolve_guest_agent_bin(&agent.bin, user_package_dirs))
-    ));
+    env_file.push_str(&format!("AGENT_BIN={}\n", shell_quote(&launch_plan.binary)));
     if let Some(model) = &agent.model {
         env_file.push_str(&format!("AGENT_MODEL={}\n", shell_quote(model)));
     }
@@ -129,9 +137,13 @@ pub(super) fn render_agent_env(
         env_file
             .push_str("OPENOMAN_AGENT_AUTH_FILE='/mnt/runtime/openoman-config/agent-auth.json'\n");
     }
-    if let Some(api_key) = &agent.api_key {
-        env_file.push_str(&format!("export CURSOR_API_KEY={}\n", shell_quote(api_key)));
+    if let Some(relative_path) = &launch_plan.auth_file_home_relative_path {
+        env_file.push_str(&format!(
+            "OPENOMAN_AGENT_AUTH_INSTALL_PATH={}\n",
+            shell_quote(&format!("/root/{}", relative_path.display()))
+        ));
     }
+    append_agent_launch_plan_env(&mut env_file, &launch_plan);
     if let Some(proxy) = &agent.egress_proxy {
         env_file.push_str(&format!("export HTTPS_PROXY={}\n", shell_quote(proxy)));
         env_file.push_str(&format!("export HTTP_PROXY={}\n", shell_quote(proxy)));
@@ -197,7 +209,60 @@ pub(super) fn render_agent_env(
         "OPENOMAN_EXTRA_PATH={}\n",
         shell_quote(&guest_path_entries.join(":"))
     ));
-    env_file
+    Ok(env_file)
+}
+
+fn append_agent_launch_plan_env(env_file: &mut String, launch_plan: &AgentLaunchPlan) {
+    env_file.push_str(&format!(
+        "OPENOMAN_AGENT_ID={}\n",
+        shell_quote(launch_plan.provider_id)
+    ));
+    env_file.push_str(&format!(
+        "OPENOMAN_AGENT_BIN={}\n",
+        shell_quote(&launch_plan.binary)
+    ));
+    env_file.push_str(&format!(
+        "OPENOMAN_AGENT_WORKDIR={}\n",
+        shell_quote(&launch_plan.working_directory)
+    ));
+    env_file.push_str(&format!(
+        "OPENOMAN_AGENT_REPORT_MODE={}\n",
+        shell_quote(match launch_plan.report_mode {
+            AgentReportMode::File => "file",
+            AgentReportMode::Stdout => "stdout",
+        })
+    ));
+    env_file.push_str(&format!(
+        "OPENOMAN_AGENT_REDACT_API_KEY_ARGS={}\n",
+        if launch_plan.redact_api_key_args {
+            "'1'"
+        } else {
+            "'0'"
+        }
+    ));
+    env_file.push_str(&format!(
+        "OPENOMAN_AGENT_VERSION_ARG_COUNT='{}'\n",
+        launch_plan.version_probe_args.len()
+    ));
+    for (idx, arg) in launch_plan.version_probe_args.iter().enumerate() {
+        env_file.push_str(&format!(
+            "OPENOMAN_AGENT_VERSION_ARG_{idx:03}={}\n",
+            shell_quote(arg)
+        ));
+    }
+    env_file.push_str(&format!(
+        "OPENOMAN_AGENT_ARG_COUNT='{}'\n",
+        launch_plan.args.len()
+    ));
+    for (idx, arg) in launch_plan.args.iter().enumerate() {
+        env_file.push_str(&format!(
+            "OPENOMAN_AGENT_ARG_{idx:03}={}\n",
+            shell_quote(arg)
+        ));
+    }
+    for (key, value) in &launch_plan.env {
+        env_file.push_str(&format!("export {key}={}\n", shell_quote(value)));
+    }
 }
 
 pub(super) fn compute_image_size_bytes(
