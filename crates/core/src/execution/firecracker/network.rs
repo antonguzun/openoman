@@ -299,6 +299,12 @@ impl<'a> FirecrackerNetworkController<'a> {
 
 type SharedLog = Arc<Mutex<fs::File>>;
 
+const TLS_HANDSHAKE_CONTENT_TYPE: u8 = 22;
+const TLS_CLIENT_HELLO_HANDSHAKE_TYPE: u8 = 1;
+const TLS_SUPPORTED_VERSIONS_EXTENSION: u16 = 0x002b;
+const TLS_MIN_ALLOWED_VERSION: u16 = 0x0303;
+const TLS_CLIENT_HELLO_PARSE_LIMIT_BYTES: usize = 64 * 1024;
+
 fn write_shared_log(log: &SharedLog, message: &str) {
     if let Ok(mut file) = log.lock() {
         let _ = writeln!(file, "{message}");
@@ -497,16 +503,306 @@ fn tunnel_tcp_streams(client: TcpStream, upstream: &mut TcpStream) -> io::Result
     let mut client_reader = client.try_clone()?;
     let mut client_writer = client;
     let mut upstream_writer = upstream.try_clone()?;
-    let upstream_to_client = thread::spawn(move || {
-        let _ = io::copy(&mut client_reader, &mut upstream_writer);
+    let client_to_upstream = thread::spawn(move || {
+        let result =
+            copy_client_to_upstream_with_tls_version_gate(&mut client_reader, &mut upstream_writer);
         let _ = upstream_writer.shutdown(Shutdown::Write);
+        result
     });
 
     let mut upstream_reader = upstream.try_clone()?;
-    let result = io::copy(&mut upstream_reader, &mut client_writer);
+    let upstream_to_client_result = io::copy(&mut upstream_reader, &mut client_writer);
     let _ = client_writer.shutdown(Shutdown::Write);
-    let _ = upstream_to_client.join();
-    result.map(|_| ())
+    let client_to_upstream_result = match client_to_upstream.join() {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            "client-to-upstream proxy worker panicked",
+        )),
+    };
+
+    if let Err(err) = client_to_upstream_result {
+        return Err(err);
+    }
+    upstream_to_client_result.map(|_| ())
+}
+
+fn copy_client_to_upstream_with_tls_version_gate(
+    client_reader: &mut TcpStream,
+    upstream_writer: &mut TcpStream,
+) -> io::Result<()> {
+    let mut chunk = [0_u8; 4096];
+    let mut buffered = Vec::new();
+    let mut tls_version_validated = false;
+
+    loop {
+        let read = client_reader.read(&mut chunk)?;
+        if read == 0 {
+            if tls_version_validated {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "connection closed before TLS ClientHello was received",
+            ));
+        }
+
+        if tls_version_validated {
+            upstream_writer.write_all(&chunk[..read])?;
+            continue;
+        }
+
+        buffered.extend_from_slice(&chunk[..read]);
+        if buffered.len() > TLS_CLIENT_HELLO_PARSE_LIMIT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "TLS ClientHello exceeded {} bytes before validation",
+                    TLS_CLIENT_HELLO_PARSE_LIMIT_BYTES
+                ),
+            ));
+        }
+
+        match parse_tls_client_hello_max_version(&buffered) {
+            TlsClientHelloParseResult::NeedMoreData => continue,
+            TlsClientHelloParseResult::Invalid(reason) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to parse TLS ClientHello: {reason}"),
+                ))
+            }
+            TlsClientHelloParseResult::Parsed(max_version) => {
+                if max_version < TLS_MIN_ALLOWED_VERSION {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "offered TLS version {} is below minimum {}",
+                            format_tls_version(max_version),
+                            format_tls_version(TLS_MIN_ALLOWED_VERSION)
+                        ),
+                    ));
+                }
+
+                upstream_writer.write_all(&buffered)?;
+                buffered.clear();
+                tls_version_validated = true;
+            }
+        }
+    }
+}
+
+enum TlsClientHelloParseResult {
+    NeedMoreData,
+    Parsed(u16),
+    Invalid(&'static str),
+}
+
+fn parse_tls_client_hello_max_version(data: &[u8]) -> TlsClientHelloParseResult {
+    if data.len() < 5 {
+        return TlsClientHelloParseResult::NeedMoreData;
+    }
+
+    let mut record_offset = 0_usize;
+    let mut handshake_payload = Vec::new();
+
+    while record_offset < data.len() {
+        let record_header_end = record_offset.saturating_add(5);
+        if record_header_end > data.len() {
+            return TlsClientHelloParseResult::NeedMoreData;
+        }
+
+        let content_type = data[record_offset];
+        if content_type != TLS_HANDSHAKE_CONTENT_TYPE {
+            return TlsClientHelloParseResult::Invalid(
+                "first TLS record is not a handshake record",
+            );
+        }
+
+        let record_len = read_u16(data, record_offset + 3) as usize;
+        let record_payload_start = record_offset + 5;
+        let record_payload_end = record_payload_start.saturating_add(record_len);
+        if record_payload_end > data.len() {
+            return TlsClientHelloParseResult::NeedMoreData;
+        }
+
+        handshake_payload.extend_from_slice(&data[record_payload_start..record_payload_end]);
+        if handshake_payload.len() > TLS_CLIENT_HELLO_PARSE_LIMIT_BYTES {
+            return TlsClientHelloParseResult::Invalid(
+                "TLS handshake payload exceeded parser limit",
+            );
+        }
+
+        if handshake_payload.len() >= 4 {
+            if handshake_payload[0] != TLS_CLIENT_HELLO_HANDSHAKE_TYPE {
+                return TlsClientHelloParseResult::Invalid(
+                    "first TLS handshake message is not ClientHello",
+                );
+            }
+
+            let client_hello_len = ((handshake_payload[1] as usize) << 16)
+                | ((handshake_payload[2] as usize) << 8)
+                | handshake_payload[3] as usize;
+            if client_hello_len == 0 {
+                return TlsClientHelloParseResult::Invalid("ClientHello payload must not be empty");
+            }
+            if client_hello_len > TLS_CLIENT_HELLO_PARSE_LIMIT_BYTES {
+                return TlsClientHelloParseResult::Invalid(
+                    "ClientHello payload exceeded parser limit",
+                );
+            }
+
+            let client_hello_end = 4 + client_hello_len;
+            if handshake_payload.len() < client_hello_end {
+                record_offset = record_payload_end;
+                continue;
+            }
+
+            let client_hello = &handshake_payload[4..client_hello_end];
+            return match parse_client_hello_max_supported_version(client_hello) {
+                Ok(version) => TlsClientHelloParseResult::Parsed(version),
+                Err(reason) => TlsClientHelloParseResult::Invalid(reason),
+            };
+        }
+
+        record_offset = record_payload_end;
+    }
+
+    TlsClientHelloParseResult::NeedMoreData
+}
+
+fn parse_client_hello_max_supported_version(client_hello: &[u8]) -> Result<u16, &'static str> {
+    if client_hello.len() < 34 {
+        return Err("ClientHello is truncated before legacy_version/random");
+    }
+
+    let legacy_version = read_u16(client_hello, 0);
+    let mut cursor = 34;
+
+    let session_id_len = *client_hello
+        .get(cursor)
+        .ok_or("ClientHello missing session_id length")? as usize;
+    cursor += 1;
+    if cursor + session_id_len > client_hello.len() {
+        return Err("ClientHello session_id is truncated");
+    }
+    cursor += session_id_len;
+
+    if cursor + 2 > client_hello.len() {
+        return Err("ClientHello missing cipher_suites length");
+    }
+    let cipher_suites_len = read_u16(client_hello, cursor) as usize;
+    if cipher_suites_len == 0 || cipher_suites_len % 2 != 0 {
+        return Err("ClientHello cipher_suites length is invalid");
+    }
+    cursor += 2;
+    if cursor + cipher_suites_len > client_hello.len() {
+        return Err("ClientHello cipher_suites are truncated");
+    }
+    cursor += cipher_suites_len;
+
+    let compression_methods_len = *client_hello
+        .get(cursor)
+        .ok_or("ClientHello missing compression_methods length")?
+        as usize;
+    if compression_methods_len == 0 {
+        return Err("ClientHello compression_methods length is invalid");
+    }
+    cursor += 1;
+    if cursor + compression_methods_len > client_hello.len() {
+        return Err("ClientHello compression_methods are truncated");
+    }
+    cursor += compression_methods_len;
+
+    if cursor == client_hello.len() {
+        return Ok(legacy_version);
+    }
+
+    if cursor + 2 > client_hello.len() {
+        return Err("ClientHello missing extensions length");
+    }
+    let extensions_len = read_u16(client_hello, cursor) as usize;
+    cursor += 2;
+    let extensions_end = cursor + extensions_len;
+    if extensions_end > client_hello.len() {
+        return Err("ClientHello extensions are truncated");
+    }
+
+    let mut max_supported_version: Option<u16> = None;
+    while cursor < extensions_end {
+        if cursor + 4 > extensions_end {
+            return Err("ClientHello extension header is truncated");
+        }
+
+        let extension_type = read_u16(client_hello, cursor);
+        let extension_len = read_u16(client_hello, cursor + 2) as usize;
+        cursor += 4;
+        if cursor + extension_len > extensions_end {
+            return Err("ClientHello extension payload is truncated");
+        }
+
+        if extension_type == TLS_SUPPORTED_VERSIONS_EXTENSION {
+            let supported_max =
+                parse_supported_versions_extension(&client_hello[cursor..cursor + extension_len])?;
+            max_supported_version = Some(match max_supported_version {
+                Some(existing) => existing.max(supported_max),
+                None => supported_max,
+            });
+        }
+        cursor += extension_len;
+    }
+
+    if cursor != extensions_end {
+        return Err("ClientHello extensions are malformed");
+    }
+
+    Ok(max_supported_version.unwrap_or(legacy_version))
+}
+
+fn parse_supported_versions_extension(extension: &[u8]) -> Result<u16, &'static str> {
+    let list_len = *extension
+        .first()
+        .ok_or("supported_versions extension payload is empty")? as usize;
+    if list_len == 0 || list_len % 2 != 0 {
+        return Err("supported_versions extension length byte is invalid");
+    }
+    if extension.len() != 1 + list_len {
+        return Err("supported_versions extension length does not match payload");
+    }
+
+    let mut max_supported_version: Option<u16> = None;
+    for version in extension[1..].chunks_exact(2) {
+        let parsed = u16::from_be_bytes([version[0], version[1]]);
+        if is_grease_value(parsed) {
+            continue;
+        }
+        max_supported_version = Some(match max_supported_version {
+            Some(existing) => existing.max(parsed),
+            None => parsed,
+        });
+    }
+
+    max_supported_version.ok_or("supported_versions extension contained only GREASE values")
+}
+
+fn is_grease_value(value: u16) -> bool {
+    let [hi, lo] = value.to_be_bytes();
+    hi == lo && (hi & 0x0f) == 0x0a
+}
+
+fn read_u16(data: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([data[offset], data[offset + 1]])
+}
+
+fn format_tls_version(version: u16) -> String {
+    let name = match version {
+        0x0300 => "SSL 3.0",
+        0x0301 => "TLS 1.0",
+        0x0302 => "TLS 1.1",
+        0x0303 => "TLS 1.2",
+        0x0304 => "TLS 1.3",
+        _ => "unknown",
+    };
+    format!("{name} (0x{version:04x})")
 }
 
 pub(super) fn allocate_network_lease(
@@ -630,5 +926,163 @@ pub(super) fn host_proxy_egress_policy(domains: &[String]) -> HostProxyEgressPol
         HostProxyEgressPolicy::AllowAllDebug
     } else {
         HostProxyEgressPolicy::Restricted(domains)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::Read,
+        net::{TcpListener, TcpStream},
+        thread,
+    };
+
+    #[test]
+    fn parse_tls_client_hello_accepts_tls_1_2_without_supported_versions_extension() {
+        let client_hello = build_tls_client_hello_record(0x0303, None);
+        let parsed = parse_tls_client_hello_max_version(&client_hello);
+        assert!(matches!(parsed, TlsClientHelloParseResult::Parsed(0x0303)));
+    }
+
+    #[test]
+    fn parse_tls_client_hello_accepts_tls_1_3_with_supported_versions_extension() {
+        let client_hello = build_tls_client_hello_record(0x0303, Some(&[0x0304]));
+        let parsed = parse_tls_client_hello_max_version(&client_hello);
+        assert!(matches!(parsed, TlsClientHelloParseResult::Parsed(0x0304)));
+    }
+
+    #[test]
+    fn parse_tls_client_hello_ignores_grease_versions() {
+        let client_hello = build_tls_client_hello_record(0x0301, Some(&[0x2a2a, 0x0302]));
+        let parsed = parse_tls_client_hello_max_version(&client_hello);
+        assert!(matches!(parsed, TlsClientHelloParseResult::Parsed(0x0302)));
+    }
+
+    #[test]
+    fn parse_tls_client_hello_rejects_non_handshake_record() {
+        let mut record = vec![23, 0x03, 0x03, 0x00, 0x01, 0x00];
+        record.extend_from_slice(&[0x00; 8]);
+        let parsed = parse_tls_client_hello_max_version(&record);
+        assert!(matches!(
+            parsed,
+            TlsClientHelloParseResult::Invalid("first TLS record is not a handshake record")
+        ));
+    }
+
+    #[test]
+    fn parse_tls_client_hello_needs_more_data_for_partial_record() {
+        let client_hello = build_tls_client_hello_record(0x0303, Some(&[0x0304]));
+        let parsed = parse_tls_client_hello_max_version(&client_hello[..8]);
+        assert!(matches!(parsed, TlsClientHelloParseResult::NeedMoreData));
+    }
+
+    #[test]
+    fn tls_gate_blocks_client_hello_below_tls_1_2() {
+        let (mut client_writer, mut proxy_reader) = connected_tcp_pair();
+        let (mut proxy_writer, mut upstream_reader) = connected_tcp_pair();
+        let worker = thread::spawn(move || {
+            copy_client_to_upstream_with_tls_version_gate(&mut proxy_reader, &mut proxy_writer)
+        });
+
+        let client_hello_tls_1_1 = build_tls_client_hello_record(0x0302, None);
+        client_writer
+            .write_all(&client_hello_tls_1_1)
+            .expect("write client hello");
+        client_writer
+            .shutdown(Shutdown::Write)
+            .expect("shutdown writer");
+
+        let err = worker
+            .join()
+            .expect("tls gate worker should not panic")
+            .expect_err("TLS 1.1 should be blocked");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        let mut forwarded = Vec::new();
+        upstream_reader
+            .read_to_end(&mut forwarded)
+            .expect("read forwarded bytes");
+        assert!(forwarded.is_empty());
+    }
+
+    #[test]
+    fn tls_gate_forwards_tls_1_2_and_follow_up_payload() {
+        let (mut client_writer, mut proxy_reader) = connected_tcp_pair();
+        let (mut proxy_writer, mut upstream_reader) = connected_tcp_pair();
+        let worker = thread::spawn(move || {
+            copy_client_to_upstream_with_tls_version_gate(&mut proxy_reader, &mut proxy_writer)
+        });
+
+        let mut payload = build_tls_client_hello_record(0x0303, None);
+        payload.extend_from_slice(b"test-payload");
+        client_writer.write_all(&payload).expect("write payload");
+        client_writer
+            .shutdown(Shutdown::Write)
+            .expect("shutdown writer");
+
+        worker
+            .join()
+            .expect("tls gate worker should not panic")
+            .expect("TLS 1.2 should pass");
+
+        let mut forwarded = Vec::new();
+        upstream_reader
+            .read_to_end(&mut forwarded)
+            .expect("read forwarded bytes");
+        assert_eq!(forwarded, payload);
+    }
+
+    fn build_tls_client_hello_record(
+        legacy_version: u16,
+        supported_versions: Option<&[u16]>,
+    ) -> Vec<u8> {
+        let mut client_hello = Vec::new();
+        client_hello.extend_from_slice(&legacy_version.to_be_bytes());
+        client_hello.extend_from_slice(&[0_u8; 32]);
+        client_hello.push(0);
+        client_hello.extend_from_slice(&2_u16.to_be_bytes());
+        client_hello.extend_from_slice(&0x1301_u16.to_be_bytes());
+        client_hello.push(1);
+        client_hello.push(0);
+
+        if let Some(supported_versions) = supported_versions {
+            let mut extension_payload = Vec::new();
+            extension_payload.push((supported_versions.len() * 2) as u8);
+            for version in supported_versions {
+                extension_payload.extend_from_slice(&version.to_be_bytes());
+            }
+
+            let mut extensions = Vec::new();
+            extensions.extend_from_slice(&TLS_SUPPORTED_VERSIONS_EXTENSION.to_be_bytes());
+            extensions.extend_from_slice(&(extension_payload.len() as u16).to_be_bytes());
+            extensions.extend_from_slice(&extension_payload);
+
+            client_hello.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+            client_hello.extend_from_slice(&extensions);
+        }
+
+        let mut handshake = Vec::new();
+        handshake.push(TLS_CLIENT_HELLO_HANDSHAKE_TYPE);
+        let hello_len = client_hello.len();
+        handshake.push(((hello_len >> 16) & 0xff) as u8);
+        handshake.push(((hello_len >> 8) & 0xff) as u8);
+        handshake.push((hello_len & 0xff) as u8);
+        handshake.extend_from_slice(&client_hello);
+
+        let mut record = Vec::new();
+        record.push(TLS_HANDSHAKE_CONTENT_TYPE);
+        record.extend_from_slice(&legacy_version.to_be_bytes());
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    fn connected_tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind local listener");
+        let listener_addr = listener.local_addr().expect("listener local addr");
+        let client = TcpStream::connect(listener_addr).expect("connect local listener");
+        let (server, _) = listener.accept().expect("accept local connection");
+        (client, server)
     }
 }

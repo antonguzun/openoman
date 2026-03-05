@@ -115,7 +115,7 @@ The current guest kernel does not enable Linux Landlock (`CONFIG_SECURITY_LANDLO
 
 ## Limitations
 
-- host-proxy mode currently supports HTTPS through HTTP CONNECT only; it does not provide general guest internet access.
+- host-proxy mode currently supports HTTPS through HTTP CONNECT only, enforces a minimum of TLS 1.2 for tunneled connections, and does not provide general guest internet access.
 - `agent.egress_allowed_domains` uses exact hostname matching; wildcard domains are not implemented.
 - guest networking in direct mode depends on host privileges for tap lifecycle management.
 - user package directories are copied into the per-run runtime image; they are not live-mounted from the host.
