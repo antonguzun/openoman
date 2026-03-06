@@ -17,6 +17,7 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
     Submit {
+        /// Repository alias (preferred) or raw clone URL/path.
         #[arg(long)]
         repo: String,
         #[arg(long)]

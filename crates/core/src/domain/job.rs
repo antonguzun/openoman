@@ -137,6 +137,7 @@ pub struct PublishResult {
 pub struct Job {
     pub id: JobId,
     pub repo_ref: RepoRef,
+    pub repo_alias: Option<String>,
     pub revision: Revision,
     pub instruction: String,
     pub check_profile: CheckProfile,
@@ -145,6 +146,7 @@ pub struct Job {
     pub attempts: Vec<Attempt>,
     pub artifacts: Vec<ArtifactRef>,
     pub publish_result: Option<PublishResult>,
+    pub publish_warning: Option<String>,
     active_attempt_id: Option<u32>,
     validation_succeeded: bool,
 }
@@ -153,6 +155,7 @@ pub struct Job {
 pub struct JobSnapshot {
     pub id: JobId,
     pub repo_ref: RepoRef,
+    pub repo_alias: Option<String>,
     pub revision: Revision,
     pub instruction: String,
     pub check_profile: CheckProfile,
@@ -161,6 +164,7 @@ pub struct JobSnapshot {
     pub attempts: Vec<Attempt>,
     pub artifacts: Vec<ArtifactRef>,
     pub publish_result: Option<PublishResult>,
+    pub publish_warning: Option<String>,
     pub active_attempt_id: Option<u32>,
     pub validation_succeeded: bool,
 }
@@ -169,6 +173,7 @@ impl Job {
     pub fn submit(
         id: JobId,
         repo_ref: RepoRef,
+        repo_alias: Option<String>,
         revision: Revision,
         instruction: String,
         check_profile: CheckProfile,
@@ -177,6 +182,7 @@ impl Job {
         let job = Self {
             id: id.clone(),
             repo_ref,
+            repo_alias,
             revision,
             instruction,
             check_profile,
@@ -185,6 +191,7 @@ impl Job {
             attempts: vec![],
             artifacts: vec![],
             publish_result: None,
+            publish_warning: None,
             active_attempt_id: None,
             validation_succeeded: false,
         };
@@ -196,6 +203,7 @@ impl Job {
         Self {
             id: snapshot.id,
             repo_ref: snapshot.repo_ref,
+            repo_alias: snapshot.repo_alias,
             revision: snapshot.revision,
             instruction: snapshot.instruction,
             check_profile: snapshot.check_profile,
@@ -204,6 +212,7 @@ impl Job {
             attempts: snapshot.attempts,
             artifacts: snapshot.artifacts,
             publish_result: snapshot.publish_result,
+            publish_warning: snapshot.publish_warning,
             active_attempt_id: snapshot.active_attempt_id,
             validation_succeeded: snapshot.validation_succeeded,
         }
@@ -328,6 +337,7 @@ impl Job {
             pull_request_url: url.into(),
             pull_request_number,
         });
+        self.publish_warning = None;
         self.state = JobState::Notifying;
 
         Ok(JobEvent::PullRequestCreated {
@@ -356,6 +366,32 @@ impl Job {
             return Err(JobError::PublishSkipRequiresNeverPolicy);
         }
 
+        self.publish_warning = None;
+        self.state = JobState::Notifying;
+        Ok(())
+    }
+
+    pub fn mark_publish_skipped_with_warning(
+        &mut self,
+        warning: impl Into<String>,
+    ) -> Result<(), JobError> {
+        if self.state != JobState::Publishing {
+            return Err(JobError::InvalidTransition {
+                from: self.state.clone(),
+                to: JobState::Notifying,
+            });
+        }
+        if !self.validation_succeeded {
+            return Err(JobError::PublishRequiresValidationSuccess);
+        }
+
+        let warning = warning.into();
+        let warning = warning.trim();
+        if warning.is_empty() {
+            return Err(JobError::EmptyPublishWarning);
+        }
+
+        self.publish_warning = Some(warning.to_string());
         self.state = JobState::Notifying;
         Ok(())
     }
@@ -429,6 +465,7 @@ pub enum JobError {
     NoActiveAttempt,
     PublishRequiresValidationSuccess,
     PublishSkipRequiresNeverPolicy,
+    EmptyPublishWarning,
     TerminalJob,
 }
 
@@ -446,6 +483,7 @@ impl Display for JobError {
             Self::PublishSkipRequiresNeverPolicy => {
                 write!(f, "publish skipping requires publish policy never")
             }
+            Self::EmptyPublishWarning => write!(f, "publish warning must not be empty"),
             Self::TerminalJob => write!(f, "job is in a terminal state"),
         }
     }
@@ -461,6 +499,7 @@ mod tests {
         Job::submit(
             JobId::new("job-1").expect("valid id"),
             RepoRef::new("github.com/acme/repo").expect("valid repo"),
+            None,
             Revision::new("main").expect("valid revision"),
             "test instruction".to_string(),
             CheckProfile::new("unit").expect("valid check profile"),
@@ -557,6 +596,7 @@ mod tests {
         let mut job = Job::submit(
             JobId::new("job-never").expect("valid id"),
             RepoRef::new("github.com/acme/repo").expect("valid repo"),
+            None,
             Revision::new("main").expect("valid revision"),
             "test instruction".to_string(),
             CheckProfile::new("unit").expect("valid check profile"),
@@ -578,6 +618,30 @@ mod tests {
         job.mark_succeeded().expect("job can succeed");
 
         assert_eq!(job.state, JobState::Succeeded);
+        assert!(job.publish_result.is_none());
+    }
+
+    #[test]
+    fn publish_policy_on_validation_success_can_skip_with_warning() {
+        let mut job = new_job();
+        job.start_attempt(1).expect("attempt should start");
+        job.collect_artifacts(vec![
+            ArtifactRef::new("artifacts/patch.diff").expect("valid ref")
+        ])
+        .expect("collects artifacts");
+        job.start_validation().expect("validation can start");
+        job.mark_validation_succeeded()
+            .expect("validation succeeds");
+
+        job.mark_publish_skipped_with_warning("missing publish token")
+            .expect("publish can be skipped with warning");
+        job.mark_succeeded().expect("job can succeed");
+
+        assert_eq!(job.state, JobState::Succeeded);
+        assert_eq!(
+            job.publish_warning.as_deref(),
+            Some("missing publish token")
+        );
         assert!(job.publish_result.is_none());
     }
 }

@@ -5,6 +5,44 @@ database_path = "./data/openoman.db"
 [git]
 # Base directory where trusted clones are stored.
 trusted_workspace_dir = "./workspaces/trusted"
+# Directory containing optional per-repo env overlays. For repo alias `kickfoss`,
+# openoman will copy files from `./env_for_repo/kickfoss` into the sandbox workspace root.
+env_for_repo_dir = "./env_for_repo"
+
+[[git.accounts]]
+# Reusable git account identity used for trusted publish commits.
+alias = "github-personal"
+# Reads token from host env at runtime; leave unset to allow run success with publish warning.
+token_env = "OPENOMAN_GITHUB_TOKEN"
+git_user_name = "OpenOMAN Bot"
+git_user_email = "openoman-bot@example.com"
+
+[[git.accounts]]
+alias = "gitlab-work"
+token_env = "OPENOMAN_GITLAB_TOKEN"
+git_user_name = "OpenOMAN Work Bot"
+git_user_email = "openoman-work@example.com"
+
+[[git.repos]]
+alias = "kickfoss"
+repo_ref = "https://github.com/username/reponame.git"
+platform = "github"
+account = "github-personal"
+env_repo_name = "reponame"
+# Required for GitHub publish planning.
+repo_owner = "username"
+repo_name = "reponame"
+# Optional GitHub publish overrides.
+branch_prefix = "openoman"
+api_base_url = "https://api.github.com"
+
+[[git.repos]]
+# Clone-only example. on_validation_success will complete with publish_warning because
+# this release only publishes GitHub repositories.
+alias = "internal-gitlab"
+repo_ref = "https://gitlab.example.com/group/project.git"
+platform = "gitlab"
+account = "gitlab-work"
 
 [sandbox]
 # Virtualization backend used for sandbox attempts.
@@ -71,6 +109,8 @@ egress_allowed_domains = ["api.openai.com"]
 # egress_allowed_domains = ["*"]
 
 [publishing]
+# Legacy fallback publishing settings used when submitting raw repo refs (non-alias `--repo`).
+# Alias-based repositories should prefer [[git.repos]] + [[git.accounts]] above.
 # Trusted GitHub publishing runs only after validation succeeds.
 provider = "github"
 repo_owner = "example"

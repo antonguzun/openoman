@@ -22,6 +22,7 @@ pub struct RunJobUseCase {
     execution_backend: Box<dyn ExecutionBackend>,
     limits: ResourceLimits,
     agent_execution: AgentExecutionSpec,
+    repo_env_source_dir: Option<PathBuf>,
     artifact_limits: RunJobArtifactLimits,
 }
 
@@ -38,6 +39,7 @@ pub struct RunJobOutcome {
     pub state: JobState,
     pub failure_reason: Option<String>,
     pub logs_path: Option<PathBuf>,
+    pub publish_warning: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +49,12 @@ pub enum RunJobError {
     Message(String),
 }
 
+#[derive(Debug, Clone)]
+pub enum PublishExecutionPlan {
+    GitHub(GitHubPublisherConfig),
+    SkipWithWarning(String),
+}
+
 impl RunJobUseCase {
     pub fn new(
         store: SqliteStore,
@@ -54,6 +62,7 @@ impl RunJobUseCase {
         execution_backend: Box<dyn ExecutionBackend>,
         limits: ResourceLimits,
         agent_execution: AgentExecutionSpec,
+        repo_env_source_dir: Option<PathBuf>,
         artifact_limits: RunJobArtifactLimits,
     ) -> Self {
         Self {
@@ -62,6 +71,7 @@ impl RunJobUseCase {
             execution_backend,
             limits,
             agent_execution,
+            repo_env_source_dir,
             artifact_limits,
         }
     }
@@ -72,7 +82,7 @@ impl RunJobUseCase {
         resolve_publisher_config: F,
     ) -> Result<RunJobOutcome, RunJobError>
     where
-        F: FnOnce(&Job) -> Result<Option<GitHubPublisherConfig>, RunJobError>,
+        F: FnOnce(&Job) -> Result<PublishExecutionPlan, RunJobError>,
     {
         let jobs = self.store.jobs();
         let Some(mut job) = jobs
@@ -91,7 +101,12 @@ impl RunJobUseCase {
 
         let prepared = self
             .git
-            .prepare_workspace(&job.repo_ref, &job.revision, job.id.as_str())
+            .prepare_workspace_with_env_overlay(
+                &job.repo_ref,
+                &job.revision,
+                job.id.as_str(),
+                self.repo_env_source_dir.as_deref(),
+            )
             .map_err(|e| {
                 RunJobError::Message(format!(
                     "failed to prepare git workspace for {} at revision {}: {e}",
@@ -248,6 +263,7 @@ impl RunJobUseCase {
                 state: job.state.clone(),
                 failure_reason: Some(reason),
                 logs_path,
+                publish_warning: job.publish_warning.clone(),
             });
         }
 
@@ -287,6 +303,7 @@ impl RunJobUseCase {
                     state: job.state.clone(),
                     failure_reason: Some(reason),
                     logs_path,
+                    publish_warning: job.publish_warning.clone(),
                 });
             }
         }
@@ -301,6 +318,7 @@ impl RunJobUseCase {
             state: job.state.clone(),
             failure_reason: None,
             logs_path,
+            publish_warning: job.publish_warning.clone(),
         })
     }
 }
@@ -329,7 +347,7 @@ fn publish_validated_changes<F>(
     resolve_publisher_config: F,
 ) -> Result<Option<NewOutboxEvent>, RunJobError>
 where
-    F: FnOnce(&Job) -> Result<Option<GitHubPublisherConfig>, RunJobError>,
+    F: FnOnce(&Job) -> Result<PublishExecutionPlan, RunJobError>,
 {
     match job.publish_policy {
         PublishPolicy::Never => {
@@ -337,51 +355,52 @@ where
                 .map_err(|e| RunJobError::Message(e.to_string()))?;
             Ok(None)
         }
-        PublishPolicy::OnValidationSuccess => {
-            let publishing = resolve_publisher_config(job)?.ok_or_else(|| {
-                RunJobError::Message(
-                    "publishing configuration is required for publish_policy = on_validation_success"
-                        .to_string(),
-                )
-            })?;
-            let patch_record = artifact_records
-                .iter()
-                .find(|artifact| artifact.artifact_ref == "sandbox.patch")
-                .ok_or_else(|| {
+        PublishPolicy::OnValidationSuccess => match resolve_publisher_config(job)? {
+            PublishExecutionPlan::SkipWithWarning(warning) => {
+                job.mark_publish_skipped_with_warning(warning)
+                    .map_err(|e| RunJobError::Message(e.to_string()))?;
+                Ok(None)
+            }
+            PublishExecutionPlan::GitHub(publishing) => {
+                let patch_record = artifact_records
+                    .iter()
+                    .find(|artifact| artifact.artifact_ref == "sandbox.patch")
+                    .ok_or_else(|| {
+                        RunJobError::Message(
+                            "sandbox.patch artifact is required before publishing".to_string(),
+                        )
+                    })?;
+                let publisher = GitHubPublisher::new(publishing);
+                let published = publisher
+                    .publish_patch(
+                        job.id.as_str(),
+                        &job.instruction,
+                        &prepared.trusted_clone_dir,
+                        Path::new(&patch_record.path),
+                    )
+                    .map_err(|e| {
+                        RunJobError::Message(format!("failed to publish validated changes: {e}"))
+                    })?;
+                let event = job
+                    .mark_pull_request_created(
+                        published.branch_name.clone(),
+                        published.pull_request_url.clone(),
+                        published.pull_request_number,
+                    )
+                    .map_err(|e| RunJobError::Message(e.to_string()))?;
+                let publish_result = job.publish_result.as_ref().ok_or_else(|| {
                     RunJobError::Message(
-                        "sandbox.patch artifact is required before publishing".to_string(),
+                        "publish result missing after pull request creation".to_string(),
                     )
                 })?;
-            let publisher = GitHubPublisher::new(publishing);
-            let published = publisher
-                .publish_patch(
-                    job.id.as_str(),
-                    &job.instruction,
-                    &prepared.trusted_clone_dir,
-                    Path::new(&patch_record.path),
-                )
-                .map_err(|e| {
-                    RunJobError::Message(format!("failed to publish validated changes: {e}"))
-                })?;
-            let event = job
-                .mark_pull_request_created(
-                    published.branch_name.clone(),
-                    published.pull_request_url.clone(),
-                    published.pull_request_number,
-                )
-                .map_err(|e| RunJobError::Message(e.to_string()))?;
-            let publish_result = job.publish_result.as_ref().ok_or_else(|| {
-                RunJobError::Message(
-                    "publish result missing after pull request creation".to_string(),
-                )
-            })?;
 
-            Ok(Some(build_pull_request_created_outbox_event(
-                job.id.as_str(),
-                event.event_type(),
-                publish_result,
-            )?))
-        }
+                Ok(Some(build_pull_request_created_outbox_event(
+                    job.id.as_str(),
+                    event.event_type(),
+                    publish_result,
+                )?))
+            }
+        },
     }
 }
 
@@ -798,6 +817,7 @@ mod tests {
         let (job, _) = Job::submit(
             JobId::new("job-running").expect("job id"),
             RepoRef::new(fixture_repo.display().to_string()).expect("repo ref"),
+            None,
             Revision::new("main").expect("revision"),
             "append a blank line".to_string(),
             CheckProfile::new("unit").expect("profile"),
@@ -832,6 +852,7 @@ mod tests {
                 )),
                 limits(),
                 agent_execution(),
+                None,
                 RunJobArtifactLimits {
                     log_limit_bytes: 1024 * 1024,
                     report_limit_bytes: 256 * 1024,
@@ -839,7 +860,11 @@ mod tests {
                 },
             );
 
-            use_case.run(&JobId::new(job_id).expect("job id"), |_| Ok(None))
+            use_case.run(&JobId::new(job_id).expect("job id"), |_| {
+                Ok(PublishExecutionPlan::SkipWithWarning(
+                    "not used for publish_policy=never".to_string(),
+                ))
+            })
         });
 
         let (state, attempts) = observed_rx.recv().expect("observed state");
@@ -853,6 +878,7 @@ mod tests {
             .expect("run job outcome");
         assert_eq!(outcome.state, JobState::Succeeded);
         assert!(outcome.failure_reason.is_none());
+        assert!(outcome.publish_warning.is_none());
 
         let reloaded = store
             .jobs()
@@ -877,6 +903,7 @@ mod tests {
         let (job, _) = Job::submit(
             JobId::new("job-failing").expect("job id"),
             RepoRef::new(fixture_repo.display().to_string()).expect("repo ref"),
+            None,
             Revision::new("main").expect("revision"),
             "append a blank line".to_string(),
             CheckProfile::new("unit").expect("profile"),
@@ -898,6 +925,7 @@ mod tests {
             )),
             limits(),
             agent_execution(),
+            None,
             RunJobArtifactLimits {
                 log_limit_bytes: 1024 * 1024,
                 report_limit_bytes: 256 * 1024,
@@ -906,7 +934,11 @@ mod tests {
         );
 
         let outcome = use_case
-            .run(&job.id, |_| Ok(None))
+            .run(&job.id, |_| {
+                Ok(PublishExecutionPlan::SkipWithWarning(
+                    "not used for publish_policy=never".to_string(),
+                ))
+            })
             .expect("run outcome should be returned");
         assert_eq!(outcome.state, JobState::Failed);
         assert_eq!(
@@ -929,6 +961,76 @@ mod tests {
             .expect("artifacts");
         assert!(has_artifact(&artifacts, "sandbox.patch"));
         assert!(has_artifact(&artifacts, "sandbox.logs"));
+    }
+
+    #[test]
+    fn run_job_succeeds_with_publish_warning_when_publish_is_skipped() {
+        let temp = TempDir::new().expect("tempdir");
+        let fixture_repo = temp.path().join("fixture-repo");
+        let trusted_root = temp.path().join("trusted");
+        let runtime_root = temp.path().join("runtime");
+        let db = NamedTempFile::new().expect("temp db");
+        init_fixture_repo(&fixture_repo);
+
+        let store = SqliteStore::open(db.path()).expect("open store");
+        let (mut job, _) = Job::submit(
+            JobId::new("job-publish-warning").expect("job id"),
+            RepoRef::new(fixture_repo.display().to_string()).expect("repo ref"),
+            Some("demo-alias".to_string()),
+            Revision::new("main").expect("revision"),
+            "append a blank line".to_string(),
+            CheckProfile::new("unit").expect("profile"),
+            PublishPolicy::OnValidationSuccess,
+        );
+        store.jobs().create(&job).expect("create job");
+
+        let use_case = RunJobUseCase::new(
+            store.clone(),
+            GitAdapter::new(&trusted_root),
+            Box::new(FakeBackend::new(
+                runtime_root,
+                ExecutionExitStatus {
+                    success: true,
+                    code: Some(0),
+                    timed_out: false,
+                },
+                None,
+            )),
+            limits(),
+            agent_execution(),
+            None,
+            RunJobArtifactLimits {
+                log_limit_bytes: 1024 * 1024,
+                report_limit_bytes: 256 * 1024,
+                patch_limit_bytes: 5 * 1024 * 1024,
+            },
+        );
+
+        let outcome = use_case
+            .run(&job.id, |_| {
+                Ok(PublishExecutionPlan::SkipWithWarning(
+                    "publishing skipped in test".to_string(),
+                ))
+            })
+            .expect("run outcome should be returned");
+        assert_eq!(outcome.state, JobState::Succeeded);
+        assert!(outcome.failure_reason.is_none());
+        assert_eq!(
+            outcome.publish_warning.as_deref(),
+            Some("publishing skipped in test")
+        );
+
+        job = store
+            .jobs()
+            .load(&job.id)
+            .expect("load job")
+            .expect("job exists");
+        assert_eq!(job.state, JobState::Succeeded);
+        assert_eq!(
+            job.publish_warning.as_deref(),
+            Some("publishing skipped in test")
+        );
+        assert!(job.publish_result.is_none());
     }
 
     fn limits() -> ResourceLimits {

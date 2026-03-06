@@ -71,6 +71,7 @@ impl SqliteStore {
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
                 repo_ref TEXT NOT NULL,
+                repo_alias TEXT,
                 revision TEXT NOT NULL,
                 instruction TEXT NOT NULL DEFAULT '',
                 check_profile TEXT NOT NULL,
@@ -80,7 +81,8 @@ impl SqliteStore {
                 validation_succeeded INTEGER NOT NULL,
                 publish_branch_name TEXT,
                 pull_request_url TEXT,
-                pull_request_number INTEGER
+                pull_request_number INTEGER,
+                publish_warning TEXT
             );
 
             CREATE TABLE IF NOT EXISTS attempts (
@@ -151,6 +153,16 @@ impl SqliteStore {
             &conn,
             "pull_request_number",
             "ALTER TABLE jobs ADD COLUMN pull_request_number INTEGER",
+        )?;
+        ensure_jobs_column(
+            &conn,
+            "repo_alias",
+            "ALTER TABLE jobs ADD COLUMN repo_alias TEXT",
+        )?;
+        ensure_jobs_column(
+            &conn,
+            "publish_warning",
+            "ALTER TABLE jobs ADD COLUMN publish_warning TEXT",
         )?;
 
         Ok(())
@@ -235,8 +247,8 @@ impl JobRepository {
     pub fn load(&self, id: &JobId) -> Result<Option<Job>, PersistenceError> {
         let conn = self.conn.borrow();
         let mut stmt = conn.prepare(
-            "SELECT id, repo_ref, revision, instruction, check_profile, publish_policy, state, active_attempt_id, validation_succeeded,
-                    publish_branch_name, pull_request_url, pull_request_number
+            "SELECT id, repo_ref, repo_alias, revision, instruction, check_profile, publish_policy, state, active_attempt_id, validation_succeeded,
+                    publish_branch_name, pull_request_url, pull_request_number, publish_warning
              FROM jobs WHERE id = ?1",
         )?;
 
@@ -244,20 +256,23 @@ impl JobRepository {
             .query_row(params![id.as_str()], |row| {
                 let id: String = row.get(0)?;
                 let repo_ref: String = row.get(1)?;
-                let revision: String = row.get(2)?;
-                let instruction: String = row.get(3)?;
-                let check_profile: String = row.get(4)?;
-                let publish_policy: String = row.get(5)?;
-                let state: String = row.get(6)?;
-                let active_attempt_id: Option<u32> = row.get(7)?;
-                let validation_succeeded: bool = row.get(8)?;
-                let publish_branch_name: Option<String> = row.get(9)?;
-                let pull_request_url: Option<String> = row.get(10)?;
-                let pull_request_number: Option<u64> = row.get(11)?;
+                let repo_alias: Option<String> = row.get(2)?;
+                let revision: String = row.get(3)?;
+                let instruction: String = row.get(4)?;
+                let check_profile: String = row.get(5)?;
+                let publish_policy: String = row.get(6)?;
+                let state: String = row.get(7)?;
+                let active_attempt_id: Option<u32> = row.get(8)?;
+                let validation_succeeded: bool = row.get(9)?;
+                let publish_branch_name: Option<String> = row.get(10)?;
+                let pull_request_url: Option<String> = row.get(11)?;
+                let pull_request_number: Option<u64> = row.get(12)?;
+                let publish_warning: Option<String> = row.get(13)?;
 
                 Ok((
                     id,
                     repo_ref,
+                    repo_alias,
                     revision,
                     instruction,
                     check_profile,
@@ -268,6 +283,7 @@ impl JobRepository {
                     publish_branch_name,
                     pull_request_url,
                     pull_request_number,
+                    publish_warning,
                 ))
             })
             .optional()?;
@@ -275,6 +291,7 @@ impl JobRepository {
         let Some((
             id,
             repo_ref,
+            repo_alias,
             revision,
             instruction,
             check_profile,
@@ -285,6 +302,7 @@ impl JobRepository {
             publish_branch_name,
             pull_request_url,
             pull_request_number,
+            publish_warning,
         )) = row
         else {
             return Ok(None);
@@ -296,6 +314,7 @@ impl JobRepository {
         let job = Job::rehydrate(JobSnapshot {
             id: JobId::new(id)?,
             repo_ref: RepoRef::new(repo_ref)?,
+            repo_alias,
             revision: Revision::new(revision)?,
             instruction,
             check_profile: CheckProfile::new(check_profile)?,
@@ -308,6 +327,7 @@ impl JobRepository {
                 pull_request_url,
                 pull_request_number,
             )?,
+            publish_warning,
             active_attempt_id,
             validation_succeeded,
         });
@@ -329,16 +349,19 @@ fn upsert_job(tx: &Transaction<'_>, job: &Job) -> Result<(), PersistenceError> {
         .publish_result
         .as_ref()
         .map(|result| result.pull_request_number);
+    let repo_alias = job.repo_alias.as_deref();
+    let publish_warning = job.publish_warning.as_deref();
 
     tx.execute(
         "INSERT INTO jobs(
-            id, repo_ref, revision, instruction, check_profile, publish_policy, state,
+            id, repo_ref, repo_alias, revision, instruction, check_profile, publish_policy, state,
             active_attempt_id, validation_succeeded, publish_branch_name, pull_request_url,
-            pull_request_number
+            pull_request_number, publish_warning
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(id) DO UPDATE SET
             repo_ref = excluded.repo_ref,
+            repo_alias = excluded.repo_alias,
             revision = excluded.revision,
             instruction = excluded.instruction,
             check_profile = excluded.check_profile,
@@ -348,10 +371,12 @@ fn upsert_job(tx: &Transaction<'_>, job: &Job) -> Result<(), PersistenceError> {
             validation_succeeded = excluded.validation_succeeded,
             publish_branch_name = excluded.publish_branch_name,
             pull_request_url = excluded.pull_request_url,
-            pull_request_number = excluded.pull_request_number",
+            pull_request_number = excluded.pull_request_number,
+            publish_warning = excluded.publish_warning",
         params![
             job.id.as_str(),
             job.repo_ref.as_str(),
+            repo_alias,
             job.revision.as_str(),
             job.instruction.as_str(),
             job.check_profile.as_str(),
@@ -362,6 +387,7 @@ fn upsert_job(tx: &Transaction<'_>, job: &Job) -> Result<(), PersistenceError> {
             publish_branch_name,
             pull_request_url,
             pull_request_number,
+            publish_warning,
         ],
     )?;
 
@@ -722,6 +748,7 @@ mod tests {
         Job::submit(
             JobId::new("job-epic-2").expect("job id"),
             RepoRef::new("github.com/acme/repo").expect("repo ref"),
+            None,
             Revision::new("main").expect("revision"),
             "persisted instruction".to_string(),
             CheckProfile::new("unit").expect("profile"),
@@ -804,6 +831,38 @@ mod tests {
                 pull_request_url: "https://example.test/pr/7".to_string(),
                 pull_request_number: 7,
             })
+        );
+    }
+
+    #[test]
+    fn job_round_trips_repo_alias_and_publish_warning() {
+        let db = NamedTempFile::new().expect("temp db");
+        let store = SqliteStore::open(db.path()).expect("open store");
+        let jobs = store.jobs();
+
+        let mut job = submitted_job();
+        job.repo_alias = Some("demo-alias".to_string());
+        jobs.create(&job).expect("insert job");
+
+        job.start_attempt(1).expect("start attempt");
+        job.collect_artifacts(vec![ArtifactRef::new("artifacts/report.txt").expect("ref")])
+            .expect("collect artifacts");
+        job.start_validation().expect("start validation");
+        job.mark_validation_succeeded()
+            .expect("validation should succeed");
+        job.mark_publish_skipped_with_warning("publishing skipped: missing token")
+            .expect("skip with warning");
+        job.mark_succeeded().expect("job should succeed");
+        jobs.update(&job).expect("update job");
+
+        let reloaded = jobs
+            .load(&job.id)
+            .expect("load job")
+            .expect("job should exist");
+        assert_eq!(reloaded.repo_alias.as_deref(), Some("demo-alias"));
+        assert_eq!(
+            reloaded.publish_warning.as_deref(),
+            Some("publishing skipped: missing token")
         );
     }
 

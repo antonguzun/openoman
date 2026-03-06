@@ -7,7 +7,7 @@ use std::{
 };
 
 use assert_cmd::Command;
-use openoman_core::persistence::SqliteStore;
+use openoman_core::{domain::job::JobId, persistence::SqliteStore};
 use tempfile::TempDir;
 
 struct PublishingTestConfig {
@@ -885,6 +885,132 @@ fn publish_policy_never_skips_pull_request_creation() {
     assert!(result_stdout.contains(&format!("job_id={job_id} result=success")));
     assert!(!result_stdout.contains("branch="));
     assert!(!result_stdout.contains("pull_request_url="));
+}
+
+#[test]
+fn submit_with_repo_alias_applies_env_overlay_and_reports_publish_warning() {
+    let temp = TempDir::new().expect("tempdir");
+    let fixture_repo = temp.path().join("fixture-repo");
+    init_fixture_repo(&fixture_repo);
+    fs::create_dir_all(temp.path().join("env_for_repo/demo")).expect("create env dir");
+    fs::write(
+        temp.path().join("env_for_repo/demo/.env"),
+        "DEMO_TOKEN=test\n",
+    )
+    .expect("write env");
+    fs::write(
+        temp.path().join("env_for_repo/demo/.env.test"),
+        "DEMO_MODE=1\n",
+    )
+    .expect("write env test");
+    let fake_codex = write_fake_codex(temp.path());
+    let db_path = temp.path().join("openoman.sqlite");
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[core]\ndatabase_path = \"{}\"\n\n[git]\ntrusted_workspace_dir = \"{}\"\nenv_for_repo_dir = \"{}\"\n\n[[git.accounts]]\nalias = \"demo-account\"\ngit_user_name = \"Repo Bot\"\ngit_user_email = \"repo-bot@example.test\"\n\n[[git.repos]]\nalias = \"demo\"\nrepo_ref = \"{}\"\nplatform = \"gitlab\"\naccount = \"demo-account\"\nenv_repo_name = \"demo\"\n\n[sandbox]\nbackend = \"process\"\nhost_risk_posture = \"already_isolated\"\nruntime_dir = \"{}\"\ntimeout_seconds = 30\nmemory_mb = 512\ncpu_cores = 1\n\n[agent]\nprovider = \"codex\"\nbin = \"{}\"\n",
+            db_path.display().to_string().replace('\\', "\\\\"),
+            temp.path()
+                .join("workspaces")
+                .display()
+                .to_string()
+                .replace('\\', "\\\\"),
+            temp.path()
+                .join("env_for_repo")
+                .display()
+                .to_string()
+                .replace('\\', "\\\\"),
+            fixture_repo.display().to_string().replace('\\', "\\\\"),
+            temp.path()
+                .join("sandbox-runtime")
+                .display()
+                .to_string()
+                .replace('\\', "\\\\"),
+            fake_codex.display().to_string().replace('\\', "\\\\"),
+        ),
+    )
+    .expect("write config");
+
+    let config = config_path.display().to_string();
+    let mut submit = cli_cmd();
+    let submit_output = submit
+        .args([
+            "--config",
+            &config,
+            "submit",
+            "--repo",
+            "demo",
+            "--revision",
+            "main",
+            "--instruction",
+            "add empty line in readme",
+            "--publish-policy",
+            "on_validation_success",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let submit_stdout = String::from_utf8(submit_output).expect("utf8 output");
+    let job_id = submit_stdout
+        .trim()
+        .strip_prefix("job_id=")
+        .expect("job id output")
+        .to_string();
+
+    let mut run = cli_cmd();
+    let run_output = run
+        .args(["--config", &config, "run", &job_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let run_stdout = String::from_utf8(run_output).expect("utf8 run output");
+    assert!(run_stdout.contains("publish_warning="));
+    assert!(run_stdout.contains(&format!("job {job_id} finished with state=succeeded")));
+
+    let mut result = cli_cmd();
+    let result_output = result
+        .args(["--config", &config, "result", &job_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result_stdout = String::from_utf8(result_output).expect("utf8 result output");
+    assert!(result_stdout.contains("publish_warning="));
+    assert!(!result_stdout.contains("branch="));
+    assert!(!result_stdout.contains("pull_request_url="));
+
+    let store = SqliteStore::open(&db_path).expect("open sqlite");
+    let job = store
+        .jobs()
+        .load(&JobId::new(job_id.clone()).expect("job id"))
+        .expect("load job")
+        .expect("job exists");
+    assert_eq!(job.repo_alias.as_deref(), Some("demo"));
+    assert_eq!(job.repo_ref.as_str(), fixture_repo.display().to_string());
+
+    let artifacts = store
+        .artifacts()
+        .list_by_job(&job_id)
+        .expect("load artifacts");
+    let workspace = artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_ref == "workspace.sandbox_result")
+        .expect("workspace artifact");
+    assert!(Path::new(&workspace.path).join(".env").exists());
+    assert!(Path::new(&workspace.path).join(".env.test").exists());
+
+    let patch = artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_ref == "sandbox.patch")
+        .expect("patch artifact");
+    let patch_contents = fs::read_to_string(&patch.path).expect("patch contents");
+    assert!(!patch_contents.contains(".env"));
 }
 
 fn submit_job(config: &str, repo_path: &Path, instruction: &str) -> String {

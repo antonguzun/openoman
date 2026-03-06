@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
@@ -68,6 +69,16 @@ impl GitAdapter {
         revision: &Revision,
         workspace_id: &str,
     ) -> Result<PreparedWorkspace, GitError> {
+        self.prepare_workspace_with_env_overlay(repo_ref, revision, workspace_id, None)
+    }
+
+    pub fn prepare_workspace_with_env_overlay(
+        &self,
+        repo_ref: &RepoRef,
+        revision: &Revision,
+        workspace_id: &str,
+        env_overlay_dir: Option<&Path>,
+    ) -> Result<PreparedWorkspace, GitError> {
         let workspace_root = self.trusted_workspace_root.join(workspace_id);
         let trusted_clone_dir = workspace_root.join("trusted-clone");
         let sandbox_workspace_dir = workspace_root.join("sandbox-workspace");
@@ -96,6 +107,11 @@ impl GitAdapter {
         )?;
 
         copy_tree(&trusted_clone_dir, &sandbox_workspace_dir, &[])?;
+        let injected_files = copy_env_overlay_files(env_overlay_dir, &sandbox_workspace_dir)?;
+        if !injected_files.is_empty() {
+            append_git_exclude_entries(&trusted_clone_dir, &injected_files)?;
+            append_git_exclude_entries(&sandbox_workspace_dir, &injected_files)?;
+        }
         sanitize_sandbox_git(&sandbox_workspace_dir)?;
 
         Ok(PreparedWorkspace {
@@ -103,6 +119,70 @@ impl GitAdapter {
             sandbox_workspace_dir,
         })
     }
+}
+
+fn copy_env_overlay_files(
+    env_overlay_dir: Option<&Path>,
+    sandbox_workspace_dir: &Path,
+) -> Result<Vec<String>, GitError> {
+    let Some(env_overlay_dir) = env_overlay_dir else {
+        return Ok(Vec::new());
+    };
+    if !env_overlay_dir.exists() {
+        return Ok(Vec::new());
+    }
+    if !env_overlay_dir.is_dir() {
+        return Err(GitError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "env overlay path is not a directory: {}",
+                env_overlay_dir.display()
+            ),
+        )));
+    }
+
+    let mut injected = Vec::new();
+    for entry in fs::read_dir(env_overlay_dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let destination = sandbox_workspace_dir.join(&file_name);
+        fs::copy(entry.path(), destination)?;
+        injected.push(file_name.to_string_lossy().to_string());
+    }
+    injected.sort();
+    injected.dedup();
+    Ok(injected)
+}
+
+fn append_git_exclude_entries(repo_dir: &Path, file_names: &[String]) -> Result<(), GitError> {
+    let exclude_path = repo_dir.join(".git").join("info").join("exclude");
+    if let Some(parent) = exclude_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let existing = if exclude_path.exists() {
+        fs::read_to_string(&exclude_path)?
+    } else {
+        String::new()
+    };
+    let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+    let mut known: HashSet<String> = lines.iter().cloned().collect();
+    for file_name in file_names {
+        let entry = format!("/{}", file_name);
+        if known.insert(entry.clone()) {
+            lines.push(entry);
+        }
+    }
+    let content = if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    };
+    fs::write(exclude_path, content)?;
+    Ok(())
 }
 
 pub fn write_canonical_patch(
@@ -499,6 +579,59 @@ mod tests {
         assert!(patch_text.contains("README.md"));
         assert!(patch_text.contains("notes.txt"));
         assert!(patch_text.contains("NEW_FILE.md"));
+    }
+
+    #[test]
+    fn env_overlay_files_are_staged_for_sandbox_and_excluded_from_patch() {
+        let temp = TempDir::new().expect("tempdir");
+        let fixture_repo = temp.path().join("fixture-repo");
+        let env_overlay_dir = temp.path().join("env_for_repo/demo");
+        init_fixture_repo(&fixture_repo);
+        fs::create_dir_all(env_overlay_dir.join("nested")).expect("create env overlay dir");
+        fs::write(env_overlay_dir.join(".env"), "API_TOKEN=demo\n").expect("write .env");
+        fs::write(env_overlay_dir.join(".env.test"), "VALUE=1\n").expect("write .env.test");
+        fs::write(env_overlay_dir.join("nested/ignored.env"), "IGNORED=1\n")
+            .expect("write nested env");
+
+        let repo_ref = RepoRef::new(fixture_repo.display().to_string()).expect("repo ref");
+        let revision = Revision::new("main").expect("revision");
+        let adapter = GitAdapter::new(temp.path().join("workspaces"));
+        let prepared = adapter
+            .prepare_workspace_with_env_overlay(
+                &repo_ref,
+                &revision,
+                "job-004",
+                Some(&env_overlay_dir),
+            )
+            .expect("prepare workspace");
+
+        assert!(prepared.sandbox_workspace_dir.join(".env").exists());
+        assert!(prepared.sandbox_workspace_dir.join(".env.test").exists());
+        assert!(!prepared
+            .sandbox_workspace_dir
+            .join("nested/ignored.env")
+            .exists());
+
+        let patch_path = temp.path().join("patch-overlay.diff");
+        write_canonical_patch(
+            &prepared.trusted_clone_dir,
+            &prepared.sandbox_workspace_dir,
+            &patch_path,
+        )
+        .expect("write patch");
+        let patch_text = fs::read_to_string(&patch_path).expect("patch text");
+        assert!(patch_text.trim().is_empty());
+
+        let trusted_exclude = fs::read_to_string(
+            prepared
+                .trusted_clone_dir
+                .join(".git")
+                .join("info")
+                .join("exclude"),
+        )
+        .expect("trusted exclude");
+        assert!(trusted_exclude.contains("/.env"));
+        assert!(trusted_exclude.contains("/.env.test"));
     }
 
     fn init_fixture_repo(path: &Path) {

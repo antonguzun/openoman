@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env, fs,
     net::Ipv4Addr,
     path::{Path, PathBuf},
@@ -40,6 +41,33 @@ struct CoreConfig {
 #[derive(Debug, Deserialize)]
 struct GitConfig {
     trusted_workspace_dir: Option<String>,
+    env_for_repo_dir: Option<String>,
+    accounts: Option<Vec<GitAccountConfig>>,
+    repos: Option<Vec<GitRepoConfig>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitAccountConfig {
+    alias: String,
+    token: Option<String>,
+    token_env: Option<String>,
+    git_user_name: Option<String>,
+    git_user_email: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitRepoConfig {
+    alias: String,
+    repo_ref: String,
+    platform: Option<String>,
+    account: Option<String>,
+    env_repo_name: Option<String>,
+    repo_owner: Option<String>,
+    repo_name: Option<String>,
+    base_branch: Option<String>,
+    branch_prefix: Option<String>,
+    api_base_url: Option<String>,
+    push_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,9 +141,86 @@ struct PublishingConfig {
 pub(crate) struct AppConfig {
     pub(crate) database_path: PathBuf,
     pub(crate) trusted_workspace_dir: PathBuf,
+    pub(crate) env_for_repo_dir: PathBuf,
     pub(crate) execution: ExecutionRuntimeConfig,
     pub(crate) agent: AgentRuntimeConfig,
     pub(crate) publishing: Option<PublishingRuntimeConfig>,
+    repo_catalog: RepoCatalogRuntimeConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedSubmitRepo {
+    pub(crate) repo_ref: String,
+    pub(crate) repo_alias: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PublishRuntimePlan {
+    GitHub(GitHubPublisherConfig),
+    SkipWithWarning(String),
+}
+
+#[derive(Debug, Clone)]
+struct RepoCatalogRuntimeConfig {
+    repos_by_alias: HashMap<String, RepoRuntimeConfig>,
+    accounts_by_alias: HashMap<String, GitAccountRuntimeConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct RepoRuntimeConfig {
+    repo_ref: String,
+    platform: RepoPlatform,
+    account_alias: Option<String>,
+    env_repo_name: String,
+    github: RepoGitHubRuntimeConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoPlatform {
+    GitHub,
+    GitLab,
+    GitLabSelfHosted,
+}
+
+impl RepoPlatform {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::GitHub => "github",
+            Self::GitLab => "gitlab",
+            Self::GitLabSelfHosted => "gitlab_self_hosted",
+        }
+    }
+
+    fn parse(raw: Option<&str>) -> Result<Self, String> {
+        let value = raw.unwrap_or("github").trim().to_ascii_lowercase();
+        match value.as_str() {
+            "github" => Ok(Self::GitHub),
+            "gitlab" => Ok(Self::GitLab),
+            "gitlab_self_hosted" | "gitlab-self-hosted" | "self_hosted_gitlab"
+            | "self-hosted-gitlab" => Ok(Self::GitLabSelfHosted),
+            other => Err(format!(
+                "unsupported git repo platform '{}'; supported values: github, gitlab, gitlab_self_hosted",
+                other
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RepoGitHubRuntimeConfig {
+    repo_owner: Option<String>,
+    repo_name: Option<String>,
+    base_branch: Option<String>,
+    branch_prefix: String,
+    api_base_url: String,
+    push_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GitAccountRuntimeConfig {
+    token: Option<String>,
+    git_user_name: String,
+    git_user_email: String,
 }
 
 #[derive(Debug, Clone)]
@@ -159,9 +264,21 @@ impl AppConfig {
             host_risk_posture: None,
             firecracker: None,
         });
+        let git = git.unwrap_or(GitConfig {
+            trusted_workspace_dir: None,
+            env_for_repo_dir: None,
+            accounts: None,
+            repos: None,
+        });
         let trusted_workspace_dir = git
-            .and_then(|g| g.trusted_workspace_dir)
+            .trusted_workspace_dir
+            .clone()
             .unwrap_or_else(|| "./workspaces/trusted".to_string());
+        let env_for_repo_dir = git
+            .env_for_repo_dir
+            .clone()
+            .unwrap_or_else(|| "./env_for_repo".to_string());
+        let repo_catalog = load_repo_catalog_config(&git, path)?;
         let agent = agent.unwrap_or(AgentConfig {
             provider: None,
             bin: None,
@@ -202,6 +319,7 @@ impl AppConfig {
         Ok(Self {
             database_path: resolve_config_path(path, &database_path)?,
             trusted_workspace_dir: resolve_config_path(path, &trusted_workspace_dir)?,
+            env_for_repo_dir: resolve_config_path(path, &env_for_repo_dir)?,
             execution: ExecutionRuntimeConfig {
                 backend: match sandbox_backend {
                     ExecutionBackendKind::Firecracker => {
@@ -230,7 +348,126 @@ impl AppConfig {
             },
             agent: agent_runtime,
             publishing: load_publishing_config(publishing, path)?,
+            repo_catalog,
         })
+    }
+
+    pub(crate) fn resolve_submit_repo(
+        &self,
+        repo_or_alias: &str,
+    ) -> Result<ResolvedSubmitRepo, String> {
+        let candidate = repo_or_alias.trim();
+        if candidate.is_empty() {
+            return Err("submit --repo must not be empty".to_string());
+        }
+
+        if let Some(repo) = self.repo_catalog.repos_by_alias.get(candidate) {
+            return Ok(ResolvedSubmitRepo {
+                repo_ref: repo.repo_ref.clone(),
+                repo_alias: Some(candidate.to_string()),
+            });
+        }
+
+        Ok(ResolvedSubmitRepo {
+            repo_ref: candidate.to_string(),
+            repo_alias: None,
+        })
+    }
+
+    pub(crate) fn env_overlay_dir_for_alias(&self, repo_alias: Option<&str>) -> Option<PathBuf> {
+        let alias = repo_alias?;
+        let repo = self.repo_catalog.repos_by_alias.get(alias)?;
+        let path = self.env_for_repo_dir.join(&repo.env_repo_name);
+        if path.is_dir() {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn resolve_publish_plan_for_job(
+        &self,
+        repo_alias: Option<&str>,
+        revision: &Revision,
+    ) -> Result<PublishRuntimePlan, String> {
+        if let Some(alias) = repo_alias {
+            let Some(repo) = self.repo_catalog.repos_by_alias.get(alias) else {
+                return Ok(PublishRuntimePlan::SkipWithWarning(format!(
+                    "publishing skipped: repo alias '{}' is not configured in git.repos",
+                    alias
+                )));
+            };
+
+            if repo.platform != RepoPlatform::GitHub {
+                return Ok(PublishRuntimePlan::SkipWithWarning(format!(
+                    "publishing skipped: repo alias '{}' uses platform '{}' and this release only publishes GitHub repositories",
+                    alias,
+                    repo.platform.as_str()
+                )));
+            }
+
+            let Some(account_alias) = repo.account_alias.as_deref() else {
+                return Ok(PublishRuntimePlan::SkipWithWarning(format!(
+                    "publishing skipped: repo alias '{}' has no bound git account",
+                    alias
+                )));
+            };
+            let Some(account) = self.repo_catalog.accounts_by_alias.get(account_alias) else {
+                return Ok(PublishRuntimePlan::SkipWithWarning(format!(
+                    "publishing skipped: bound git account '{}' was not found",
+                    account_alias
+                )));
+            };
+            let Some(token) = account.token.clone() else {
+                return Ok(PublishRuntimePlan::SkipWithWarning(format!(
+                    "publishing skipped: git account '{}' has no token configured",
+                    account_alias
+                )));
+            };
+            let repo_owner = repo.github.repo_owner.clone().ok_or_else(|| {
+                format!(
+                    "git.repos alias '{}' is missing repo_owner required for GitHub publishing",
+                    alias
+                )
+            })?;
+            let repo_name = repo.github.repo_name.clone().ok_or_else(|| {
+                format!(
+                    "git.repos alias '{}' is missing repo_name required for GitHub publishing",
+                    alias
+                )
+            })?;
+            let base_branch = repo
+                .github
+                .base_branch
+                .clone()
+                .unwrap_or_else(|| revision.as_str().to_string());
+            let push_url = repo
+                .github
+                .push_url
+                .clone()
+                .unwrap_or_else(|| format!("https://github.com/{repo_owner}/{repo_name}.git"));
+
+            return Ok(PublishRuntimePlan::GitHub(GitHubPublisherConfig {
+                api_base_url: repo.github.api_base_url.clone(),
+                repo_owner,
+                repo_name,
+                base_branch,
+                branch_prefix: repo.github.branch_prefix.clone(),
+                push_url,
+                token,
+                curl_bin: "curl".to_string(),
+                git_user_name: account.git_user_name.clone(),
+                git_user_email: account.git_user_email.clone(),
+            }));
+        }
+
+        let legacy = self.publishing.as_ref().ok_or_else(|| {
+            "publishing configuration is required for publish_policy = on_validation_success"
+                .to_string()
+        })?;
+        Ok(PublishRuntimePlan::GitHub(
+            legacy.github_config_for_job(revision)?,
+        ))
     }
 }
 
@@ -357,6 +594,8 @@ impl PublishingRuntimeConfig {
             push_url,
             token,
             curl_bin: self.curl_bin.clone(),
+            git_user_name: "OpenOMAN".to_string(),
+            git_user_email: "openoman@openoman.invalid".to_string(),
         })
     }
 }
@@ -386,6 +625,131 @@ pub(crate) fn resolve_agent_execution_spec(
 #[cfg(test)]
 fn discover_matching_cursor_auth_cache_path_in_home(api_key: &str, home: &Path) -> Option<PathBuf> {
     openoman_core::agents::discover_matching_cursor_auth_cache_path_in_home(api_key, home)
+}
+
+fn load_repo_catalog_config(
+    git: &GitConfig,
+    config_path: &Path,
+) -> Result<RepoCatalogRuntimeConfig, String> {
+    let mut accounts_by_alias = HashMap::new();
+    for account in git.accounts.as_deref().unwrap_or(&[]) {
+        let alias = normalize_required_string(&account.alias, "git.accounts.alias")?;
+        if accounts_by_alias.contains_key(&alias) {
+            return Err(format!("duplicate git account alias '{}'", alias));
+        }
+        let token = resolve_generic_token(account.token_env.as_deref(), account.token.clone());
+        let git_user_name = normalize_required_string(
+            account.git_user_name.as_deref().unwrap_or(""),
+            "git.accounts.git_user_name",
+        )?;
+        let git_user_email = normalize_required_string(
+            account.git_user_email.as_deref().unwrap_or(""),
+            "git.accounts.git_user_email",
+        )?;
+        accounts_by_alias.insert(
+            alias,
+            GitAccountRuntimeConfig {
+                token,
+                git_user_name,
+                git_user_email,
+            },
+        );
+    }
+
+    let mut repos_by_alias = HashMap::new();
+    for repo in git.repos.as_deref().unwrap_or(&[]) {
+        let alias = normalize_required_string(&repo.alias, "git.repos.alias")?;
+        if repos_by_alias.contains_key(&alias) {
+            return Err(format!("duplicate git repo alias '{}'", alias));
+        }
+        let repo_ref = normalize_required_string(&repo.repo_ref, "git.repos.repo_ref")?;
+        let platform = RepoPlatform::parse(repo.platform.as_deref())
+            .map_err(|e| format!("invalid platform for git.repos alias '{}': {}", alias, e))?;
+        let account_alias = repo.account.as_ref().map(|value| value.trim().to_string());
+        if let Some(account_alias) = account_alias.as_deref() {
+            if account_alias.is_empty() {
+                return Err(format!(
+                    "git.repos alias '{}' has an empty account reference",
+                    alias
+                ));
+            }
+            if !accounts_by_alias.contains_key(account_alias) {
+                return Err(format!(
+                    "git.repos alias '{}' references unknown git account '{}'",
+                    alias, account_alias
+                ));
+            }
+        }
+        let env_repo_name = match repo
+            .env_repo_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => value.to_string(),
+            None => alias.clone(),
+        };
+        let push_url = repo
+            .push_url
+            .as_deref()
+            .map(|value| resolve_push_url(config_path, value))
+            .transpose()?;
+
+        repos_by_alias.insert(
+            alias,
+            RepoRuntimeConfig {
+                repo_ref,
+                platform,
+                account_alias,
+                env_repo_name,
+                github: RepoGitHubRuntimeConfig {
+                    repo_owner: repo.repo_owner.clone(),
+                    repo_name: repo.repo_name.clone(),
+                    base_branch: repo.base_branch.clone(),
+                    branch_prefix: repo
+                        .branch_prefix
+                        .clone()
+                        .unwrap_or_else(|| "openoman".to_string()),
+                    api_base_url: repo
+                        .api_base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.github.com".to_string()),
+                    push_url,
+                },
+            },
+        );
+    }
+
+    Ok(RepoCatalogRuntimeConfig {
+        repos_by_alias,
+        accounts_by_alias,
+    })
+}
+
+fn resolve_generic_token(token_env: Option<&str>, token: Option<String>) -> Option<String> {
+    if let Some(token_env) = token_env.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Ok(value) = env::var(token_env) {
+            if !value.trim().is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    token.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn normalize_required_string(raw: &str, field_name: &str) -> Result<String, String> {
+    let normalized = raw.trim();
+    if normalized.is_empty() {
+        return Err(format!("{field_name} must not be empty"));
+    }
+    Ok(normalized.to_string())
 }
 
 fn load_publishing_config(
@@ -1454,5 +1818,187 @@ github_token_env = "github_pat_example123"
         let loaded = AppConfig::load(&config_path).expect("load config");
         let publishing = loaded.publishing.expect("publishing config");
         assert_eq!(publishing.token.as_deref(), Some("github_pat_example123"));
+    }
+
+    #[test]
+    fn app_config_resolves_repo_alias_and_env_overlay_dir() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::create_dir_all(temp.path().join("env_for_repo/demo")).expect("create env dir");
+        fs::write(temp.path().join("env_for_repo/demo/.env"), "DEMO=1\n").expect("write env");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+env_for_repo_dir = "./env_for_repo"
+
+[[git.accounts]]
+alias = "demo-account"
+token = "github_pat_demo_token"
+git_user_name = "Repo Bot"
+git_user_email = "repo-bot@example.test"
+
+[[git.repos]]
+alias = "demo"
+repo_ref = "https://github.com/acme/demo.git"
+platform = "github"
+account = "demo-account"
+repo_owner = "acme"
+repo_name = "demo"
+
+[sandbox]
+backend = "process"
+runtime_dir = "./workspaces/sandboxes"
+host_risk_posture = "already_isolated"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+
+        let resolved = loaded.resolve_submit_repo("demo").expect("resolve alias");
+        assert_eq!(resolved.repo_ref, "https://github.com/acme/demo.git");
+        assert_eq!(resolved.repo_alias.as_deref(), Some("demo"));
+
+        let fallback = loaded
+            .resolve_submit_repo("https://github.com/acme/raw.git")
+            .expect("resolve raw repo");
+        assert_eq!(fallback.repo_ref, "https://github.com/acme/raw.git");
+        assert!(fallback.repo_alias.is_none());
+
+        let overlay = loaded
+            .env_overlay_dir_for_alias(Some("demo"))
+            .expect("overlay path");
+        assert_eq!(overlay, temp.path().join("env_for_repo/demo"));
+    }
+
+    #[test]
+    fn app_config_publish_plan_uses_repo_account_identity_for_github_alias() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[[git.accounts]]
+alias = "demo-account"
+token = "github_pat_demo_token"
+git_user_name = "Repo Bot"
+git_user_email = "repo-bot@example.test"
+
+[[git.repos]]
+alias = "demo"
+repo_ref = "https://github.com/acme/demo.git"
+platform = "github"
+account = "demo-account"
+repo_owner = "acme"
+repo_name = "demo"
+api_base_url = "https://api.github.com"
+branch_prefix = "openoman"
+
+[sandbox]
+backend = "process"
+runtime_dir = "./workspaces/sandboxes"
+host_risk_posture = "already_isolated"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        let revision = Revision::new("main").expect("revision");
+        let plan = loaded
+            .resolve_publish_plan_for_job(Some("demo"), &revision)
+            .expect("publish plan");
+        let PublishRuntimePlan::GitHub(github) = plan else {
+            panic!("expected github publish plan");
+        };
+
+        assert_eq!(github.repo_owner, "acme");
+        assert_eq!(github.repo_name, "demo");
+        assert_eq!(github.base_branch, "main");
+        assert_eq!(github.token, "github_pat_demo_token");
+        assert_eq!(github.git_user_name, "Repo Bot");
+        assert_eq!(github.git_user_email, "repo-bot@example.test");
+    }
+
+    #[test]
+    fn app_config_publish_plan_skips_non_github_or_missing_token_with_warning() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[[git.accounts]]
+alias = "gitlab-account"
+git_user_name = "Repo Bot"
+git_user_email = "repo-bot@example.test"
+
+[[git.repos]]
+alias = "gitlab-repo"
+repo_ref = "https://gitlab.example.test/group/project.git"
+platform = "gitlab"
+account = "gitlab-account"
+
+[[git.repos]]
+alias = "github-no-token"
+repo_ref = "https://github.com/acme/demo.git"
+platform = "github"
+account = "gitlab-account"
+repo_owner = "acme"
+repo_name = "demo"
+
+[sandbox]
+backend = "process"
+runtime_dir = "./workspaces/sandboxes"
+host_risk_posture = "already_isolated"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        let revision = Revision::new("main").expect("revision");
+
+        let gitlab_plan = loaded
+            .resolve_publish_plan_for_job(Some("gitlab-repo"), &revision)
+            .expect("publish plan");
+        let PublishRuntimePlan::SkipWithWarning(gitlab_warning) = gitlab_plan else {
+            panic!("expected warning for non-github repo");
+        };
+        assert!(gitlab_warning.contains("only publishes GitHub"));
+
+        let missing_token_plan = loaded
+            .resolve_publish_plan_for_job(Some("github-no-token"), &revision)
+            .expect("publish plan");
+        let PublishRuntimePlan::SkipWithWarning(missing_token_warning) = missing_token_plan else {
+            panic!("expected warning for missing token");
+        };
+        assert!(missing_token_warning.contains("no token"));
     }
 }

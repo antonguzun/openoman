@@ -6,7 +6,7 @@ use std::{
 
 use clap::Parser;
 use openoman_core::{
-    application::{RunJobArtifactLimits, RunJobError, RunJobUseCase},
+    application::{PublishExecutionPlan, RunJobArtifactLimits, RunJobError, RunJobUseCase},
     domain::{
         job::{Job, JobId, JobState, RepoRef, Revision},
         plugin::{CheckProfile, PublishPolicy},
@@ -18,7 +18,9 @@ use openoman_core::{
 
 use crate::{
     cli::{Cli, Commands},
-    config::{ensure_network_privileges, resolve_agent_execution_spec, AppConfig},
+    config::{
+        ensure_network_privileges, resolve_agent_execution_spec, AppConfig, PublishRuntimePlan,
+    },
     internal::run_internal,
 };
 
@@ -76,6 +78,7 @@ fn dispatch_command(command: Commands, context: RuntimeContext) -> Result<(), St
             check_profile,
             publish_policy,
         } => run_submit(
+            &context.config,
             &context.store,
             repo,
             revision,
@@ -98,6 +101,7 @@ fn dispatch_command(command: Commands, context: RuntimeContext) -> Result<(), St
 }
 
 fn run_submit(
+    config: &AppConfig,
     store: &SqliteStore,
     repo: String,
     revision: String,
@@ -106,7 +110,8 @@ fn run_submit(
     publish_policy: String,
 ) -> Result<(), String> {
     let id = JobId::new(generate_job_id()).map_err(|e| e.to_string())?;
-    let repo_ref = RepoRef::new(repo).map_err(|e| e.to_string())?;
+    let resolved_repo = config.resolve_submit_repo(&repo)?;
+    let repo_ref = RepoRef::new(resolved_repo.repo_ref).map_err(|e| e.to_string())?;
     let revision = Revision::new(revision).map_err(|e| e.to_string())?;
     let check_profile = CheckProfile::new(check_profile).map_err(|e| e.to_string())?;
     let publish_policy = PublishPolicy::parse(&publish_policy).map_err(|e| e.to_string())?;
@@ -114,6 +119,7 @@ fn run_submit(
     let (job, event) = Job::submit(
         id,
         repo_ref,
+        resolved_repo.repo_alias,
         revision,
         instruction,
         check_profile,
@@ -143,13 +149,18 @@ fn run_job(
 ) -> Result<(), String> {
     ensure_network_privileges(&config.execution)?;
     let job_id = JobId::new(job_id).map_err(|e| e.to_string())?;
+    let Some(submitted_job) = store.jobs().load(&job_id).map_err(|e| e.to_string())? else {
+        return Err(format!("job not found: {}", job_id.as_str()));
+    };
     let agent_execution = resolve_agent_execution_spec(&config.agent)?;
+    let repo_env_source_dir = config.env_overlay_dir_for_alias(submitted_job.repo_alias.as_deref());
     let run_job = RunJobUseCase::new(
         store.clone(),
         GitAdapter::new(&config.trusted_workspace_dir),
         execution_backend,
         config.execution.limits.clone(),
         agent_execution,
+        repo_env_source_dir,
         RunJobArtifactLimits {
             log_limit_bytes: LOG_LIMIT_BYTES,
             report_limit_bytes: REPORT_LIMIT_BYTES,
@@ -158,12 +169,15 @@ fn run_job(
     );
     let outcome = run_job
         .run(&job_id, |job| {
-            config
-                .publishing
-                .as_ref()
-                .map(|publishing| publishing.github_config_for_job(&job.revision))
-                .transpose()
-                .map_err(RunJobError::Message)
+            let resolved = config
+                .resolve_publish_plan_for_job(job.repo_alias.as_deref(), &job.revision)
+                .map_err(RunJobError::Message)?;
+            match resolved {
+                PublishRuntimePlan::GitHub(config) => Ok(PublishExecutionPlan::GitHub(config)),
+                PublishRuntimePlan::SkipWithWarning(warning) => {
+                    Ok(PublishExecutionPlan::SkipWithWarning(warning))
+                }
+            }
         })
         .map_err(|e| e.to_string())?;
 
@@ -172,6 +186,9 @@ fn run_job(
             print_sandbox_logs_to_stderr(logs_path);
         }
         return Err(reason);
+    }
+    if let Some(warning) = outcome.publish_warning.as_deref() {
+        println!("publish_warning={warning}");
     }
 
     println!(
@@ -265,6 +282,9 @@ fn run_result(store: &SqliteStore, job_id: &str) -> Result<(), String> {
         println!("branch={}", publish_result.branch_name);
         println!("pull_request_number={}", publish_result.pull_request_number);
         println!("pull_request_url={}", publish_result.pull_request_url);
+    }
+    if let Some(warning) = &job.publish_warning {
+        println!("publish_warning={warning}");
     }
     Ok(())
 }

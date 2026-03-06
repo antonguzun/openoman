@@ -16,6 +16,8 @@ pub struct GitHubPublisherConfig {
     pub push_url: String,
     pub token: String,
     pub curl_bin: String,
+    pub git_user_name: String,
+    pub git_user_email: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,7 +68,7 @@ impl GitHubPublisher {
             vec![
                 OsStr::new("config"),
                 OsStr::new("user.name"),
-                OsStr::new("OpenOMAN"),
+                OsStr::new(&self.config.git_user_name),
             ],
         )?;
         run_git(
@@ -74,7 +76,7 @@ impl GitHubPublisher {
             vec![
                 OsStr::new("config"),
                 OsStr::new("user.email"),
-                OsStr::new("openoman@openoman.invalid"),
+                OsStr::new(&self.config.git_user_email),
             ],
         )?;
         if !worktree_has_changes(trusted_clone_dir)? {
@@ -481,6 +483,8 @@ mod tests {
             push_url: bare_remote.display().to_string(),
             token: "test-token".to_string(),
             curl_bin: curl_bin.display().to_string(),
+            git_user_name: "Repo Bot".to_string(),
+            git_user_email: "repo-bot@example.test".to_string(),
         });
 
         let published = publisher
@@ -512,6 +516,18 @@ mod tests {
             ],
         );
         assert!(!remote_head.trim().is_empty());
+        let author = git_stdout(
+            temp.path(),
+            [
+                OsStr::new("--git-dir"),
+                bare_remote.as_os_str(),
+                OsStr::new("show"),
+                OsStr::new("-s"),
+                OsStr::new("--format=%an <%ae>"),
+                OsStr::new("refs/heads/openoman/job-publish"),
+            ],
+        );
+        assert_eq!(author, "Repo Bot <repo-bot@example.test>");
 
         let curl_invocation = fs::read_to_string(&curl_log).expect("curl log");
         let curl_request_body = fs::read_to_string(&curl_body).expect("curl body");

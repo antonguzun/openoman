@@ -32,7 +32,8 @@ If the hook reports a false positive, narrow the allowlist in `.gitleaks.toml` d
 
 The `openoman` binary provides a minimal local workflow against SQLite:
 
-- `openoman --config ./config.toml submit --repo github.com/acme/repo --revision main`
+- `openoman --config ./config.toml submit --repo kickfoss --revision main --instruction "update README"`
+- `openoman --config ./config.toml submit --repo https://github.com/acme/repo.git --revision main --instruction "update README"`
 - `openoman --config ./config.toml status <job_id>`
 - `openoman --config ./config.toml run <job_id>`
 - `openoman --config ./config.toml logs <job_id>`
@@ -41,7 +42,7 @@ The `openoman` binary provides a minimal local workflow against SQLite:
 
 Configuration is loaded from `--config` and can be overridden with `OPENOMAN_DATABASE_PATH`.
 
-When a submitted job uses `--publish-policy on_validation_success`, `run` now applies the canonical patch to the trusted clone, pushes a branch named `openoman/<job_id>` by default, opens a GitHub pull request, stores the branch plus PR metadata on the job, and emits a `job.pr_created` outbox event. `result <job_id>` prints the stored branch name, pull request number, and pull request URL when publishing succeeded.
+When a submitted job uses `--publish-policy on_validation_success`, `run` applies the canonical patch to the trusted clone and either publishes (GitHub aliases with token) or records `publish_warning=...` and skips publishing (non-GitHub aliases or missing token). `result <job_id>` prints stored branch/PR metadata when publishing succeeded, and prints `publish_warning` when publishing was skipped intentionally.
 
 Startup now validates the configured sandbox backend before any command runs. With the default Firecracker backend, `openoman` will fail fast if required host dependencies such as `firecracker`, `/dev/kvm`, or the configured guest asset paths are unavailable.
 
@@ -82,34 +83,48 @@ Guest asset notes:
 - rootfs-only build helper: [guest/build-rootfs.sh](/home/antonguzun/Work/personal/openoman/guest/build-rootfs.sh)
 - guest contract documentation: [guest/README.md](/home/antonguzun/Work/personal/openoman/guest/README.md)
 
+## Repository aliases and accounts
+
+Repository config now supports many repositories, each with its own platform/account binding under `[git]`:
+
+- `[[git.accounts]]` defines reusable publish credentials and trusted commit identity (`git_user_name`, `git_user_email`)
+- `[[git.repos]]` defines repository alias, `repo_ref`, `platform`, optional `env_repo_name`, and GitHub publish metadata
+- `submit --repo <value>` resolves `<value>` as alias first, then falls back to raw repo refs/paths
+- `env_for_repo_dir` defaults to `./env_for_repo`; if `./env_for_repo/<env_repo_name>` exists, its files are copied into sandbox workspace root for that job
+
+Alias-based jobs persist `repo_alias`, so publish/account behavior and env overlays remain deterministic at `run` time.
+
 ## Core Git workspace preparation (Epic 4)
 
-`openoman-core` now includes a trusted `GitAdapter` that can:
+`openoman-core` includes a trusted `GitAdapter` that can:
 
 - clone a repository into a trusted workspace directory
 - checkout a branch name or commit SHA
-- export a sandbox workspace copy without `.git` metadata
+- export a sandbox workspace copy with sanitized `.git` metadata
+- apply optional per-repo env file overlays into sandbox workspace root
 
 See `crates/core/src/git.rs` for the adapter API and tests.
 
 ## GitHub publishing (Epic 9)
 
-Publishing is configured in the trusted host config under `[publishing]`:
+Preferred publishing config is repo-scoped under `[[git.repos]]` + `[[git.accounts]]`:
 
-- `provider = "github"`
+- `platform = "github"` enables trusted GitHub publish planning for that alias
 - `repo_owner` and `repo_name` select the GitHub repository for pull request creation
 - `base_branch` is optional and otherwise defaults to the submitted revision
 - `branch_prefix` defaults to `openoman`
 - `api_base_url` defaults to `https://api.github.com`
 - `push_url` is optional and otherwise defaults to `https://github.com/<owner>/<repo>.git`
-- `github_token_env` or `github_token` supplies the GitHub token used only by the trusted core
-- `curl_bin` defaults to `curl`
+- bound account token comes from `[[git.accounts]].token` or `token_env`
+- trusted commits use bound account identity (`git_user_name`, `git_user_email`)
 
-`github_token_env` is not a GitHub-provided variable name. It is the environment variable name that OpenOMAN should read on your machine. For example:
+Legacy fallback publishing via `[publishing]` still works for raw non-alias `submit --repo ...` flows.
 
-- config: `github_token_env = "OPENOMAN_GITHUB_TOKEN"`
+For account `token_env`, use a local environment variable name. Example:
+
+- config: `token_env = "OPENOMAN_GITHUB_TOKEN"`
 - shell: `export OPENOMAN_GITHUB_TOKEN=ghp_...`
 
 To create the token itself, use GitHub Settings -> Developer settings -> Personal access tokens. Official GitHub docs: https://docs.github.com/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
 
-If a job uses `--publish-policy never`, the trusted publish step is skipped and `result <job_id>` remains a plain success/failure summary without PR metadata.
+If a job uses `--publish-policy never`, the trusted publish step is skipped. If a job uses `--publish-policy on_validation_success` but publish prerequisites are missing for the alias, the job still succeeds and `result <job_id>` includes `publish_warning=...`.
