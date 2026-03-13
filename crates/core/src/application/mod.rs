@@ -13,6 +13,7 @@ use crate::{
     },
     git::{write_canonical_patch, GitAdapter, PreparedWorkspace},
     github::{GitHubPublisher, GitHubPublisherConfig},
+    gitlab::{GitLabPublisher, GitLabPublisherConfig},
     persistence::{NewArtifactRecord, NewOutboxEvent, OutboxStatus, SqliteStore},
 };
 
@@ -53,6 +54,7 @@ pub enum RunJobError {
 #[derive(Debug, Clone)]
 pub enum PublishExecutionPlan {
     GitHub(GitHubPublisherConfig),
+    GitLab(GitLabPublisherConfig),
     SkipWithWarning(String),
 }
 
@@ -375,6 +377,45 @@ where
                         )
                     })?;
                 let publisher = GitHubPublisher::new(publishing);
+                let published = publisher
+                    .publish_patch(
+                        job.id.as_str(),
+                        &job.instruction,
+                        &prepared.trusted_clone_dir,
+                        Path::new(&patch_record.path),
+                    )
+                    .map_err(|e| {
+                        RunJobError::Message(format!("failed to publish validated changes: {e}"))
+                    })?;
+                let event = job
+                    .mark_pull_request_created(
+                        published.branch_name.clone(),
+                        published.pull_request_url.clone(),
+                        published.pull_request_number,
+                    )
+                    .map_err(|e| RunJobError::Message(e.to_string()))?;
+                let publish_result = job.publish_result.as_ref().ok_or_else(|| {
+                    RunJobError::Message(
+                        "publish result missing after pull request creation".to_string(),
+                    )
+                })?;
+
+                Ok(Some(build_pull_request_created_outbox_event(
+                    job.id.as_str(),
+                    event.event_type(),
+                    publish_result,
+                )?))
+            }
+            PublishExecutionPlan::GitLab(publishing) => {
+                let patch_record = artifact_records
+                    .iter()
+                    .find(|artifact| artifact.artifact_ref == "sandbox.patch")
+                    .ok_or_else(|| {
+                        RunJobError::Message(
+                            "sandbox.patch artifact is required before publishing".to_string(),
+                        )
+                    })?;
+                let publisher = GitLabPublisher::new(publishing);
                 let published = publisher
                     .publish_patch(
                         job.id.as_str(),

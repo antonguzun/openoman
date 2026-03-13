@@ -38,12 +38,20 @@ branch_prefix = "openoman"
 api_base_url = "https://api.github.com"
 
 [[git.repos]]
-# Clone-only example. on_validation_success will complete with publish_warning because
-# this release only publishes GitHub repositories.
 alias = "internal-gitlab"
 repo_ref = "https://gitlab.example.com/group/project.git"
-platform = "gitlab"
+platform = "gitlab_self_hosted"
 account = "gitlab-work"
+# Optional when inferable from repo_ref/push_url. repo_owner may include subgroup path segments.
+repo_owner = "group"
+repo_name = "project"
+branch_prefix = "openoman"
+# Defaults to https://gitlab.example.com/api/v4 when omitted and the host can be inferred.
+# api_base_url = "https://gitlab.example.com/api/v4"
+# Defaults to https://gitlab.example.com/group/project.git when omitted.
+# push_url = "https://gitlab.example.com/group/project.git"
+# Optional per-repo curl override for trusted publish API calls.
+# curl_bin = "curl"
 
 [sandbox]
 # Virtualization backend used for sandbox attempts.
@@ -112,7 +120,7 @@ egress_allowed_domains = ["api.openai.com"]
 [publishing]
 # Legacy fallback publishing settings used when submitting raw repo refs (non-alias `--repo`).
 # Alias-based repositories should prefer [[git.repos]] + [[git.accounts]] above.
-# Trusted GitHub publishing runs only after validation succeeds.
+# Trusted raw-ref publishing remains GitHub-only and runs only after validation succeeds.
 provider = "github"
 repo_owner = "example"
 repo_name = "example-repo"

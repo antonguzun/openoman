@@ -176,6 +176,7 @@ fn run_job(
                 .map_err(RunJobError::Message)?;
             match resolved {
                 PublishRuntimePlan::GitHub(config) => Ok(PublishExecutionPlan::GitHub(config)),
+                PublishRuntimePlan::GitLab(config) => Ok(PublishExecutionPlan::GitLab(config)),
                 PublishRuntimePlan::SkipWithWarning(warning) => {
                     Ok(PublishExecutionPlan::SkipWithWarning(warning))
                 }

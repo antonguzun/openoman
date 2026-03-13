@@ -4,6 +4,7 @@ pub mod domain;
 pub mod execution;
 pub mod git;
 pub mod github;
+pub mod gitlab;
 pub mod persistence;
 pub mod sandbox;
 

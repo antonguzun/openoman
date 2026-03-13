@@ -756,6 +756,113 @@ fn submit_run_and_result_show_github_publish_metadata() {
 }
 
 #[test]
+fn gitlab_alias_publishes_and_result_prints_merge_request_metadata() {
+    let temp = TempDir::new().expect("tempdir");
+    let fixture_repo = temp.path().join("fixture-repo");
+    let publish_remote = temp.path().join("publish-remote.git");
+    let fake_codex = write_fake_codex(temp.path());
+    let fake_curl = write_fake_gitlab_curl(temp.path());
+    let db_path = temp.path().join("openoman.sqlite");
+    let config_path = temp.path().join("config.toml");
+    init_fixture_repo(&fixture_repo);
+    git(
+        temp.path(),
+        [
+            OsStr::new("clone"),
+            OsStr::new("--bare"),
+            fixture_repo.as_os_str(),
+            publish_remote.as_os_str(),
+        ],
+    );
+    fs::write(
+        &config_path,
+        format!(
+            "[core]\ndatabase_path = \"{}\"\n\n[git]\ntrusted_workspace_dir = \"{}\"\n\n[[git.accounts]]\nalias = \"gitlab-account\"\ntoken = \"glpat-test-token\"\ngit_user_name = \"Repo Bot\"\ngit_user_email = \"repo-bot@example.test\"\n\n[[git.repos]]\nalias = \"gitlab-demo\"\nrepo_ref = \"{}\"\nplatform = \"gitlab_self_hosted\"\naccount = \"gitlab-account\"\nrepo_owner = \"group/subgroup\"\nrepo_name = \"demo\"\npush_url = \"{}\"\napi_base_url = \"https://gitlab.example.test/api/v4\"\ncurl_bin = \"{}\"\nbranch_prefix = \"openoman\"\n\n[sandbox]\nbackend = \"process\"\nhost_risk_posture = \"already_isolated\"\nruntime_dir = \"{}\"\ntimeout_seconds = 30\nmemory_mb = 512\ncpu_cores = 1\n\n[agent]\nprovider = \"codex\"\nbin = \"{}\"\n",
+            db_path.display().to_string().replace('\\', "\\\\"),
+            temp.path()
+                .join("workspaces")
+                .display()
+                .to_string()
+                .replace('\\', "\\\\"),
+            fixture_repo.display().to_string().replace('\\', "\\\\"),
+            publish_remote.display().to_string().replace('\\', "\\\\"),
+            fake_curl.display().to_string().replace('\\', "\\\\"),
+            temp.path()
+                .join("sandbox-runtime")
+                .display()
+                .to_string()
+                .replace('\\', "\\\\"),
+            fake_codex.display().to_string().replace('\\', "\\\\"),
+        ),
+    )
+    .expect("write config");
+
+    let config = config_path.display().to_string();
+    let job_id = submit_job_with_policy(
+        &config,
+        Path::new("gitlab-demo"),
+        "add empty line in readme",
+        "on_validation_success",
+    );
+
+    let mut run = cli_cmd();
+    run.args(["--config", &config, "run", &job_id])
+        .assert()
+        .success()
+        .stdout(format!("job {job_id} finished with state=succeeded\n"));
+
+    let branch_name = format!("openoman/{job_id}");
+    let mut result = cli_cmd();
+    let result_output = result
+        .args(["--config", &config, "result", &job_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result_stdout = String::from_utf8(result_output).expect("utf8 result output");
+    assert!(result_stdout.contains(&format!("job_id={job_id} result=success")));
+    assert!(result_stdout.contains(&format!("branch={branch_name}")));
+    assert!(result_stdout.contains("pull_request_number=17"));
+    assert!(result_stdout.contains(
+        "pull_request_url=https://gitlab.example.test/group/subgroup/demo/-/merge_requests/17"
+    ));
+
+    let remote_branch = git_output(
+        temp.path(),
+        [
+            OsStr::new("--git-dir"),
+            publish_remote.as_os_str(),
+            OsStr::new("rev-parse"),
+            OsStr::new("--verify"),
+            OsStr::new(&format!("refs/heads/{branch_name}")),
+        ],
+    );
+    assert!(!remote_branch.trim().is_empty());
+
+    let store = SqliteStore::open(temp.path().join("openoman.sqlite")).expect("open sqlite store");
+    let outbox_events = store
+        .outbox()
+        .list_by_job(&job_id)
+        .expect("list outbox events");
+    let pr_event = outbox_events
+        .iter()
+        .find(|event| event.event_type == "job.pr_created")
+        .expect("pull request event should exist");
+    assert!(pr_event.payload.contains(&branch_name));
+    assert!(pr_event
+        .payload
+        .contains("https://gitlab.example.test/group/subgroup/demo/-/merge_requests/17"));
+
+    let fake_curl_output =
+        fs::read_to_string(temp.path().join("fake-gitlab-curl.args")).expect("curl args log");
+    assert!(fake_curl_output.contains("PRIVATE-TOKEN: glpat-test-token"));
+    assert!(fake_curl_output.contains(
+        "https://gitlab.example.test/api/v4/projects/group%2Fsubgroup%2Fdemo/merge_requests"
+    ));
+}
+
+#[test]
 fn submit_run_with_relative_config_paths_publishes_successfully() {
     let temp = TempDir::new().expect("tempdir");
     let fixture_repo = temp.path().join("fixture-repo");
@@ -1258,6 +1365,22 @@ printf '{"number":17,"html_url":"https://example.test/pulls/17"}\n201'
     )
     .expect("write fake curl");
     fs::set_permissions(&script_path, PermissionsExt::from_mode(0o755)).expect("chmod fake curl");
+    script_path
+}
+
+fn write_fake_gitlab_curl(root: &Path) -> PathBuf {
+    let script_path = root.join("fake-gitlab-curl.sh");
+    let args_path = root.join("fake-gitlab-curl.args");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/usr/bin/env sh\nset -eu\nargs_path='{}'\n: > \"$args_path\"\nwhile [ \"$#\" -gt 0 ]; do\n  printf '%s\\n' \"$1\" >> \"$args_path\"\n  shift 1\ndone\nprintf '{{\"iid\":17,\"web_url\":\"https://gitlab.example.test/group/subgroup/demo/-/merge_requests/17\"}}\\n201'\n",
+            args_path.display()
+        ),
+    )
+    .expect("write fake gitlab curl");
+    fs::set_permissions(&script_path, PermissionsExt::from_mode(0o755))
+        .expect("chmod fake gitlab curl");
     script_path
 }
 

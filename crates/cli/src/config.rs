@@ -21,6 +21,7 @@ use openoman_core::{
         UserPackageDir,
     },
     github::GitHubPublisherConfig,
+    gitlab::GitLabPublisherConfig,
 };
 use serde::Deserialize;
 
@@ -68,6 +69,7 @@ struct GitRepoConfig {
     branch_prefix: Option<String>,
     api_base_url: Option<String>,
     push_url: Option<String>,
+    curl_bin: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,6 +159,7 @@ pub(crate) struct ResolvedSubmitRepo {
 #[derive(Debug, Clone)]
 pub(crate) enum PublishRuntimePlan {
     GitHub(GitHubPublisherConfig),
+    GitLab(GitLabPublisherConfig),
     SkipWithWarning(String),
 }
 
@@ -172,7 +175,7 @@ struct RepoRuntimeConfig {
     platform: RepoPlatform,
     account_alias: Option<String>,
     env_repo_name: String,
-    github: RepoGitHubRuntimeConfig,
+    publish: RepoPublishRuntimeConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,14 +186,6 @@ enum RepoPlatform {
 }
 
 impl RepoPlatform {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::GitHub => "github",
-            Self::GitLab => "gitlab",
-            Self::GitLabSelfHosted => "gitlab_self_hosted",
-        }
-    }
-
     fn parse(raw: Option<&str>) -> Result<Self, String> {
         let value = raw.unwrap_or("github").trim().to_ascii_lowercase();
         match value.as_str() {
@@ -207,13 +202,14 @@ impl RepoPlatform {
 }
 
 #[derive(Debug, Clone)]
-struct RepoGitHubRuntimeConfig {
+struct RepoPublishRuntimeConfig {
     repo_owner: Option<String>,
     repo_name: Option<String>,
     base_branch: Option<String>,
     branch_prefix: String,
-    api_base_url: String,
+    api_base_url: Option<String>,
     push_url: Option<String>,
+    curl_bin: String,
 }
 
 #[derive(Debug, Clone)]
@@ -388,9 +384,6 @@ impl AppConfig {
     pub(crate) fn resolve_clone_token_for_job(&self, repo_alias: Option<&str>) -> Option<String> {
         if let Some(alias) = repo_alias {
             let repo = self.repo_catalog.repos_by_alias.get(alias)?;
-            if repo.platform != RepoPlatform::GitHub {
-                return None;
-            }
             let account_alias = repo.account_alias.as_deref()?;
             let account = self.repo_catalog.accounts_by_alias.get(account_alias)?;
             return account.token.clone();
@@ -422,14 +415,6 @@ impl AppConfig {
                 )));
             };
 
-            if repo.platform != RepoPlatform::GitHub {
-                return Ok(PublishRuntimePlan::SkipWithWarning(format!(
-                    "publishing skipped: repo alias '{}' uses platform '{}' and this release only publishes GitHub repositories",
-                    alias,
-                    repo.platform.as_str()
-                )));
-            }
-
             let Some(account_alias) = repo.account_alias.as_deref() else {
                 return Ok(PublishRuntimePlan::SkipWithWarning(format!(
                     "publishing skipped: repo alias '{}' has no bound git account",
@@ -448,53 +433,134 @@ impl AppConfig {
                     account_alias
                 )));
             };
-            let inferred_repo =
-                infer_github_repo_identity(repo.github.push_url.as_deref(), Some(&repo.repo_ref));
-            let repo_owner = repo
-                .github
-                .repo_owner
-                .clone()
-                .or_else(|| inferred_repo.as_ref().map(|inferred| inferred.owner.clone()))
-                .ok_or_else(|| {
-                    format!(
-                        "git.repos alias '{}' is missing repo_owner and it could not be inferred from repo_ref/push_url; set repo_owner explicitly",
-                        alias
-                    )
-                })?;
-            let repo_name = repo
-                .github
-                .repo_name
-                .clone()
-                .or_else(|| inferred_repo.as_ref().map(|inferred| inferred.name.clone()))
-                .ok_or_else(|| {
-                    format!(
-                        "git.repos alias '{}' is missing repo_name and it could not be inferred from repo_ref/push_url; set repo_name explicitly",
-                        alias
-                    )
-                })?;
             let base_branch = repo
-                .github
+                .publish
                 .base_branch
                 .clone()
                 .unwrap_or_else(|| revision.as_str().to_string());
-            let push_url = repo
-                .github
-                .push_url
-                .clone()
-                .unwrap_or_else(|| format!("https://github.com/{repo_owner}/{repo_name}.git"));
 
-            return Ok(PublishRuntimePlan::GitHub(GitHubPublisherConfig {
-                api_base_url: repo.github.api_base_url.clone(),
-                repo_owner,
-                repo_name,
-                base_branch,
-                branch_prefix: repo.github.branch_prefix.clone(),
-                push_url,
-                token,
-                curl_bin: "curl".to_string(),
-                git_user_name: account.git_user_name.clone(),
-                git_user_email: account.git_user_email.clone(),
-            }));
+            return match repo.platform {
+                RepoPlatform::GitHub => {
+                    let inferred_repo = infer_github_repo_identity(
+                        repo.publish.push_url.as_deref(),
+                        Some(&repo.repo_ref),
+                    );
+                    let repo_owner = repo
+                        .publish
+                        .repo_owner
+                        .clone()
+                        .or_else(|| inferred_repo.as_ref().map(|inferred| inferred.owner.clone()))
+                        .ok_or_else(|| {
+                            format!(
+                                "git.repos alias '{}' is missing repo_owner and it could not be inferred from repo_ref/push_url; set repo_owner explicitly",
+                                alias
+                            )
+                        })?;
+                    let repo_name = repo
+                        .publish
+                        .repo_name
+                        .clone()
+                        .or_else(|| inferred_repo.as_ref().map(|inferred| inferred.name.clone()))
+                        .ok_or_else(|| {
+                            format!(
+                                "git.repos alias '{}' is missing repo_name and it could not be inferred from repo_ref/push_url; set repo_name explicitly",
+                                alias
+                            )
+                        })?;
+                    let push_url = repo.publish.push_url.clone().unwrap_or_else(|| {
+                        format!("https://github.com/{repo_owner}/{repo_name}.git")
+                    });
+
+                    Ok(PublishRuntimePlan::GitHub(GitHubPublisherConfig {
+                        api_base_url: repo
+                            .publish
+                            .api_base_url
+                            .clone()
+                            .unwrap_or_else(|| "https://api.github.com".to_string()),
+                        repo_owner,
+                        repo_name,
+                        base_branch,
+                        branch_prefix: repo.publish.branch_prefix.clone(),
+                        push_url,
+                        token,
+                        curl_bin: repo.publish.curl_bin.clone(),
+                        git_user_name: account.git_user_name.clone(),
+                        git_user_email: account.git_user_email.clone(),
+                    }))
+                }
+                RepoPlatform::GitLab | RepoPlatform::GitLabSelfHosted => {
+                    let explicit_project_path = repo
+                        .publish
+                        .repo_owner
+                        .as_ref()
+                        .zip(repo.publish.repo_name.as_ref())
+                        .map(|(owner, name)| {
+                            format!("{}/{}", owner.trim_matches('/'), name.trim_matches('/'))
+                        });
+                    let inferred_project = infer_gitlab_project_identity(
+                        repo.publish.push_url.as_deref(),
+                        Some(&repo.repo_ref),
+                    )
+                    .map(|identity| identity.project_path);
+                    let project_path = explicit_project_path
+                        .or(inferred_project)
+                        .ok_or_else(|| {
+                            format!(
+                                "git.repos alias '{}' is missing repo_owner/repo_name and the GitLab project path could not be inferred from repo_ref/push_url; set repo_owner and repo_name explicitly",
+                                alias
+                            )
+                        })?;
+                    let inferred_host = infer_git_remote_location(
+                        repo.publish.push_url.as_deref(),
+                        Some(&repo.repo_ref),
+                    )
+                    .map(|location| location.host);
+                    let api_base_url = match repo.publish.api_base_url.clone() {
+                        Some(value) => value,
+                        None => match repo.platform {
+                            RepoPlatform::GitLab => "https://gitlab.com/api/v4".to_string(),
+                            RepoPlatform::GitLabSelfHosted => {
+                                let host = inferred_host.clone().ok_or_else(|| {
+                                    format!(
+                                        "git.repos alias '{}' is missing api_base_url and the GitLab host could not be inferred from repo_ref/push_url; set api_base_url explicitly",
+                                        alias
+                                    )
+                                })?;
+                                format!("https://{host}/api/v4")
+                            }
+                            RepoPlatform::GitHub => unreachable!("github handled above"),
+                        },
+                    };
+                    let push_url = match repo.publish.push_url.clone() {
+                        Some(push_url) => push_url,
+                        None => {
+                            let host = match repo.platform {
+                                RepoPlatform::GitLab => "gitlab.com".to_string(),
+                                RepoPlatform::GitLabSelfHosted => inferred_host.ok_or_else(|| {
+                                    format!(
+                                        "git.repos alias '{}' is missing push_url and the GitLab host could not be inferred from repo_ref/push_url; set push_url explicitly",
+                                        alias
+                                    )
+                                })?,
+                                RepoPlatform::GitHub => unreachable!("github handled above"),
+                            };
+                            format!("https://{host}/{project_path}.git")
+                        }
+                    };
+
+                    Ok(PublishRuntimePlan::GitLab(GitLabPublisherConfig {
+                        api_base_url,
+                        project_path,
+                        base_branch,
+                        branch_prefix: repo.publish.branch_prefix.clone(),
+                        push_url,
+                        token,
+                        curl_bin: repo.publish.curl_bin.clone(),
+                        git_user_name: account.git_user_name.clone(),
+                        git_user_email: account.git_user_email.clone(),
+                    }))
+                }
+            };
         }
 
         let legacy = self.publishing.as_ref().ok_or_else(|| {
@@ -738,7 +804,7 @@ fn load_repo_catalog_config(
                 platform,
                 account_alias,
                 env_repo_name,
-                github: RepoGitHubRuntimeConfig {
+                publish: RepoPublishRuntimeConfig {
                     repo_owner: repo.repo_owner.clone(),
                     repo_name: repo.repo_name.clone(),
                     base_branch: repo.base_branch.clone(),
@@ -746,11 +812,9 @@ fn load_repo_catalog_config(
                         .branch_prefix
                         .clone()
                         .unwrap_or_else(|| "openoman".to_string()),
-                    api_base_url: repo
-                        .api_base_url
-                        .clone()
-                        .unwrap_or_else(|| "https://api.github.com".to_string()),
+                    api_base_url: repo.api_base_url.clone(),
                     push_url,
+                    curl_bin: repo.curl_bin.clone().unwrap_or_else(|| "curl".to_string()),
                 },
             },
         );
@@ -787,6 +851,17 @@ fn resolve_generic_token(token_env: Option<&str>, token: Option<String>) -> Opti
 struct GitHubRepoIdentity {
     owner: String,
     name: String,
+}
+
+#[derive(Debug, Clone)]
+struct GitLabProjectIdentity {
+    project_path: String,
+}
+
+#[derive(Debug, Clone)]
+struct GitRemoteLocation {
+    host: String,
+    path: String,
 }
 
 fn infer_github_repo_identity(
@@ -848,6 +923,123 @@ fn parse_github_repo_identity_from_path(raw_path: &str) -> Option<GitHubRepoIden
         owner: owner.to_string(),
         name: repo_name.to_string(),
     })
+}
+
+fn infer_gitlab_project_identity(
+    push_url: Option<&str>,
+    repo_ref: Option<&str>,
+) -> Option<GitLabProjectIdentity> {
+    if let Some(identity) = push_url.and_then(parse_gitlab_project_identity_from_git_ref) {
+        return Some(identity);
+    }
+    repo_ref.and_then(parse_gitlab_project_identity_from_git_ref)
+}
+
+fn parse_gitlab_project_identity_from_git_ref(raw_ref: &str) -> Option<GitLabProjectIdentity> {
+    let location = parse_git_remote_location(raw_ref)?;
+    parse_gitlab_project_identity_from_path(&location.path)
+}
+
+fn parse_gitlab_project_identity_from_path(raw_path: &str) -> Option<GitLabProjectIdentity> {
+    let path_without_fragment = raw_path
+        .split_once('#')
+        .map(|(value, _)| value)
+        .unwrap_or(raw_path);
+    let path_without_query = path_without_fragment
+        .split_once('?')
+        .map(|(value, _)| value)
+        .unwrap_or(path_without_fragment);
+
+    let segments = path_without_query
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() < 2 {
+        return None;
+    }
+
+    let mut normalized = Vec::with_capacity(segments.len());
+    for (index, segment) in segments.iter().enumerate() {
+        let trimmed = if index == segments.len() - 1 {
+            segment.trim_end_matches(".git")
+        } else {
+            segment.trim()
+        };
+        if trimmed.is_empty() {
+            return None;
+        }
+        normalized.push(trimmed);
+    }
+
+    Some(GitLabProjectIdentity {
+        project_path: normalized.join("/"),
+    })
+}
+
+fn infer_git_remote_location(
+    push_url: Option<&str>,
+    repo_ref: Option<&str>,
+) -> Option<GitRemoteLocation> {
+    if let Some(location) = push_url.and_then(parse_git_remote_location) {
+        return Some(location);
+    }
+    repo_ref.and_then(parse_git_remote_location)
+}
+
+fn parse_git_remote_location(raw_ref: &str) -> Option<GitRemoteLocation> {
+    let candidate = raw_ref.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+
+    if let Some((scheme, remainder)) = candidate.split_once("://") {
+        if scheme.is_empty() {
+            return None;
+        }
+        let (authority, path) = remainder.split_once('/')?;
+        let host = normalize_remote_authority(authority)?;
+        return Some(GitRemoteLocation {
+            host,
+            path: path.to_string(),
+        });
+    }
+
+    if let Some((left, right)) = candidate.split_once(':') {
+        if !left.is_empty() && !left.contains('/') {
+            let host = left
+                .rsplit_once('@')
+                .map(|(_, host)| host)
+                .unwrap_or(left)
+                .trim();
+            if host.is_empty() {
+                return None;
+            }
+            return Some(GitRemoteLocation {
+                host: host.to_string(),
+                path: right.to_string(),
+            });
+        }
+    }
+
+    None
+}
+
+fn normalize_remote_authority(authority: &str) -> Option<String> {
+    let trimmed = authority.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_user = trimmed
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(trimmed);
+    let without_path = without_user.trim_matches('/');
+    if without_path.is_empty() {
+        None
+    } else {
+        Some(without_path.to_string())
+    }
 }
 
 fn normalize_required_string(raw: &str, field_name: &str) -> Result<String, String> {
@@ -1973,6 +2165,52 @@ bin = "/usr/local/bin/codex"
     }
 
     #[test]
+    fn app_config_resolves_clone_token_for_gitlab_alias() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[[git.accounts]]
+alias = "gitlab-account"
+token = "glpat-example123"
+git_user_name = "Repo Bot"
+git_user_email = "repo-bot@example.test"
+
+[[git.repos]]
+alias = "gitlab-demo"
+repo_ref = "https://gitlab.com/group/demo.git"
+platform = "gitlab"
+account = "gitlab-account"
+
+[sandbox]
+backend = "process"
+runtime_dir = "./workspaces/sandboxes"
+host_risk_posture = "already_isolated"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        assert_eq!(
+            loaded
+                .resolve_clone_token_for_job(Some("gitlab-demo"))
+                .as_deref(),
+            Some("glpat-example123")
+        );
+    }
+
+    #[test]
     fn app_config_clone_token_for_raw_jobs_falls_back_to_legacy_publishing_token() {
         let temp = TempDir::new().expect("tempdir");
         let config_path = temp.path().join("config.toml");
@@ -2240,7 +2478,7 @@ bin = "/usr/local/bin/codex"
     }
 
     #[test]
-    fn app_config_publish_plan_skips_non_github_or_missing_token_with_warning() {
+    fn app_config_publish_plan_resolves_gitlab_cloud_and_missing_token_warning() {
         let temp = TempDir::new().expect("tempdir");
         let config_path = temp.path().join("config.toml");
         fs::write(
@@ -2254,6 +2492,7 @@ trusted_workspace_dir = "./workspaces/trusted"
 
 [[git.accounts]]
 alias = "gitlab-account"
+token = "glpat-example123"
 git_user_name = "Repo Bot"
 git_user_email = "repo-bot@example.test"
 
@@ -2263,11 +2502,16 @@ repo_ref = "https://gitlab.example.test/group/project.git"
 platform = "gitlab"
 account = "gitlab-account"
 
+[[git.accounts]]
+alias = "missing-token-account"
+git_user_name = "Repo Bot"
+git_user_email = "repo-bot@example.test"
+
 [[git.repos]]
 alias = "github-no-token"
 repo_ref = "https://github.com/acme/demo.git"
 platform = "github"
-account = "gitlab-account"
+account = "missing-token-account"
 repo_owner = "acme"
 repo_name = "demo"
 
@@ -2289,10 +2533,16 @@ bin = "/usr/local/bin/codex"
         let gitlab_plan = loaded
             .resolve_publish_plan_for_job(Some("gitlab-repo"), &revision)
             .expect("publish plan");
-        let PublishRuntimePlan::SkipWithWarning(gitlab_warning) = gitlab_plan else {
-            panic!("expected warning for non-github repo");
+        let PublishRuntimePlan::GitLab(gitlab) = gitlab_plan else {
+            panic!("expected gitlab publish plan");
         };
-        assert!(gitlab_warning.contains("only publishes GitHub"));
+        assert_eq!(gitlab.api_base_url, "https://gitlab.com/api/v4");
+        assert_eq!(gitlab.project_path, "group/project");
+        assert_eq!(
+            gitlab.push_url,
+            "https://gitlab.example.test/group/project.git"
+        );
+        assert_eq!(gitlab.token, "glpat-example123");
 
         let missing_token_plan = loaded
             .resolve_publish_plan_for_job(Some("github-no-token"), &revision)
@@ -2301,5 +2551,60 @@ bin = "/usr/local/bin/codex"
             panic!("expected warning for missing token");
         };
         assert!(missing_token_warning.contains("no token"));
+    }
+
+    #[test]
+    fn app_config_publish_plan_resolves_gitlab_self_hosted_repo() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[[git.accounts]]
+alias = "gitlab-account"
+token = "glpat-example123"
+git_user_name = "Repo Bot"
+git_user_email = "repo-bot@example.test"
+
+[[git.repos]]
+alias = "gitlab-self-hosted"
+repo_ref = "https://gitlab.example.test/group/subgroup/project.git"
+platform = "gitlab_self_hosted"
+account = "gitlab-account"
+
+[sandbox]
+backend = "process"
+runtime_dir = "./workspaces/sandboxes"
+host_risk_posture = "already_isolated"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        let revision = Revision::new("main").expect("revision");
+        let plan = loaded
+            .resolve_publish_plan_for_job(Some("gitlab-self-hosted"), &revision)
+            .expect("publish plan");
+        let PublishRuntimePlan::GitLab(gitlab) = plan else {
+            panic!("expected gitlab publish plan");
+        };
+
+        assert_eq!(gitlab.api_base_url, "https://gitlab.example.test/api/v4");
+        assert_eq!(gitlab.project_path, "group/subgroup/project");
+        assert_eq!(
+            gitlab.push_url,
+            "https://gitlab.example.test/group/subgroup/project.git"
+        );
+        assert_eq!(gitlab.base_branch, "main");
     }
 }
