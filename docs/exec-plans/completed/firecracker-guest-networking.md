@@ -89,7 +89,7 @@ For a manual repro once `sudo` credentials are available:
 
     env PATH=$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin \
     ./target/debug/openoman submit \
-      --repo git@github.com:antonguzun/kickfoss.git \
+      --repo git@github.com:antonguzun/my_repo.git \
       --revision main \
       --instruction 'add 12345 into end of README'
 

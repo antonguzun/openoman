@@ -2,11 +2,18 @@
 # Path to SQLite database file used by the core service.
 database_path = "./data/openoman.db"
 
+[server]
+# HTTP control plane bind address and optional bearer token auth.
+host = "127.0.0.1"
+port = 8080
+# auth_token = "replace-me"
+# auth_token_env = "OPENOMAN_SERVER_TOKEN"
+
 [git]
 # Base directory where trusted clones are stored.
 trusted_workspace_dir = "./workspaces/trusted"
-# Directory containing optional per-repo env overlays. For repo alias `kickfoss`,
-# openoman will copy files from `./env_for_repo/kickfoss` into the sandbox workspace root.
+# Directory containing optional per-repo env overlays. For repo alias `my_repo`,
+# openoman will copy files from `./env_for_repo/my_repo` into the sandbox workspace root.
 env_for_repo_dir = "./env_for_repo"
 
 [[git.accounts]]
@@ -24,7 +31,7 @@ git_user_name = "OpenOMAN Work Bot"
 git_user_email = "openoman-work@example.com"
 
 [[git.repos]]
-alias = "kickfoss"
+alias = "my_repo"
 repo_ref = "https://github.com/username/reponame.git"
 platform = "github"
 account = "github-personal"

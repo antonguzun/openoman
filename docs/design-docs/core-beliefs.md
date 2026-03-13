@@ -7,7 +7,7 @@ The system exists to automate small, well-scoped repository changes without trus
 - Host safety. The sandbox must not receive host secrets, host runtime sockets, or arbitrary filesystem access.
 - Deterministic publishing. Only the trusted core can push branches or create pull requests, and only after validation succeeds.
 - Minimal operational overhead. The MVP prefers one bare-metal Linux host, a CLI interface, and SQLite instead of external brokers or distributed control planes.
-- Extension without core sprawl. Integrations are designed as out-of-process plugins behind a frozen protocol so the core can stay narrow and trusted.
+- Extension without core sprawl. Integrations should remain outside the trusted core and use a stable HTTP control plane instead of loading third-party logic into the runtime.
 
 ## MVP goals
 
@@ -25,9 +25,9 @@ The untrusted agent must not gain access to GitHub tokens, SSH keys, or any othe
 - No GitLab support is required; GitHub is the only publishing target.
 - No distributed execution across multiple machines.
 - No advanced scheduling beyond a simple FIFO queue.
-- No package-management behavior in the core for installing plugin dependencies.
+- No package-management behavior in the core for installing third-party integration dependencies.
 - No sophisticated policy engine for sandbox control beyond explicit configuration.
 
 ## Core design decisions
 
-The project chooses microVM isolation rather than a host container boundary because the agent must be able to run realistic Docker Compose workloads while staying outside the host kernel and host container runtime. The trusted core replays and validates the sandbox output in a clean clone so that publishing depends on deterministic evidence instead of the sandbox filesystem state. SQLite is used because it keeps the MVP operationally small while still giving durable job history and an outbox for future integrations. Plugins are external processes speaking JSON-RPC over standard input and output so they can be written in Python, Node.js, TypeScript, or any other language without embedding their dependencies into the trusted core.
+The project chooses microVM isolation rather than a host container boundary because the agent must be able to run realistic Docker Compose workloads while staying outside the host kernel and host container runtime. The trusted core replays and validates the sandbox output in a clean clone so that publishing depends on deterministic evidence instead of the sandbox filesystem state. SQLite is used because it keeps the MVP operationally small while still giving durable job history and an outbox for future integrations. The control plane is HTTP-first so that bots, issue bridges, and custom UIs can evolve independently of the trusted runtime.

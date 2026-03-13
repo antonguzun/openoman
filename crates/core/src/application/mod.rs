@@ -6,7 +6,7 @@ use std::{
 use crate::{
     domain::{
         job::{ArtifactRef, Job, JobId, JobState, PublishResult},
-        plugin::PublishPolicy,
+        request::PublishPolicy,
     },
     execution::{
         AgentExecutionSpec, AttemptSpec, CollectedExecutionOutput, ExecutionBackend, ResourceLimits,
@@ -678,7 +678,7 @@ mod tests {
     use crate::{
         domain::{
             job::{RepoRef, Revision},
-            plugin::CheckProfile,
+            request::CheckProfile,
         },
         execution::{
             CollectedExecutionOutput, ExecutionBackendCapabilities, ExecutionBackendKind,

@@ -1,0 +1,348 @@
+openapi: 3.1.0
+info:
+  title: OpenOMAN Control Plane API
+  version: 0.1.0
+  summary: Draft OpenAPI contract for the HTTP API exposed by `openoman serve`.
+servers:
+  - url: http://127.0.0.1:8080
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      summary: Health check
+      security: []
+      responses:
+        '200':
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+                    const: true
+  /jobs:
+    post:
+      summary: Create a queued job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateJobRequest'
+      responses:
+        '201':
+          description: Job created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+    get:
+      summary: List jobs
+      responses:
+        '200':
+          description: Jobs in reverse insertion order
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Job'
+        '401':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+  /jobs/{job_id}:
+    get:
+      summary: Get one job
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Job detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+  /jobs/{job_id}/run:
+    post:
+      summary: Run a job
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Run completed without a run-level failure response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunJob'
+        '401':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '409':
+          description: Run returned a failure_reason
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunJob'
+        '500':
+          $ref: '#/components/responses/Error'
+  /jobs/{job_id}/retry:
+    post:
+      summary: Create a retry job from an existing job
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '201':
+          description: Retry job created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+  /jobs/{job_id}/logs:
+    get:
+      summary: Get job logs or fallback outbox events
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Logs view
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobLogs'
+        '401':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+  /jobs/{job_id}/artifacts:
+    get:
+      summary: List artifact metadata for a job
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Artifacts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Artifact'
+        '401':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+  /jobs/{job_id}/result:
+    get:
+      summary: Get final job result summary
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Result view
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResult'
+        '401':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+  parameters:
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema:
+        type: string
+  responses:
+    Error:
+      description: Error response
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+    CreateJobRequest:
+      type: object
+      required: [repo, revision, instruction]
+      properties:
+        repo:
+          type: string
+        revision:
+          type: string
+        instruction:
+          type: string
+        check_profile:
+          type: string
+          default: unit
+        publish_policy:
+          type: string
+          default: on_validation_success
+          enum: [never, on_validation_success]
+    PublishResult:
+      type: object
+      required: [branch_name, pull_request_url, pull_request_number]
+      properties:
+        branch_name:
+          type: string
+        pull_request_url:
+          type: string
+        pull_request_number:
+          type: integer
+          minimum: 0
+    Job:
+      type: object
+      required:
+        - job_id
+        - repo_ref
+        - revision
+        - instruction
+        - check_profile
+        - publish_policy
+        - state
+        - attempts
+        - artifact_refs
+      properties:
+        job_id:
+          type: string
+        repo_ref:
+          type: string
+        repo_alias:
+          type: string
+          nullable: true
+        revision:
+          type: string
+        instruction:
+          type: string
+        check_profile:
+          type: string
+        publish_policy:
+          type: string
+        state:
+          type: string
+        attempts:
+          type: integer
+          minimum: 0
+        artifact_refs:
+          type: array
+          items:
+            type: string
+        publish_warning:
+          type: string
+          nullable: true
+        publish_result:
+          oneOf:
+            - $ref: '#/components/schemas/PublishResult'
+            - type: 'null'
+    RunJob:
+      type: object
+      required: [job_id, state]
+      properties:
+        job_id:
+          type: string
+        state:
+          type: string
+        failure_reason:
+          type: string
+          nullable: true
+        publish_warning:
+          type: string
+          nullable: true
+    OutboxEvent:
+      type: object
+      required: [event_id, event_type, status]
+      properties:
+        event_id:
+          type: string
+        event_type:
+          type: string
+        status:
+          type: string
+    JobLogs:
+      type: object
+      required: [job_id, source, events]
+      properties:
+        job_id:
+          type: string
+        source:
+          type: string
+          enum: [artifact, outbox, none]
+        contents:
+          type: string
+          nullable: true
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/OutboxEvent'
+    Artifact:
+      type: object
+      required: [artifact_ref, kind, path, content_hash, size_bytes]
+      properties:
+        artifact_ref:
+          type: string
+        kind:
+          type: string
+        path:
+          type: string
+        content_hash:
+          type: string
+        size_bytes:
+          type: integer
+    JobResult:
+      type: object
+      required: [job_id, result]
+      properties:
+        job_id:
+          type: string
+        result:
+          type: string
+          enum: [success, failed, canceled, in_progress]
+        publish_warning:
+          type: string
+          nullable: true
+        publish_result:
+          oneOf:
+            - $ref: '#/components/schemas/PublishResult'
+            - type: 'null'

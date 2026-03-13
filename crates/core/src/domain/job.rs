@@ -2,7 +2,7 @@ use std::fmt::{Display, Formatter};
 
 use super::{
     events::JobEvent,
-    plugin::{CheckProfile, PublishPolicy},
+    request::{CheckProfile, PublishPolicy},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -6,7 +6,7 @@ This document follows `docs/PLANS.md` and must be maintained in accordance with 
 
 ## Purpose / Big Picture
 
-After this change, Firecracker direct-mode guests started by `openoman run <job_id>` have a virtual entropy device. In plain terms, the guest kernel can read random bytes from the host instead of stalling while programs wait for entropy during startup. The immediate user-visible outcome is that guest-side `node` and the Codex CLI can progress past the `getrandom` stall that currently prevents any patch generation. You can see the improvement by rerunning the existing `kickfoss` reproduction job flow and observing that guest logs advance past `running node codex entrypoint --version`.
+After this change, Firecracker direct-mode guests started by `openoman run <job_id>` have a virtual entropy device. In plain terms, the guest kernel can read random bytes from the host instead of stalling while programs wait for entropy during startup. The immediate user-visible outcome is that guest-side `node` and the Codex CLI can progress past the `getrandom` stall that currently prevents any patch generation. You can see the improvement by rerunning the existing `my_repo` reproduction job flow and observing that guest logs advance past `running node codex entrypoint --version`.
 
 ## Progress
 
@@ -14,11 +14,11 @@ After this change, Firecracker direct-mode guests started by `openoman run <job_
 - [x] (2026-03-02 13:57Z) Reviewed the Firecracker backend JSON writer and the official Firecracker schema to identify the correct top-level `entropy` config shape.
 - [x] (2026-03-02 14:00Z) Implemented the Firecracker JSON change so direct mode always enables a virtio RNG device.
 - [x] (2026-03-02 14:00Z) Added unit coverage that inspects the generated Firecracker config and proves the `entropy` object is present.
-- [x] (2026-03-02 14:03Z) Validated the change against the real `kickfoss` reproduction flow and captured the new behavior with preserved transient Firecracker config and boot logs.
+- [x] (2026-03-02 14:03Z) Validated the change against the real `my_repo` reproduction flow and captured the new behavior with preserved transient Firecracker config and boot logs.
 - [x] (2026-03-02 14:04Z) Updated guest asset documentation to explain that the default downloaded `hello-vmlinux.bin` kernel is still too minimal to consume the entropy device.
 - [x] (2026-03-02 14:18Z) Verified Firecracker's official `firecracker-ci/v1.12/{x86_64,aarch64}/vmlinux-6.1.128` artifacts and their published configs both include `CONFIG_HW_RANDOM_VIRTIO=y`.
 - [x] (2026-03-02 14:19Z) Switched the guest kernel downloader to the official `firecracker-ci` kernel by default, persisted the matching `.config` beside the image, and made the download fail fast if virtio-rng support is missing.
-- [x] (2026-03-02 14:20Z) Rebuilt `guest/out/vmlinux` from the new default and reran the `kickfoss` reproduction flow as `job-1772461099382`.
+- [x] (2026-03-02 14:20Z) Rebuilt `guest/out/vmlinux` from the new default and reran the `my_repo` reproduction flow as `job-1772461099382`.
 - [x] (2026-03-02 14:20Z) Confirmed the guest now progresses past the old `getrandom` stall: `node "$codex_target" --version` and `codex --version` both return `codex-cli 0.106.0`, and the run reaches live `codex exec`.
 - [x] (2026-03-02 14:20Z) Captured the new remaining blocker: `codex exec` times out after a reconnect error while sending a request to `https://api.openai.com/v1/responses`, which is consistent with the known lack of guest networking.
 
@@ -72,7 +72,7 @@ The Firecracker backend lives in `crates/core/src/sandbox/firecracker.rs`. That 
 
 The guest asset workflow lives under `guest/`. `guest/download-firecracker-kernel.sh` downloads the kernel image into `guest/out/vmlinux`. `guest/build-rootfs.sh` builds `guest/out/rootfs.ext4` with `/sbin/openoman-init` and the guest-side Node/Codex toolchain. `guest/build-assets.sh` is the wrapper that prepares both. The asset choice matters because Firecracker can expose a virtio-rng device while the guest kernel still ignores it if that driver was not compiled in.
 
-The reproduction path for this plan is a real `openoman` run against `git@github.com:antonguzun/kickfoss.git` with the instruction `add 12345 into end of README`. Before the kernel switch, guest logs showed Node startup hanging in `getrandom`, so `codex exec` never started and `sandbox.patch` stayed empty. After the kernel switch validated here, the entropy problem is gone and the remaining blocker is guest network reachability for the Codex API call.
+The reproduction path for this plan is a real `openoman` run against `git@github.com:antonguzun/my_repo.git` with the instruction `add 12345 into end of README`. Before the kernel switch, guest logs showed Node startup hanging in `getrandom`, so `codex exec` never started and `sandbox.patch` stayed empty. After the kernel switch validated here, the entropy problem is gone and the remaining blocker is guest network reachability for the Codex API call.
 
 ## Plan of Work
 
@@ -80,7 +80,7 @@ First, keep the existing Firecracker backend entropy support in place and change
 
 Second, make the kernel download self-validating. After downloading `guest/out/vmlinux.config`, inspect it for `CONFIG_HW_RANDOM_VIRTIO=y` and fail fast if that option is missing. This keeps the repository from silently falling back to another entropy-starved kernel in future rebuilds. Update `guest/README.md` so a novice understands the new default, the new `guest/out/vmlinux.config` artifact, and the override variables `OPENOMAN_FIRECRACKER_KERNEL_URL` and `OPENOMAN_FIRECRACKER_KERNEL_CONFIG_URL`.
 
-Third, rebuild `guest/out/vmlinux` from the new default and rerun the `kickfoss` reproduction flow. The expected proof is no longer just “the VM has an entropy device”; it is that guest logs advance through `node --version`, `node .../codex.js --version`, `codex --version`, and into live `codex exec`. Record the next blocker if the run still does not produce a patch.
+Third, rebuild `guest/out/vmlinux` from the new default and rerun the `my_repo` reproduction flow. The expected proof is no longer just “the VM has an entropy device”; it is that guest logs advance through `node --version`, `node .../codex.js --version`, `codex --version`, and into live `codex exec`. Record the next blocker if the run still does not produce a patch.
 
 ## Concrete Steps
 
@@ -95,7 +95,7 @@ Rebuild the default kernel asset and verify the pinned config:
 
 Rerun the reproduction:
 
-    env PATH=$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin ./target/debug/openoman submit --repo git@github.com:antonguzun/kickfoss.git --revision main --instruction 'add 12345 into end of README'
+    env PATH=$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin ./target/debug/openoman submit --repo git@github.com:antonguzun/my_repo.git --revision main --instruction 'add 12345 into end of README'
     env PATH=$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin ./target/debug/openoman run <job_id>
     env PATH=$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin ./target/debug/openoman logs <job_id>
 
@@ -117,7 +117,7 @@ Acceptance is satisfied when all of the following are true:
 2. `cargo test -p openoman-core firecracker -- --nocapture` passes locally.
 3. `./guest/download-firecracker-kernel.sh ./guest/out` succeeds and writes both `guest/out/vmlinux` and `guest/out/vmlinux.config`.
 4. The downloaded `guest/out/vmlinux.config` contains `CONFIG_HW_RANDOM_VIRTIO=y`.
-5. A fresh real `openoman run` against the `kickfoss` reproduction job proves the guest progresses past the old `getrandom` stall and reaches live `codex exec`.
+5. A fresh real `openoman run` against the `my_repo` reproduction job proves the guest progresses past the old `getrandom` stall and reaches live `codex exec`.
 6. If the run still does not finish successfully, the plan must record the new blocker with concrete logs.
 
 ## Idempotence and Recovery

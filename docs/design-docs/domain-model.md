@@ -23,10 +23,6 @@ Important invariants:
 - publishing is allowed only after trusted validation succeeds
 - terminal states are final unless the user creates a new job as a rerun
 
-### Plugin
-
-`Plugin` is a separate aggregate reserved for post-MVP integration support. It records plugin identity, version, entrypoint command, declared capabilities, whether the plugin is enabled, and a reference to its configuration schema and secret source.
-
 ## Entities and value objects
 
 ### Attempt

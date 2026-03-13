@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env, fs,
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
 };
@@ -31,6 +31,7 @@ struct FileConfig {
     git: Option<GitConfig>,
     sandbox: Option<SandboxConfig>,
     agent: Option<AgentConfig>,
+    server: Option<ServerConfig>,
     publishing: Option<PublishingConfig>,
 }
 
@@ -139,15 +140,30 @@ struct PublishingConfig {
     curl_bin: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize)]
+struct ServerConfig {
+    host: Option<String>,
+    port: Option<u16>,
+    auth_token: Option<String>,
+    auth_token_env: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct AppConfig {
     pub(crate) database_path: PathBuf,
     pub(crate) trusted_workspace_dir: PathBuf,
     pub(crate) env_for_repo_dir: PathBuf,
     pub(crate) execution: ExecutionRuntimeConfig,
     pub(crate) agent: AgentRuntimeConfig,
+    pub(crate) server: ServerRuntimeConfig,
     pub(crate) publishing: Option<PublishingRuntimeConfig>,
     repo_catalog: RepoCatalogRuntimeConfig,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ServerRuntimeConfig {
+    pub(crate) bind_addr: SocketAddr,
+    pub(crate) auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +259,7 @@ impl AppConfig {
             git,
             sandbox,
             agent,
+            server,
             publishing,
         } = parsed;
         let file_db = core.and_then(|c| c.database_path);
@@ -343,6 +360,7 @@ impl AppConfig {
                 host_risk_posture,
             },
             agent: agent_runtime,
+            server: load_server_config(server)?,
             publishing: load_publishing_config(publishing, path)?,
             repo_catalog,
         })
@@ -571,6 +589,49 @@ impl AppConfig {
             legacy.github_config_for_job(revision)?,
         ))
     }
+}
+
+fn load_server_config(config: Option<ServerConfig>) -> Result<ServerRuntimeConfig, String> {
+    let config = config.unwrap_or(ServerConfig {
+        host: None,
+        port: None,
+        auth_token: None,
+        auth_token_env: None,
+    });
+    let host = normalize_optional_string(config.host.as_deref(), "server.host")?
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let host = host
+        .parse::<IpAddr>()
+        .map_err(|e| format!("server.host must be a valid IP address, got '{host}': {e}"))?;
+    let auth_token =
+        match normalize_optional_string(config.auth_token.as_deref(), "server.auth_token")? {
+            Some(token) => Some(token),
+            None => {
+                let env_name = normalize_optional_string(
+                    config.auth_token_env.as_deref(),
+                    "server.auth_token_env",
+                )?;
+                match env_name {
+                    Some(name) => {
+                        let value = env::var(&name).map_err(|_| {
+                            format!("server auth token env var '{name}' is not set")
+                        })?;
+                        let value = value.trim().to_string();
+                        if value.is_empty() {
+                            None
+                        } else {
+                            Some(value)
+                        }
+                    }
+                    None => None,
+                }
+            }
+        };
+
+    Ok(ServerRuntimeConfig {
+        bind_addr: SocketAddr::new(host, config.port.unwrap_or(8080)),
+        auth_token,
+    })
 }
 
 fn resolve_host_risk_posture(
@@ -2107,7 +2168,7 @@ bin = "/usr/local/bin/codex"
 [publishing]
 provider = "github"
 repo_owner = "antonguzun"
-repo_name = "kickfoss"
+repo_name = "my_repo"
 github_token_env = "github_pat_example123"
 "#,
         )
@@ -2235,7 +2296,7 @@ bin = "/usr/local/bin/codex"
 [publishing]
 provider = "github"
 repo_owner = "antonguzun"
-repo_name = "kickfoss"
+repo_name = "my_repo"
 github_token_env = "github_pat_example123"
 "#,
         )
@@ -2538,10 +2599,7 @@ bin = "/usr/local/bin/codex"
         };
         assert_eq!(gitlab.api_base_url, "https://gitlab.com/api/v4");
         assert_eq!(gitlab.project_path, "group/project");
-        assert_eq!(
-            gitlab.push_url,
-            "https://gitlab.example.test/group/project.git"
-        );
+        assert_eq!(gitlab.push_url, "https://gitlab.com/group/project.git");
         assert_eq!(gitlab.token, "glpat-example123");
 
         let missing_token_plan = loaded
@@ -2606,5 +2664,74 @@ bin = "/usr/local/bin/codex"
             "https://gitlab.example.test/group/subgroup/project.git"
         );
         assert_eq!(gitlab.base_branch, "main");
+    }
+
+    #[test]
+    fn app_config_loads_server_defaults() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "process"
+runtime_dir = "./workspaces/sandboxes"
+host_risk_posture = "already_isolated"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+
+        assert_eq!(loaded.server.bind_addr.to_string(), "127.0.0.1:8080");
+        assert!(loaded.server.auth_token.is_none());
+    }
+
+    #[test]
+    fn app_config_reads_server_auth_token_from_env() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[server]
+host = "127.0.0.1"
+port = 9090
+auth_token_env = "OPENOMAN_TEST_SERVER_TOKEN"
+
+[sandbox]
+backend = "process"
+runtime_dir = "./workspaces/sandboxes"
+host_risk_posture = "already_isolated"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        env::set_var("OPENOMAN_TEST_SERVER_TOKEN", "secret-token");
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        env::remove_var("OPENOMAN_TEST_SERVER_TOKEN");
+
+        assert_eq!(loaded.server.bind_addr.to_string(), "127.0.0.1:9090");
+        assert_eq!(loaded.server.auth_token.as_deref(), Some("secret-token"));
     }
 }

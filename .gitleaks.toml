@@ -8,3 +8,14 @@ description = "Generated guest rootfs artifacts"
 paths = [
   '''^guest/out/''',
 ]
+
+[[allowlists]]
+description = "Documentation bearer token example"
+condition = "AND"
+regexTarget = "match"
+paths = [
+  '''^docs/api/control-plane\.md$''',
+]
+regexes = [
+  '''Authorization:\s+Bearer\s+secret-token''',
+]

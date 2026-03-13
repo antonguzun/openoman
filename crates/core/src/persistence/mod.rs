@@ -1,20 +1,20 @@
 use std::{cell::RefCell, path::Path, rc::Rc};
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, Transaction};
 
 use crate::domain::{
     job::{
         ArtifactRef, Attempt, Job, JobId, JobSnapshot, JobState, JobValueError, PublishResult,
         RepoRef, Revision,
     },
-    plugin::{CheckProfile, PluginValueError, PublishPolicy},
+    request::{CheckProfile, PublishPolicy, RequestValueError},
 };
 
 #[derive(Debug)]
 pub enum PersistenceError {
     Sql(rusqlite::Error),
     JobValue(JobValueError),
-    PluginValue(PluginValueError),
+    RequestValue(RequestValueError),
 }
 
 impl std::fmt::Display for PersistenceError {
@@ -22,7 +22,7 @@ impl std::fmt::Display for PersistenceError {
         match self {
             Self::Sql(err) => write!(f, "sqlite error: {err}"),
             Self::JobValue(err) => write!(f, "job value error: {err}"),
-            Self::PluginValue(err) => write!(f, "plugin value error: {err}"),
+            Self::RequestValue(err) => write!(f, "request value error: {err}"),
         }
     }
 }
@@ -41,9 +41,9 @@ impl From<JobValueError> for PersistenceError {
     }
 }
 
-impl From<PluginValueError> for PersistenceError {
-    fn from(value: PluginValueError) -> Self {
-        Self::PluginValue(value)
+impl From<RequestValueError> for PersistenceError {
+    fn from(value: RequestValueError) -> Self {
+        Self::RequestValue(value)
     }
 }
 
@@ -246,49 +246,63 @@ impl JobRepository {
 
     pub fn load(&self, id: &JobId) -> Result<Option<Job>, PersistenceError> {
         let conn = self.conn.borrow();
-        let mut stmt = conn.prepare(
-            "SELECT id, repo_ref, repo_alias, revision, instruction, check_profile, publish_policy, state, active_attempt_id, validation_succeeded,
-                    publish_branch_name, pull_request_url, pull_request_number, publish_warning
-             FROM jobs WHERE id = ?1",
-        )?;
+        let Some(snapshot) = load_job_snapshot(&conn, "WHERE id = ?1", params![id.as_str()])?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Job::rehydrate(snapshot)))
+    }
 
-        let row = stmt
-            .query_row(params![id.as_str()], |row| {
-                let id: String = row.get(0)?;
-                let repo_ref: String = row.get(1)?;
-                let repo_alias: Option<String> = row.get(2)?;
-                let revision: String = row.get(3)?;
-                let instruction: String = row.get(4)?;
-                let check_profile: String = row.get(5)?;
-                let publish_policy: String = row.get(6)?;
-                let state: String = row.get(7)?;
-                let active_attempt_id: Option<u32> = row.get(8)?;
-                let validation_succeeded: bool = row.get(9)?;
-                let publish_branch_name: Option<String> = row.get(10)?;
-                let pull_request_url: Option<String> = row.get(11)?;
-                let pull_request_number: Option<u64> = row.get(12)?;
-                let publish_warning: Option<String> = row.get(13)?;
+    pub fn list(&self) -> Result<Vec<Job>, PersistenceError> {
+        let conn = self.conn.borrow();
+        let snapshots = load_job_snapshots(&conn, "ORDER BY rowid DESC, id DESC", params![])?;
+        Ok(snapshots.into_iter().map(Job::rehydrate).collect())
+    }
+}
 
-                Ok((
-                    id,
-                    repo_ref,
-                    repo_alias,
-                    revision,
-                    instruction,
-                    check_profile,
-                    publish_policy,
-                    state,
-                    active_attempt_id,
-                    validation_succeeded,
-                    publish_branch_name,
-                    pull_request_url,
-                    pull_request_number,
-                    publish_warning,
-                ))
-            })
-            .optional()?;
+fn load_job_snapshot<P: rusqlite::Params>(
+    conn: &Connection,
+    where_clause: &str,
+    params: P,
+) -> Result<Option<JobSnapshot>, PersistenceError> {
+    Ok(load_job_snapshots(conn, where_clause, params)?
+        .into_iter()
+        .next())
+}
 
-        let Some((
+fn load_job_snapshots<P: rusqlite::Params>(
+    conn: &Connection,
+    suffix_sql: &str,
+    params: P,
+) -> Result<Vec<JobSnapshot>, PersistenceError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, repo_ref, repo_alias, revision, instruction, check_profile, publish_policy, state, active_attempt_id, validation_succeeded,
+                publish_branch_name, pull_request_url, pull_request_number, publish_warning
+         FROM jobs {suffix_sql}"
+    ))?;
+
+    let rows = stmt.query_map(params, |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, Option<u32>>(8)?,
+            row.get::<_, bool>(9)?,
+            row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
+            row.get::<_, Option<u64>>(12)?,
+            row.get::<_, Option<String>>(13)?,
+        ))
+    })?;
+
+    let mut snapshots = Vec::new();
+    for row in rows {
+        let (
             id,
             repo_ref,
             repo_alias,
@@ -303,15 +317,10 @@ impl JobRepository {
             pull_request_url,
             pull_request_number,
             publish_warning,
-        )) = row
-        else {
-            return Ok(None);
-        };
-
-        let attempts = load_attempts(&conn, &id)?;
-        let artifacts = load_artifact_refs(&conn, &id)?;
-
-        let job = Job::rehydrate(JobSnapshot {
+        ) = row?;
+        let attempts = load_attempts(conn, &id)?;
+        let artifacts = load_artifact_refs(conn, &id)?;
+        snapshots.push(JobSnapshot {
             id: JobId::new(id)?,
             repo_ref: RepoRef::new(repo_ref)?,
             repo_alias,
@@ -331,9 +340,9 @@ impl JobRepository {
             active_attempt_id,
             validation_succeeded,
         });
-
-        Ok(Some(job))
     }
+
+    Ok(snapshots)
 }
 
 fn upsert_job(tx: &Transaction<'_>, job: &Job) -> Result<(), PersistenceError> {
@@ -739,10 +748,10 @@ fn insert_artifact_conn(
 
 #[cfg(test)]
 mod tests {
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     use super::*;
-    use crate::domain::{job::RepoRef, plugin::PublishPolicy};
+    use crate::domain::{job::RepoRef, request::PublishPolicy};
 
     fn submitted_job() -> Job {
         Job::submit(
@@ -946,5 +955,41 @@ mod tests {
             .expect("outbox should load");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "job.pr_created");
+    }
+
+    #[test]
+    fn list_returns_jobs_in_reverse_insert_order() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = SqliteStore::open(temp.path().join("jobs.sqlite")).expect("store");
+
+        let first = Job::submit(
+            JobId::new("job-1").expect("job id"),
+            RepoRef::new("github.com/acme/one").expect("repo ref"),
+            None,
+            Revision::new("main").expect("revision"),
+            "first".to_string(),
+            CheckProfile::new("unit").expect("profile"),
+            PublishPolicy::Never,
+        )
+        .0;
+        let second = Job::submit(
+            JobId::new("job-2").expect("job id"),
+            RepoRef::new("github.com/acme/two").expect("repo ref"),
+            None,
+            Revision::new("main").expect("revision"),
+            "second".to_string(),
+            CheckProfile::new("unit").expect("profile"),
+            PublishPolicy::Never,
+        )
+        .0;
+
+        store.jobs().create(&first).expect("create first");
+        store.jobs().create(&second).expect("create second");
+
+        let jobs = store.jobs().list().expect("list jobs");
+
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].id.as_str(), "job-2");
+        assert_eq!(jobs[1].id.as_str(), "job-1");
     }
 }

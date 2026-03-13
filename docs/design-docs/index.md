@@ -6,11 +6,11 @@ This directory decomposes the architecture into focused documents. Read them in 
 
 1. [`core-beliefs.md`](core-beliefs.md) explains what the system is trying to achieve, what it refuses to do, and which constraints drive every other decision.
 2. [`system-overview.md`](system-overview.md) shows the major components, the trust boundaries between them, and how the repository is expected to be organized.
-3. [`domain-model.md`](domain-model.md) defines the long-lived concepts the core manages, especially jobs, attempts, artifacts, and plugin metadata.
+3. [`domain-model.md`](domain-model.md) defines the long-lived concepts the core manages, especially jobs, attempts, and artifacts.
 4. [`execution-lifecycle.md`](execution-lifecycle.md) walks through the user-facing commands and the end-to-end job pipeline.
 5. [`sandbox-and-safety.md`](sandbox-and-safety.md) details the microVM model, network restrictions, validation gate, and safe publishing path.
-6. [`plugin-protocol.md`](plugin-protocol.md) freezes the plugin discovery model, transport, JSON-RPC methods, and integration event envelope.
-7. [`operational-model.md`](operational-model.md) covers SQLite persistence, artifact references, and the MVP CLI.
+6. [`control-plane-and-adapters.md`](control-plane-and-adapters.md) defines the HTTP control plane, auth model, and external adapter boundary.
+7. [`operational-model.md`](operational-model.md) covers SQLite persistence, artifact references, the HTTP server, and CLI/operator surface.
 8. [`roadmap.md`](roadmap.md) captures the intended post-MVP expansion areas.
 
 ## Topic map
@@ -20,6 +20,6 @@ This directory decomposes the architecture into focused documents. Read them in 
 - Data and state transitions: [`domain-model.md`](domain-model.md)
 - Pipeline behavior and events: [`execution-lifecycle.md`](execution-lifecycle.md)
 - Isolation and trusted control points: [`sandbox-and-safety.md`](sandbox-and-safety.md)
-- External integration contract: [`plugin-protocol.md`](plugin-protocol.md)
+- External integration contract: [`control-plane-and-adapters.md`](control-plane-and-adapters.md)
 - Storage and operator surface: [`operational-model.md`](operational-model.md)
 - Future direction: [`roadmap.md`](roadmap.md)

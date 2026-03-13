@@ -9,13 +9,16 @@ name = "openoman"
 path = "src/main.rs"
 
 [dependencies]
+axum = { version = "0.8", features = ["json"] }
 clap = { version = "4.5", features = ["derive"] }
 openoman-core = { path = "../core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
 toml = "0.8"
 
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.1"
 tempfile = "=3.12.0"
+tower = { version = "0.5", features = ["util"] }

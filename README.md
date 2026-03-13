@@ -1,16 +1,162 @@
 # openoman
 
-openoman is a secure agent runner project that starts with a Rust core service and a microVM-first architecture to safely execute untrusted automation while keeping credentials and publishing actions in trusted host code.
+openoman runs coding agents against real repositories without handing them your Git or platform credentials. It gives each task its own disposable sandbox, keeps publishing decisions in trusted host code, and lets you build whatever task-entry workflow you want on top of the API.
+
+## Why it exists
+
+Use openoman when you want agent automation to touch real code, but you do not want it to mutate your day-to-day environment, hold your Git credentials, or dictate how tasks enter the system.
+
+## Feature map
+
+- [Keep agent work out of your manual environment](#disposable-sandbox-execution): each task runs in its own sandbox instead of your everyday clone or shell. The execution layer is sandbox-agnostic in design; the current implementation is Firecracker and currently targets Linux hosts with KVM. Details: [guest/README.md](guest/README.md)
+- [Keep Git and publishing on the trusted side](#trusted-publishing): the agent can change files, but it does not get direct Git credentials or publish access. openoman applies a deterministic host-side publish flow for GitHub and GitLab. Details: [config.example.toml](config.example.toml), [docs/api/control-plane.md](docs/api/control-plane.md)
+- [Bring your own task source](#cli-and-http-control-plane): use the built-in CLI, or wire your own Telegram bot, web UI, cron job, issue tracker bridge, or any other adapter against the HTTP API. Details: [docs/design-docs/control-plane-and-adapters.md](docs/design-docs/control-plane-and-adapters.md), [docs/api/control-plane.md](docs/api/control-plane.md), [docs/api/openapi.yaml](docs/api/openapi.yaml)
+- [Swap agents without changing the rest of the system](#agent-provider-support): Codex and Cursor use the same sandbox and publish flow through one provider-neutral config shape. Details: [config.example.toml](config.example.toml), [guest/README.md](guest/README.md)
+- [Run many repositories safely](#repository-aliases-accounts-and-env-overlays): bind each repo to its own account, env overlay, and isolated task runs without contaminating other repos or your local setup. Details: [config.example.toml](config.example.toml)
+- [Inspect what happened after the run](#artifacts-and-audit-trail): SQLite-backed job state plus patch, report, logs, and publish metadata make runs inspectable after the fact. Details: [docs/design-docs/operational-model.md](docs/design-docs/operational-model.md), [docs/api/control-plane.md](docs/api/control-plane.md)
+
+## Near-term plans
+
+- More agent providers on top of the same execution and publish flow
+- More flexible branch naming and commit message generation
+- Additional sandbox backends and runtime options
+- Firecracker `jailer` support for a more hardened sandbox mode
+- Agent pipelines tailored to different task types such as architecture checks, documentation checks, and review flows
+- A broader HTTP API for richer external integrations
+- Continuing or resuming a task after the first run has completed
+
+## Getting started
+
+1. Review and adapt [config.example.toml](config.example.toml).
+2. Build guest assets with `./guest/build-assets.sh ./guest/out`.
+3. Point `sandbox.firecracker.kernel_image_path` and `sandbox.firecracker.rootfs_image_path` at those assets.
+4. Configure `[agent]` plus either `[[git.repos]]` and `[[git.accounts]]` or the legacy `[publishing]` fallback.
+5. Start the HTTP control plane with `openoman --config ./config.toml serve` or submit jobs directly through the CLI.
+
+Configuration is loaded from `--config` and the database path can be overridden with `OPENOMAN_DATABASE_PATH`.
+
+## CLI and HTTP control plane
+
+The `openoman` binary exposes the same trusted core through local commands:
+
+- `openoman --config ./config.toml serve`
+- `openoman --config ./config.toml submit --repo my_repo --revision main --instruction "update README"`
+- `openoman --config ./config.toml submit --repo https://github.com/acme/repo.git --revision main --instruction "update README"`
+- `openoman --config ./config.toml status <job_id>`
+- `openoman --config ./config.toml run <job_id>`
+- `openoman --config ./config.toml logs <job_id>`
+- `openoman --config ./config.toml artifacts <job_id>`
+- `openoman --config ./config.toml result <job_id>`
+
+The HTTP control plane exposed by `serve` provides:
+
+- `GET /health`
+- `POST /jobs`
+- `GET /jobs`
+- `GET /jobs/:id`
+- `POST /jobs/:id/run`
+- `POST /jobs/:id/retry`
+- `GET /jobs/:id/logs`
+- `GET /jobs/:id/artifacts`
+- `GET /jobs/:id/result`
+
+By default the server binds to `127.0.0.1:8080`. Add `[server].auth_token` or `[server].auth_token_env` to require a bearer token for HTTP requests.
+
+The HTTP API is the extension point for your own task sources and UIs. If you want tasks to come from chat, a form, cron, Jira, Linear, or an internal tool, build that outside the trusted core and talk to `openoman serve`.
+
+API documentation:
+
+- human-readable reference: [docs/api/control-plane.md](docs/api/control-plane.md)
+- draft OpenAPI contract: [docs/api/openapi.yaml](docs/api/openapi.yaml)
+
+## Disposable sandbox execution
+
+Each job attempt runs in its own disposable sandbox, so agent work stays out of your manual environment. The execution model is sandbox-agnostic in design, but the current implementation uses Firecracker in `direct` mode and currently expects a Linux host with `/dev/kvm`.
+
+Firecracker-specific details:
+
+- `backend = "firecracker"` selects the microVM backend
+- `sandbox.firecracker.mode = "direct"` is the working execution mode
+- `sandbox.firecracker.mode = "jailer"` is config-visible but rejected during startup validation
+- `sandbox.firecracker.network.mode = "disabled"` runs without guest networking
+- `sandbox.firecracker.network.mode = "host-proxy"` routes guest HTTPS through a host-local allowlisting proxy
+- `[[sandbox.firecracker.user_package_dirs]]` copies explicit host-user package directories into each run
+
+Startup validates the configured backend before any command runs. With Firecracker, openoman fails fast if required host dependencies such as `firecracker`, `/dev/kvm`, or the configured guest asset paths are unavailable.
+
+Guest asset documentation:
+
+- asset-pair build helper: [guest/build-assets.sh](guest/build-assets.sh)
+- rootfs-only build helper: [guest/build-rootfs.sh](guest/build-rootfs.sh)
+- guest runtime contract: [guest/README.md](guest/README.md)
+
+## Agent provider support
+
+Agent configuration lives under `[agent]` and uses provider-neutral keys:
+
+- `provider = "codex"` or `provider = "cursor"`
+- `bin = "..."` selects the agent binary inside the guest
+- `model = "gpt-5"` is supported for Cursor and passed as `cursor-agent --model ...`
+- `auth_file = "..."` is Codex-only and stages a host auth file into `/root/.codex/auth.json`
+- `api_key = "crsr_..."` injects a Cursor API key into the guest as `CURSOR_API_KEY`
+- `api_key_env = "OPENOMAN_CURSOR_API_KEY"` reads the Cursor API key from a host environment variable at run time
+- `egress_allowed_domains = ["api.openai.com"]` or `["api2.cursor.sh"]` defines the host-proxy allowlist
+
+Existing Codex configs that still use `codex_bin` and `codex_auth_file` continue to work as compatibility aliases.
+
+## Repository aliases, accounts, and env overlays
+
+Repository configuration supports many repositories under `[git]`:
+
+- `[[git.accounts]]` defines reusable publish credentials and trusted commit identity
+- `[[git.repos]]` defines repository alias, `repo_ref`, `platform`, optional `env_repo_name`, and provider-specific publish metadata
+- `submit --repo <value>` resolves `<value>` as alias first, then falls back to a raw repo ref or path
+- `env_repo_name` defaults to the repo alias
+- `env_for_repo_dir` defaults to `./env_for_repo`, and `./env_for_repo/<env_repo_name>` is copied into the sandbox workspace root when present
+
+Alias-based jobs persist `repo_alias`, so publish behavior and environment overlays remain deterministic at `run` time.
+
+Each job still runs in its own sandbox, so repo-specific automation does not overwrite files, shells, or tool state in the environment you use for manual work.
+
+## Trusted publishing
+
+The sandbox never publishes directly. The agent can modify the workspace, but it does not get direct Git credentials or permission to push branches on its own. openoman keeps the publish step in trusted host code and applies the resulting changes through a deterministic host-side flow.
+
+Separate trusted re-validation of the patch is not implemented yet. The current safety boundary is that the agent does not get Git access and does not execute the publish step itself.
+
+Publishing support includes:
+
+- GitHub repository aliases with trusted branch push and pull request creation
+- GitLab.com repository aliases with trusted branch push and merge request creation
+- self-hosted GitLab aliases through `platform = "gitlab_self_hosted"`
+- legacy raw-repo GitHub publishing through `[publishing]`
+- `--publish-policy never` to skip publishing cleanly
+- `--publish-policy on_validation_success` as the current publish-policy flag name for the trusted host-side publish path
+
+For successful publish flows, `openoman result <job_id>` and `GET /jobs/:id/result` expose the branch name and PR/MR metadata. When publish prerequisites are missing intentionally, the job can still succeed and returns `publish_warning=...`.
+
+## Artifacts and audit trail
+
+Job state is stored in SQLite. The system persists enough information to inspect runs after restart, including job state, attempt count, artifact references, and publish outcome.
+
+Important artifact classes include:
+
+- `sandbox.patch`
+- `sandbox.report`
+- `sandbox.logs`
+- `workspace.sandbox_result`
+
+The operator surfaces expose those artifacts through `logs`, `artifacts`, and `result`, and the HTTP API mirrors the same data model.
 
 ## Build and test
 
-Run all local quality checks from the repository root:
+Run local quality checks from the repository root:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all-targets --all-features`
 
-## Git Hooks
+## Git hooks
 
 This repository ships a repo-managed `pre-commit` hook for secret scanning.
 
@@ -20,117 +166,18 @@ Enable it once per clone from the repository root:
 
 The hook requires `gitleaks` to be installed and available on `PATH`. It scans staged content only, so it blocks newly introduced secrets without rescanning the entire working tree on each commit.
 
-You can run the scanner manually from the repository root:
+Run the scanner manually from the repository root:
 
 - `gitleaks dir . --config .gitleaks.toml`
 
-If the hook reports a false positive, narrow the allowlist in `.gitleaks.toml` deliberately instead of bypassing it routinely. Emergency bypass remains available through:
+If the hook reports a false positive, narrow the allowlist in `.gitleaks.toml` deliberately instead of bypassing it routinely. Emergency bypass remains available through `git commit --no-verify`.
 
-- `git commit --no-verify`
+## Documentation
 
-## CLI (Epic 3 MVP surface)
-
-The `openoman` binary provides a minimal local workflow against SQLite:
-
-- `openoman --config ./config.toml submit --repo kickfoss --revision main --instruction "update README"`
-- `openoman --config ./config.toml submit --repo https://github.com/acme/repo.git --revision main --instruction "update README"`
-- `openoman --config ./config.toml status <job_id>`
-- `openoman --config ./config.toml run <job_id>`
-- `openoman --config ./config.toml logs <job_id>`
-- `openoman --config ./config.toml artifacts <job_id>`
-- `openoman --config ./config.toml result <job_id>`
-
-Configuration is loaded from `--config` and can be overridden with `OPENOMAN_DATABASE_PATH`.
-
-When a submitted job uses `--publish-policy on_validation_success`, `run` applies the canonical patch to the trusted clone and either publishes (GitHub or GitLab aliases with a configured token) or records `publish_warning=...` and skips publishing when prerequisites are missing. `result <job_id>` prints stored branch and review-request metadata when publishing succeeded, and prints `publish_warning` when publishing was skipped intentionally. For compatibility, GitLab merge request results are still exposed through the existing `pull_request_*` output fields.
-
-Startup now validates the configured sandbox backend before any command runs. With the default Firecracker backend, `openoman` will fail fast if required host dependencies such as `firecracker`, `/dev/kvm`, or the configured guest asset paths are unavailable.
-
-## Agent providers
-
-The sandbox agent contract now uses provider-neutral `[agent]` keys:
-
-- `provider = "codex"` or `provider = "cursor"`
-- `bin = "..."` selects the agent binary inside the guest
-- `model = "gpt-5"` is supported for Cursor and is passed as `cursor-agent --model ...`
-- `auth_file = "..."` is Codex-only and stages a host auth file into `/root/.codex/auth.json`
-- `api_key = "crsr_..."` is the preferred Cursor credential path and is injected into the guest as `CURSOR_API_KEY`
-- `api_key_env = "OPENOMAN_CURSOR_API_KEY"` is an optional Cursor alternative that tells `openoman run` which host environment variable to read before injecting `CURSOR_API_KEY` into the guest
-
-Existing Codex configs that still use `codex_bin` and `codex_auth_file` continue to work as compatibility aliases.
-
-Examples:
-
-- Codex:
-  `provider = "codex"`, `bin = "/usr/local/bin/codex"`, `auth_file = "~/.codex/auth.json"`, `egress_allowed_domains = ["api.openai.com"]`
-- Cursor:
-  `provider = "cursor"`, `bin = "cursor-agent"`, `model = "gpt-5"`, `api_key = "crsr_..."`, `egress_allowed_domains = ["api2.cursor.sh"]`
-  For debugging only, `egress_allowed_domains = ["*"]` disables hostname filtering and enables broader guest egress via the host.
-
-## Sandbox backend
-
-The sandbox runtime is now selected from config:
-
-- `backend = "firecracker"`
-- `sandbox.firecracker.mode = "direct"` boots Firecracker without Jailer and is the only working mode in this release
-- `sandbox.firecracker.mode = "jailer"` is config-visible but intentionally rejected during startup validation because it needs a more prepared host environment
-
-The direct backend stages the prepared workspace plus any explicitly allowlisted host-user package directories into an ext4 runtime image, boots Firecracker with a per-run writable copy of the configured rootfs, and then extracts the modified workspace plus report/log artifacts back out of that image on the host.
-
-Guest asset notes:
-
-- asset-pair build helper: [guest/build-assets.sh](/home/antonguzun/Work/personal/openoman/guest/build-assets.sh)
-- rootfs-only build helper: [guest/build-rootfs.sh](/home/antonguzun/Work/personal/openoman/guest/build-rootfs.sh)
-- guest contract documentation: [guest/README.md](/home/antonguzun/Work/personal/openoman/guest/README.md)
-
-## Repository aliases and accounts
-
-Repository config now supports many repositories, each with its own platform/account binding under `[git]`:
-
-- `[[git.accounts]]` defines reusable publish credentials and trusted commit identity (`git_user_name`, `git_user_email`)
-- `[[git.repos]]` defines repository alias, `repo_ref`, `platform`, optional `env_repo_name`, and provider-specific publish metadata
-- `submit --repo <value>` resolves `<value>` as alias first, then falls back to raw repo refs/paths
-- `env_repo_name` is optional and defaults to repo alias; `env_for_repo_dir` defaults to `./env_for_repo`, and if `./env_for_repo/<env_repo_name>` exists, its files are copied into sandbox workspace root for that job
-
-Alias-based jobs persist `repo_alias`, so publish/account behavior and env overlays remain deterministic at `run` time.
-
-## Core Git workspace preparation (Epic 4)
-
-`openoman-core` includes a trusted `GitAdapter` that can:
-
-- clone a repository into a trusted workspace directory
-- checkout a branch name or commit SHA
-- export a sandbox workspace copy with sanitized `.git` metadata
-- apply optional per-repo env file overlays into sandbox workspace root
-
-See `crates/core/src/git.rs` for the adapter API and tests.
-
-## Trusted publishing
-
-Preferred publishing config is repo-scoped under `[[git.repos]]` + `[[git.accounts]]`:
-
-- `platform = "github"` enables trusted GitHub publish planning for that alias
-- `platform = "gitlab"` enables trusted publish planning against `gitlab.com`
-- `platform = "gitlab_self_hosted"` enables trusted publish planning against a custom GitLab host
-- `repo_owner` and `repo_name` select the GitHub repository for pull request creation; when omitted, openoman tries to infer them from `push_url` first, then `repo_ref`
-- for GitLab aliases, `repo_owner` may include subgroup path segments and pairs with `repo_name` to form `<repo_owner>/<repo_name>`; when omitted, openoman tries to infer the project path from `push_url` first, then `repo_ref`
-- `base_branch` is optional and otherwise defaults to the submitted revision
-- `branch_prefix` defaults to `openoman`
-- `api_base_url` defaults to `https://api.github.com` for GitHub, `https://gitlab.com/api/v4` for `platform = "gitlab"`, and `<host>/api/v4` for `platform = "gitlab_self_hosted"` when the host can be inferred from `repo_ref` or `push_url`
-- `push_url` is optional and otherwise defaults to the provider HTTPS remote derived from repo identity
-- `curl_bin` is optional on repo aliases and defaults to `curl`
-- bound account token comes from `[[git.accounts]].token` or `token_env`
-- trusted commits use bound account identity (`git_user_name`, `git_user_email`)
-
-Legacy fallback publishing via `[publishing]` still works for raw non-alias `submit --repo ...` flows.
-
-For account `token_env`, use a local environment variable name. Example:
-
-- config: `token_env = "OPENOMAN_GITHUB_TOKEN"`
-- shell: `export OPENOMAN_GITHUB_TOKEN=ghp_...`
-
-To create the GitHub token itself, use GitHub Settings -> Developer settings -> Personal access tokens. Official GitHub docs: https://docs.github.com/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
-
-For GitLab aliases, the bound account token is also used for trusted HTTPS clone and branch push. Merge requests are created through the GitLab REST API, and the resulting MR URL and IID are persisted in the existing `pull_request_url` and `pull_request_number` fields so `openoman result <job_id>` keeps the same output shape across providers.
-
-If a job uses `--publish-policy never`, the trusted publish step is skipped. If a job uses `--publish-policy on_validation_success` but publish prerequisites are missing for the alias, the job still succeeds and `result <job_id>` includes `publish_warning=...`.
+- design docs index: [docs/design-docs/index.md](docs/design-docs/index.md)
+- system overview: [docs/design-docs/system-overview.md](docs/design-docs/system-overview.md)
+- execution lifecycle: [docs/design-docs/execution-lifecycle.md](docs/design-docs/execution-lifecycle.md)
+- sandbox and safety: [docs/design-docs/sandbox-and-safety.md](docs/design-docs/sandbox-and-safety.md)
+- control plane and adapters: [docs/design-docs/control-plane-and-adapters.md](docs/design-docs/control-plane-and-adapters.md)
+- operational model: [docs/design-docs/operational-model.md](docs/design-docs/operational-model.md)
+- guest runtime docs: [guest/README.md](guest/README.md)

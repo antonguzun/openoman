@@ -4,11 +4,11 @@ This document captures the planned extensions beyond the MVP. These items are in
 
 ## Additional input interfaces
 
-Future versions can add richer frontends such as a TUI and task sources such as Linear or Jira. These should arrive as plugins or adapters rather than as logic folded directly into the trusted core.
+Future versions can add richer frontends such as a TUI and task sources such as Linear or Jira. These should arrive as adapters or first-party clients over the HTTP control plane rather than as logic folded directly into the trusted core.
 
 ## Additional notification channels
 
-Notification plugins such as Telegram, Slack, or email are expected once the outbox dispatcher exists. The current architecture already freezes the event envelope and plugin protocol so those integrations can be added without redesigning the core.
+Notification delivery such as Telegram, Slack, or email can be added once the outbox dispatcher exists. Those integrations should consume stable event data from the core instead of requiring a general plugin runtime inside `openoman`.
 
 ## Multiple VCS providers
 

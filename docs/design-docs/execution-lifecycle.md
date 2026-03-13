@@ -2,10 +2,11 @@
 
 This document describes how a job moves through the system from the user's perspective and from the core service's perspective.
 
-## CLI-facing use cases
+## User-facing use cases
 
-The MVP command surface is intentionally small:
+The MVP operator surface is intentionally small:
 
+- `serve` starts the HTTP control plane
 - `submit` creates a job and returns a stable job identifier
 - `run` executes a job to completion; blocking execution is acceptable in the MVP
 - `status <job_id>` reports the current state
@@ -41,7 +42,7 @@ If the publish policy allows it and validation succeeds, the trusted core create
 
 ### 7. Notification and result reporting
 
-The core prints a final summary, stores the outcome, and writes integration events into the outbox for future plugin delivery.
+The core prints a final summary, stores the outcome, and writes integration events into the outbox for future adapters or notification workers.
 
 ## Domain events
 
@@ -61,4 +62,4 @@ The core can model important transitions as internal domain events such as:
 - `JobFailed`
 - `JobCanceled`
 
-Integration events derived from these transitions are part of the stable plugin contract and are described in [`plugin-protocol.md`](plugin-protocol.md).
+Integration events derived from these transitions are part of the stable integration contract and are described in [`control-plane-and-adapters.md`](control-plane-and-adapters.md).

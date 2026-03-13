@@ -4,10 +4,10 @@ use std::fmt::{Display, Formatter};
 pub struct CheckProfile(String);
 
 impl CheckProfile {
-    pub fn new(value: impl Into<String>) -> Result<Self, PluginValueError> {
+    pub fn new(value: impl Into<String>) -> Result<Self, RequestValueError> {
         let value = value.into();
         if value.trim().is_empty() {
-            return Err(PluginValueError::EmptyCheckProfile);
+            return Err(RequestValueError::EmptyCheckProfile);
         }
         Ok(Self(value))
     }
@@ -31,22 +31,22 @@ impl PublishPolicy {
         }
     }
 
-    pub fn parse(value: &str) -> Result<Self, PluginValueError> {
+    pub fn parse(value: &str) -> Result<Self, RequestValueError> {
         match value {
             "never" => Ok(Self::Never),
             "on_validation_success" => Ok(Self::OnValidationSuccess),
-            _ => Err(PluginValueError::InvalidPublishPolicy(value.to_string())),
+            _ => Err(RequestValueError::InvalidPublishPolicy(value.to_string())),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PluginValueError {
+pub enum RequestValueError {
     EmptyCheckProfile,
     InvalidPublishPolicy(String),
 }
 
-impl Display for PluginValueError {
+impl Display for RequestValueError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyCheckProfile => write!(f, "check profile must not be empty"),
@@ -57,4 +57,4 @@ impl Display for PluginValueError {
     }
 }
 
-impl std::error::Error for PluginValueError {}
+impl std::error::Error for RequestValueError {}
