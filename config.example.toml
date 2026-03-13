@@ -28,8 +28,9 @@ alias = "kickfoss"
 repo_ref = "https://github.com/username/reponame.git"
 platform = "github"
 account = "github-personal"
-env_repo_name = "reponame"
-# Required for GitHub publish planning.
+# Optional. Defaults to the repo alias when omitted.
+# env_repo_name = "reponame"
+# Optional when inferable from repo_ref/push_url.
 repo_owner = "username"
 repo_name = "reponame"
 # Optional GitHub publish overrides.

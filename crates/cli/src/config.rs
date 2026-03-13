@@ -385,6 +385,30 @@ impl AppConfig {
         }
     }
 
+    pub(crate) fn resolve_clone_token_for_job(&self, repo_alias: Option<&str>) -> Option<String> {
+        if let Some(alias) = repo_alias {
+            let repo = self.repo_catalog.repos_by_alias.get(alias)?;
+            if repo.platform != RepoPlatform::GitHub {
+                return None;
+            }
+            let account_alias = repo.account_alias.as_deref()?;
+            let account = self.repo_catalog.accounts_by_alias.get(account_alias)?;
+            return account.token.clone();
+        }
+
+        self.publishing
+            .as_ref()
+            .and_then(|legacy| legacy.token.clone())
+            .and_then(|token| {
+                let trimmed = token.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+    }
+
     pub(crate) fn resolve_publish_plan_for_job(
         &self,
         repo_alias: Option<&str>,
@@ -424,18 +448,30 @@ impl AppConfig {
                     account_alias
                 )));
             };
-            let repo_owner = repo.github.repo_owner.clone().ok_or_else(|| {
-                format!(
-                    "git.repos alias '{}' is missing repo_owner required for GitHub publishing",
-                    alias
-                )
-            })?;
-            let repo_name = repo.github.repo_name.clone().ok_or_else(|| {
-                format!(
-                    "git.repos alias '{}' is missing repo_name required for GitHub publishing",
-                    alias
-                )
-            })?;
+            let inferred_repo =
+                infer_github_repo_identity(repo.github.push_url.as_deref(), Some(&repo.repo_ref));
+            let repo_owner = repo
+                .github
+                .repo_owner
+                .clone()
+                .or_else(|| inferred_repo.as_ref().map(|inferred| inferred.owner.clone()))
+                .ok_or_else(|| {
+                    format!(
+                        "git.repos alias '{}' is missing repo_owner and it could not be inferred from repo_ref/push_url; set repo_owner explicitly",
+                        alias
+                    )
+                })?;
+            let repo_name = repo
+                .github
+                .repo_name
+                .clone()
+                .or_else(|| inferred_repo.as_ref().map(|inferred| inferred.name.clone()))
+                .ok_or_else(|| {
+                    format!(
+                        "git.repos alias '{}' is missing repo_name and it could not be inferred from repo_ref/push_url; set repo_name explicitly",
+                        alias
+                    )
+                })?;
             let base_branch = repo
                 .github
                 .base_branch
@@ -733,6 +769,9 @@ fn resolve_generic_token(token_env: Option<&str>, token: Option<String>) -> Opti
                 return Some(value);
             }
         }
+        if looks_like_github_token(token_env) {
+            return Some(token_env.to_string());
+        }
     }
     token.and_then(|value| {
         let trimmed = value.trim();
@@ -741,6 +780,73 @@ fn resolve_generic_token(token_env: Option<&str>, token: Option<String>) -> Opti
         } else {
             Some(trimmed.to_string())
         }
+    })
+}
+
+#[derive(Debug, Clone)]
+struct GitHubRepoIdentity {
+    owner: String,
+    name: String,
+}
+
+fn infer_github_repo_identity(
+    push_url: Option<&str>,
+    repo_ref: Option<&str>,
+) -> Option<GitHubRepoIdentity> {
+    if let Some(identity) = push_url.and_then(parse_github_repo_identity_from_git_ref) {
+        return Some(identity);
+    }
+    repo_ref.and_then(parse_github_repo_identity_from_git_ref)
+}
+
+fn parse_github_repo_identity_from_git_ref(raw_ref: &str) -> Option<GitHubRepoIdentity> {
+    let candidate = raw_ref.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+
+    if let Some((left, right)) = candidate.split_once(':') {
+        if !candidate.contains("://") && !left.is_empty() && !left.contains('/') {
+            return parse_github_repo_identity_from_path(right);
+        }
+    }
+
+    if let Some((_, remainder)) = candidate.split_once("://") {
+        let (_, path) = remainder.split_once('/')?;
+        return parse_github_repo_identity_from_path(path);
+    }
+
+    None
+}
+
+fn parse_github_repo_identity_from_path(raw_path: &str) -> Option<GitHubRepoIdentity> {
+    let path_without_fragment = raw_path
+        .split_once('#')
+        .map(|(value, _)| value)
+        .unwrap_or(raw_path);
+    let path_without_query = path_without_fragment
+        .split_once('?')
+        .map(|(value, _)| value)
+        .unwrap_or(path_without_fragment);
+
+    let segments = path_without_query
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() != 2 {
+        return None;
+    }
+
+    let owner = segments[0].trim();
+    let repo_name = segments[1].trim().trim_end_matches(".git");
+    if owner.is_empty() || repo_name.is_empty() {
+        return None;
+    }
+
+    Some(GitHubRepoIdentity {
+        owner: owner.to_string(),
+        name: repo_name.to_string(),
     })
 }
 
@@ -1821,6 +1927,90 @@ github_token_env = "github_pat_example123"
     }
 
     #[test]
+    fn app_config_accepts_raw_github_token_in_git_account_token_env_field() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[[git.accounts]]
+alias = "demo-account"
+token_env = "github_pat_example123"
+git_user_name = "Repo Bot"
+git_user_email = "repo-bot@example.test"
+
+[[git.repos]]
+alias = "demo"
+repo_ref = "https://github.com/acme/demo.git"
+platform = "github"
+account = "demo-account"
+repo_owner = "acme"
+repo_name = "demo"
+
+[sandbox]
+backend = "process"
+runtime_dir = "./workspaces/sandboxes"
+host_risk_posture = "already_isolated"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        assert_eq!(
+            loaded.resolve_clone_token_for_job(Some("demo")).as_deref(),
+            Some("github_pat_example123")
+        );
+    }
+
+    #[test]
+    fn app_config_clone_token_for_raw_jobs_falls_back_to_legacy_publishing_token() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "process"
+runtime_dir = "./workspaces/sandboxes"
+host_risk_posture = "already_isolated"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+
+[publishing]
+provider = "github"
+repo_owner = "antonguzun"
+repo_name = "kickfoss"
+github_token_env = "github_pat_example123"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        assert_eq!(
+            loaded.resolve_clone_token_for_job(None).as_deref(),
+            Some("github_pat_example123")
+        );
+    }
+
+    #[test]
     fn app_config_resolves_repo_alias_and_env_overlay_dir() {
         let temp = TempDir::new().expect("tempdir");
         let config_path = temp.path().join("config.toml");
@@ -1936,6 +2126,117 @@ bin = "/usr/local/bin/codex"
         assert_eq!(github.token, "github_pat_demo_token");
         assert_eq!(github.git_user_name, "Repo Bot");
         assert_eq!(github.git_user_email, "repo-bot@example.test");
+    }
+
+    #[test]
+    fn app_config_publish_plan_infers_repo_owner_and_name_from_repo_ref_or_push_url() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[[git.accounts]]
+alias = "demo-account"
+token = "github_pat_demo_token"
+git_user_name = "Repo Bot"
+git_user_email = "repo-bot@example.test"
+
+[[git.repos]]
+alias = "from-ref"
+repo_ref = "https://github.com/acme/inferred-from-ref.git"
+platform = "github"
+account = "demo-account"
+
+[[git.repos]]
+alias = "from-push-url"
+repo_ref = "./fixtures/local-repo"
+platform = "github"
+account = "demo-account"
+push_url = "git@github.com:acme/inferred-from-push.git"
+
+[sandbox]
+backend = "process"
+runtime_dir = "./workspaces/sandboxes"
+host_risk_posture = "already_isolated"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        let revision = Revision::new("main").expect("revision");
+
+        let from_ref = loaded
+            .resolve_publish_plan_for_job(Some("from-ref"), &revision)
+            .expect("publish plan");
+        let PublishRuntimePlan::GitHub(from_ref) = from_ref else {
+            panic!("expected github publish plan for repo_ref inference");
+        };
+        assert_eq!(from_ref.repo_owner, "acme");
+        assert_eq!(from_ref.repo_name, "inferred-from-ref");
+
+        let from_push_url = loaded
+            .resolve_publish_plan_for_job(Some("from-push-url"), &revision)
+            .expect("publish plan");
+        let PublishRuntimePlan::GitHub(from_push_url) = from_push_url else {
+            panic!("expected github publish plan for push_url inference");
+        };
+        assert_eq!(from_push_url.repo_owner, "acme");
+        assert_eq!(from_push_url.repo_name, "inferred-from-push");
+    }
+
+    #[test]
+    fn app_config_publish_plan_requires_explicit_owner_and_name_when_inference_is_ambiguous() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[[git.accounts]]
+alias = "demo-account"
+token = "github_pat_demo_token"
+git_user_name = "Repo Bot"
+git_user_email = "repo-bot@example.test"
+
+[[git.repos]]
+alias = "ambiguous"
+repo_ref = "https://github.com/acme/team/demo.git"
+platform = "github"
+account = "demo-account"
+
+[sandbox]
+backend = "process"
+runtime_dir = "./workspaces/sandboxes"
+host_risk_posture = "already_isolated"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        let revision = Revision::new("main").expect("revision");
+        let err = loaded
+            .resolve_publish_plan_for_job(Some("ambiguous"), &revision)
+            .expect_err("publish plan should fail");
+        assert!(err.contains("could not be inferred"));
     }
 
     #[test]

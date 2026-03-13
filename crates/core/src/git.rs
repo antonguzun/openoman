@@ -69,7 +69,13 @@ impl GitAdapter {
         revision: &Revision,
         workspace_id: &str,
     ) -> Result<PreparedWorkspace, GitError> {
-        self.prepare_workspace_with_env_overlay(repo_ref, revision, workspace_id, None)
+        self.prepare_workspace_with_env_overlay_and_clone_token(
+            repo_ref,
+            revision,
+            workspace_id,
+            None,
+            None,
+        )
     }
 
     pub fn prepare_workspace_with_env_overlay(
@@ -78,6 +84,23 @@ impl GitAdapter {
         revision: &Revision,
         workspace_id: &str,
         env_overlay_dir: Option<&Path>,
+    ) -> Result<PreparedWorkspace, GitError> {
+        self.prepare_workspace_with_env_overlay_and_clone_token(
+            repo_ref,
+            revision,
+            workspace_id,
+            env_overlay_dir,
+            None,
+        )
+    }
+
+    pub fn prepare_workspace_with_env_overlay_and_clone_token(
+        &self,
+        repo_ref: &RepoRef,
+        revision: &Revision,
+        workspace_id: &str,
+        env_overlay_dir: Option<&Path>,
+        clone_token: Option<&str>,
     ) -> Result<PreparedWorkspace, GitError> {
         let workspace_root = self.trusted_workspace_root.join(workspace_id);
         let trusted_clone_dir = workspace_root.join("trusted-clone");
@@ -88,15 +111,7 @@ impl GitAdapter {
         }
         fs::create_dir_all(&workspace_root)?;
 
-        run_git(
-            None,
-            vec![
-                OsStr::new("clone"),
-                OsStr::new("--quiet"),
-                OsStr::new(repo_ref.as_str()),
-                trusted_clone_dir.as_os_str(),
-            ],
-        )?;
+        run_git_clone(repo_ref.as_str(), &trusted_clone_dir, clone_token)?;
         run_git(
             Some(&trusted_clone_dir),
             vec![
@@ -119,6 +134,31 @@ impl GitAdapter {
             sandbox_workspace_dir,
         })
     }
+}
+
+fn run_git_clone(
+    repo_ref: &str,
+    trusted_clone_dir: &Path,
+    clone_token: Option<&str>,
+) -> Result<(), GitError> {
+    let mut args = Vec::new();
+    if repo_ref.starts_with("https://") {
+        if let Some(token) = clone_token.map(str::trim).filter(|value| !value.is_empty()) {
+            args.push(OsString::from("-c"));
+            args.push(OsString::from(format!(
+                "http.extraheader={}",
+                build_git_http_auth_header(token)
+            )));
+            args.push(OsString::from("-c"));
+            args.push(OsString::from("credential.helper="));
+        }
+    }
+
+    args.push(OsString::from("clone"));
+    args.push(OsString::from("--quiet"));
+    args.push(OsString::from(repo_ref));
+    args.push(trusted_clone_dir.as_os_str().to_os_string());
+    run_git_os(None, &args)
 }
 
 fn copy_env_overlay_files(
@@ -409,26 +449,7 @@ fn run_git(
         .into_iter()
         .map(|arg| arg.as_ref().to_os_string())
         .collect();
-
-    let mut command = Command::new("git");
-    command.args(&collected_args);
-    if let Some(dir) = current_dir {
-        command.current_dir(dir);
-    }
-
-    let output = command.output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    Err(GitError::CommandFailed {
-        program: "git".to_string(),
-        args: collected_args
-            .iter()
-            .map(|arg| arg.to_string_lossy().to_string())
-            .collect(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-    })
+    run_git_os(current_dir, &collected_args)
 }
 
 fn run_git_stdout(
@@ -439,26 +460,94 @@ fn run_git_stdout(
         .into_iter()
         .map(|arg| arg.as_ref().to_os_string())
         .collect();
+    run_git_stdout_os(current_dir, &collected_args)
+}
 
-    let mut command = Command::new("git");
-    command.args(&collected_args);
-    if let Some(dir) = current_dir {
-        command.current_dir(dir);
+fn run_git_os(current_dir: Option<&Path>, args: &[OsString]) -> Result<(), GitError> {
+    let output = run_git_command(current_dir, args)?;
+    if output.status.success() {
+        return Ok(());
     }
 
-    let output = command.output()?;
+    Err(GitError::CommandFailed {
+        program: "git".to_string(),
+        args: render_git_args_for_error(args),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+fn run_git_stdout_os(current_dir: Option<&Path>, args: &[OsString]) -> Result<Vec<u8>, GitError> {
+    let output = run_git_command(current_dir, args)?;
     if output.status.success() {
         return Ok(output.stdout);
     }
 
     Err(GitError::CommandFailed {
         program: "git".to_string(),
-        args: collected_args
-            .iter()
-            .map(|arg| arg.to_string_lossy().to_string())
-            .collect(),
+        args: render_git_args_for_error(args),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
     })
+}
+
+fn run_git_command(
+    current_dir: Option<&Path>,
+    args: &[OsString],
+) -> Result<std::process::Output, GitError> {
+    let mut command = Command::new("git");
+    command.args(args);
+    if let Some(dir) = current_dir {
+        command.current_dir(dir);
+    }
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    Ok(command.output()?)
+}
+
+fn render_git_args_for_error(args: &[OsString]) -> Vec<String> {
+    args.iter()
+        .map(|arg| {
+            let text = arg.to_string_lossy();
+            if text.starts_with("http.extraheader=") {
+                "http.extraheader=<redacted>".to_string()
+            } else {
+                text.to_string()
+            }
+        })
+        .collect()
+}
+
+fn build_git_http_auth_header(token: &str) -> String {
+    let credentials = format!("x-access-token:{token}");
+    format!(
+        "Authorization: Basic {}",
+        encode_base64(credentials.as_bytes())
+    )
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+
+        output.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        output.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(ALPHABET[(n & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+
+    output
 }
 
 #[cfg(test)]

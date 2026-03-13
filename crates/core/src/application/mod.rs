@@ -23,6 +23,7 @@ pub struct RunJobUseCase {
     limits: ResourceLimits,
     agent_execution: AgentExecutionSpec,
     repo_env_source_dir: Option<PathBuf>,
+    repo_clone_token: Option<String>,
     artifact_limits: RunJobArtifactLimits,
 }
 
@@ -63,6 +64,7 @@ impl RunJobUseCase {
         limits: ResourceLimits,
         agent_execution: AgentExecutionSpec,
         repo_env_source_dir: Option<PathBuf>,
+        repo_clone_token: Option<String>,
         artifact_limits: RunJobArtifactLimits,
     ) -> Self {
         Self {
@@ -72,6 +74,7 @@ impl RunJobUseCase {
             limits,
             agent_execution,
             repo_env_source_dir,
+            repo_clone_token,
             artifact_limits,
         }
     }
@@ -101,11 +104,12 @@ impl RunJobUseCase {
 
         let prepared = self
             .git
-            .prepare_workspace_with_env_overlay(
+            .prepare_workspace_with_env_overlay_and_clone_token(
                 &job.repo_ref,
                 &job.revision,
                 job.id.as_str(),
                 self.repo_env_source_dir.as_deref(),
+                self.repo_clone_token.as_deref(),
             )
             .map_err(|e| {
                 RunJobError::Message(format!(
@@ -853,6 +857,7 @@ mod tests {
                 limits(),
                 agent_execution(),
                 None,
+                None,
                 RunJobArtifactLimits {
                     log_limit_bytes: 1024 * 1024,
                     report_limit_bytes: 256 * 1024,
@@ -926,6 +931,7 @@ mod tests {
             limits(),
             agent_execution(),
             None,
+            None,
             RunJobArtifactLimits {
                 log_limit_bytes: 1024 * 1024,
                 report_limit_bytes: 256 * 1024,
@@ -998,6 +1004,7 @@ mod tests {
             )),
             limits(),
             agent_execution(),
+            None,
             None,
             RunJobArtifactLimits {
                 log_limit_bytes: 1024 * 1024,

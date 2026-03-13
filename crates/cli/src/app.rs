@@ -154,6 +154,7 @@ fn run_job(
     };
     let agent_execution = resolve_agent_execution_spec(&config.agent)?;
     let repo_env_source_dir = config.env_overlay_dir_for_alias(submitted_job.repo_alias.as_deref());
+    let repo_clone_token = config.resolve_clone_token_for_job(submitted_job.repo_alias.as_deref());
     let run_job = RunJobUseCase::new(
         store.clone(),
         GitAdapter::new(&config.trusted_workspace_dir),
@@ -161,6 +162,7 @@ fn run_job(
         config.execution.limits.clone(),
         agent_execution,
         repo_env_source_dir,
+        repo_clone_token,
         RunJobArtifactLimits {
             log_limit_bytes: LOG_LIMIT_BYTES,
             report_limit_bytes: REPORT_LIMIT_BYTES,

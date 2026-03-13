@@ -90,7 +90,7 @@ Repository config now supports many repositories, each with its own platform/acc
 - `[[git.accounts]]` defines reusable publish credentials and trusted commit identity (`git_user_name`, `git_user_email`)
 - `[[git.repos]]` defines repository alias, `repo_ref`, `platform`, optional `env_repo_name`, and GitHub publish metadata
 - `submit --repo <value>` resolves `<value>` as alias first, then falls back to raw repo refs/paths
-- `env_for_repo_dir` defaults to `./env_for_repo`; if `./env_for_repo/<env_repo_name>` exists, its files are copied into sandbox workspace root for that job
+- `env_repo_name` is optional and defaults to repo alias; `env_for_repo_dir` defaults to `./env_for_repo`, and if `./env_for_repo/<env_repo_name>` exists, its files are copied into sandbox workspace root for that job
 
 Alias-based jobs persist `repo_alias`, so publish/account behavior and env overlays remain deterministic at `run` time.
 
@@ -110,7 +110,7 @@ See `crates/core/src/git.rs` for the adapter API and tests.
 Preferred publishing config is repo-scoped under `[[git.repos]]` + `[[git.accounts]]`:
 
 - `platform = "github"` enables trusted GitHub publish planning for that alias
-- `repo_owner` and `repo_name` select the GitHub repository for pull request creation
+- `repo_owner` and `repo_name` select the GitHub repository for pull request creation; when omitted, openoman tries to infer them from `push_url` first, then `repo_ref`
 - `base_branch` is optional and otherwise defaults to the submitted revision
 - `branch_prefix` defaults to `openoman`
 - `api_base_url` defaults to `https://api.github.com`
