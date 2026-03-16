@@ -318,4 +318,49 @@ mod tests {
         assert_eq!(jobs.as_array().expect("array").len(), 1);
         assert_eq!(jobs[0]["job_id"], job_id);
     }
+
+    #[tokio::test]
+    async fn retry_job_over_http_inherits_branch_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let app = app(temp.path(), None).await;
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/jobs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"repo":"https://example.com/repo.git","revision":"main","instruction":"update readme"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let created = json_body(create).await;
+        let job_id = created["job_id"].as_str().expect("job id");
+        let branch_name = created["branch_name"]
+            .as_str()
+            .expect("branch name should be present");
+        let commit_message = created["commit_message"]
+            .as_str()
+            .expect("commit message should be present");
+
+        let retry = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/jobs/{job_id}/retry"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(retry.status(), StatusCode::CREATED);
+        let retried = json_body(retry).await;
+        assert_ne!(retried["job_id"], created["job_id"]);
+        assert_eq!(retried["branch_name"], branch_name);
+        assert_eq!(retried["commit_message"], commit_message);
+    }
 }

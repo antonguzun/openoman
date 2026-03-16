@@ -16,6 +16,25 @@ trusted_workspace_dir = "./workspaces/trusted"
 # openoman will copy files from `./env_for_repo/my_repo` into the sandbox workspace root.
 env_for_repo_dir = "./env_for_repo"
 
+[git.naming]
+# Optional trusted host-side LLM naming for branch names and commit messages.
+# If api_key/api_key_env is not set, openoman keeps the legacy deterministic naming path:
+# branch_name = "<branch_prefix>/<job_id>"
+# commit_message = "OpenOMAN job <job_id>"
+provider = "openai"
+model = "gpt-5-mini"
+api_key_env = "OPENOMAN_GIT_NAMING_OPENAI_API_KEY"
+api_base_url = "https://api.openai.com/v1"
+curl_bin = "curl"
+timeout_seconds = 30
+prompt_template = '''
+Return strict JSON with keys "branch_name" and "commit_message".
+Available template variables: {{job_id}}, {{repo_alias}}, {{repo_ref}}, {{revision}}, {{platform}}, {{instruction}}.
+Use job_id={{job_id}} repo={{repo_alias}} repo_ref={{repo_ref}} revision={{revision}} platform={{platform}}.
+The commit_message must stay single-line.
+Instruction: {{instruction}}
+'''
+
 [[git.accounts]]
 # Reusable git account identity used for trusted publish commits.
 alias = "github-personal"
@@ -41,6 +60,7 @@ account = "github-personal"
 repo_owner = "username"
 repo_name = "reponame"
 # Optional GitHub publish overrides.
+# Also used by the legacy branch naming path when git.naming is disabled.
 branch_prefix = "openoman"
 api_base_url = "https://api.github.com"
 
@@ -52,6 +72,7 @@ account = "gitlab-work"
 # Optional when inferable from repo_ref/push_url. repo_owner may include subgroup path segments.
 repo_owner = "group"
 repo_name = "project"
+# Also used by the legacy branch naming path when git.naming is disabled.
 branch_prefix = "openoman"
 # Defaults to https://gitlab.example.com/api/v4 when omitted and the host can be inferred.
 # api_base_url = "https://gitlab.example.com/api/v4"
@@ -133,7 +154,8 @@ repo_owner = "example"
 repo_name = "example-repo"
 # Defaults to the submitted revision when omitted.
 # base_branch = "main"
-# Prefix used for the pushed branch name, which becomes "<branch_prefix>/<job_id>".
+# Prefix used for the pushed branch name in the legacy deterministic naming path,
+# which becomes "<branch_prefix>/<job_id>" when git.naming is disabled.
 branch_prefix = "openoman"
 api_base_url = "https://api.github.com"
 # Defaults to https://github.com/<repo_owner>/<repo_name>.git when omitted.

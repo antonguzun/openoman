@@ -98,6 +98,12 @@ async fn dispatch_command(command: Commands, service: OperatorService) -> Result
         Commands::Result { job_id } => {
             let result = service.get_result(&job_id)?;
             println!("job_id={} result={}", result.job_id, result.result);
+            if let Some(branch_name) = result.branch_name {
+                println!("branch_name={branch_name}");
+            }
+            if let Some(commit_message) = result.commit_message {
+                println!("commit_message={commit_message}");
+            }
             if let Some(publish_result) = result.publish_result {
                 println!("branch={}", publish_result.branch_name);
                 println!("pull_request_number={}", publish_result.pull_request_number);

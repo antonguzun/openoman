@@ -39,20 +39,18 @@ impl GitHubPublisher {
 
     pub fn publish_patch(
         &self,
-        job_id: &str,
+        branch_name: &str,
+        commit_message: &str,
         instruction: &str,
         trusted_clone_dir: &Path,
         patch_path: &Path,
     ) -> Result<PublishedPullRequest, GitHubPublishError> {
-        let branch_name = build_branch_name(&self.config.branch_prefix, job_id);
-        let commit_message = format!("OpenOMAN job {job_id}");
-
         run_git(
             Some(trusted_clone_dir),
             vec![
                 OsStr::new("checkout"),
                 OsStr::new("-B"),
-                OsStr::new(&branch_name),
+                OsStr::new(branch_name),
             ],
         )?;
         run_git(
@@ -94,19 +92,19 @@ impl GitHubPublisher {
                 OsStr::new("commit"),
                 OsStr::new("--quiet"),
                 OsStr::new("-m"),
-                OsStr::new(&commit_message),
+                OsStr::new(commit_message),
             ],
         )?;
         push_branch(
             trusted_clone_dir,
             &self.config.push_url,
-            &branch_name,
+            branch_name,
             &self.config.token,
         )?;
 
-        let created = self.create_pull_request(&branch_name, job_id, instruction)?;
+        let created = self.create_pull_request(branch_name, commit_message, instruction)?;
         Ok(PublishedPullRequest {
-            branch_name,
+            branch_name: branch_name.to_string(),
             pull_request_url: created.html_url,
             pull_request_number: created.number,
         })
@@ -115,7 +113,7 @@ impl GitHubPublisher {
     fn create_pull_request(
         &self,
         branch_name: &str,
-        job_id: &str,
+        commit_message: &str,
         instruction: &str,
     ) -> Result<CreatePullRequestResponse, GitHubPublishError> {
         let api_url = format!(
@@ -125,7 +123,7 @@ impl GitHubPublisher {
             self.config.repo_name
         );
         let payload = CreatePullRequestRequest {
-            title: format!("OpenOMAN job {job_id}"),
+            title: commit_message.to_string(),
             body: format!("Instruction:\n\n{instruction}"),
             head: branch_name.to_string(),
             base: self.config.base_branch.clone(),
@@ -206,26 +204,6 @@ impl std::error::Error for GitHubPublishError {}
 impl From<std::io::Error> for GitHubPublishError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
-    }
-}
-
-fn build_branch_name(prefix: &str, job_id: &str) -> String {
-    let prefix = prefix.trim_matches('/');
-    let sanitized_job_id = job_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-
-    if prefix.is_empty() {
-        sanitized_job_id
-    } else {
-        format!("{prefix}/{sanitized_job_id}")
     }
 }
 
@@ -489,7 +467,8 @@ mod tests {
 
         let published = publisher
             .publish_patch(
-                "job-publish",
+                "openoman/job-publish",
+                "Refresh README copy",
                 "append a line to README",
                 &prepared.trusted_clone_dir,
                 &patch_path,
@@ -533,6 +512,7 @@ mod tests {
         let curl_request_body = fs::read_to_string(&curl_body).expect("curl body");
         assert!(curl_invocation.contains("Authorization: Bearer test-token"));
         assert!(curl_invocation.contains("https://api.example.test/repos/acme/demo/pulls"));
+        assert!(curl_request_body.contains("\"title\":\"Refresh README copy\""));
         assert!(curl_request_body.contains("\"head\":\"openoman/job-publish\""));
         assert!(curl_request_body.contains("\"base\":\"main\""));
     }

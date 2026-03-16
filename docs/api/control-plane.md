@@ -70,6 +70,8 @@ Response shape:
   "job_id": "job-1741860000000",
   "repo_ref": "https://github.com/acme/repo.git",
   "repo_alias": null,
+  "branch_name": "openoman/job-1741860000000",
+  "commit_message": "OpenOMAN job job-1741860000000",
   "revision": "main",
   "instruction": "update README",
   "check_profile": "unit",
@@ -111,7 +113,7 @@ If execution reaches a run-level failure, the endpoint returns `409` with the sa
 
 ### `POST /jobs/:id/retry`
 
-Creates a new queued job by copying the original job request fields.
+Creates a new queued job by copying the original job request fields and persisted branch identity.
 
 Response: same job object shape as `POST /jobs`.
 
@@ -171,6 +173,8 @@ Response:
 {
   "job_id": "job-1741860000000",
   "result": "success",
+  "branch_name": "openoman/job-1741860000000",
+  "commit_message": "OpenOMAN job job-1741860000000",
   "publish_warning": null,
   "publish_result": {
     "branch_name": "openoman/job-1741860000000",

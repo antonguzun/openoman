@@ -43,6 +43,8 @@ pub(crate) struct JobView {
     pub(crate) job_id: String,
     pub(crate) repo_ref: String,
     pub(crate) repo_alias: Option<String>,
+    pub(crate) branch_name: Option<String>,
+    pub(crate) commit_message: Option<String>,
     pub(crate) revision: String,
     pub(crate) instruction: String,
     pub(crate) check_profile: String,
@@ -89,6 +91,8 @@ pub(crate) struct ArtifactView {
 pub(crate) struct JobResultView {
     pub(crate) job_id: String,
     pub(crate) result: String,
+    pub(crate) branch_name: Option<String>,
+    pub(crate) commit_message: Option<String>,
     pub(crate) publish_warning: Option<String>,
     pub(crate) publish_result: Option<PublishResultView>,
 }
@@ -131,16 +135,26 @@ impl OperatorService {
         let check_profile = CheckProfile::new(input.check_profile).map_err(|e| e.to_string())?;
         let publish_policy =
             PublishPolicy::parse(&input.publish_policy).map_err(|e| e.to_string())?;
+        let git_naming = self.config.resolve_submit_git_naming(
+            id.as_str(),
+            repo_ref.as_str(),
+            resolved_repo.repo_alias.as_deref(),
+            &revision,
+            &input.instruction,
+        );
 
         let (job, event) = Job::submit(
             id,
             repo_ref,
             resolved_repo.repo_alias,
+            Some(git_naming.branch_name),
+            Some(git_naming.commit_message),
             revision,
             input.instruction,
             check_profile,
             publish_policy,
-        );
+        )
+        .map_err(|e| e.to_string())?;
         store.jobs().create(&job).map_err(|e| e.to_string())?;
         store
             .outbox()
@@ -165,9 +179,10 @@ impl OperatorService {
     pub(crate) fn get_job(&self, job_id: &str) -> Result<JobView, String> {
         let store = self.open_store()?;
         let job_id = parse_job_id(job_id)?;
-        let Some(job) = store.jobs().load(&job_id).map_err(|e| e.to_string())? else {
+        let Some(mut job) = store.jobs().load(&job_id).map_err(|e| e.to_string())? else {
             return Err(format!("job not found: {}", job_id.as_str()));
         };
+        self.ensure_job_git_naming(&store, &mut job)?;
         Ok(job_to_view(&job))
     }
 
@@ -182,11 +197,14 @@ impl OperatorService {
             JobId::new(generate_job_id()).map_err(|e| e.to_string())?,
             job.repo_ref.clone(),
             job.repo_alias.clone(),
+            job.branch_name.clone(),
+            job.commit_message.clone(),
             job.revision.clone(),
             job.instruction.clone(),
             job.check_profile.clone(),
             job.publish_policy.clone(),
-        );
+        )
+        .map_err(|e| e.to_string())?;
         store.jobs().create(&retry).map_err(|e| e.to_string())?;
         store
             .outbox()
@@ -206,9 +224,10 @@ impl OperatorService {
         ensure_network_privileges(&self.config.execution)?;
         let store = self.open_store()?;
         let job_id = parse_job_id(job_id)?;
-        let Some(submitted_job) = store.jobs().load(&job_id).map_err(|e| e.to_string())? else {
+        let Some(mut submitted_job) = store.jobs().load(&job_id).map_err(|e| e.to_string())? else {
             return Err(format!("job not found: {}", job_id.as_str()));
         };
+        self.ensure_job_git_naming(&store, &mut submitted_job)?;
         let execution_backend = self.execution_backend()?;
         let agent_execution = resolve_agent_execution_spec(&self.config.agent)?;
         let repo_env_source_dir = self
@@ -323,9 +342,10 @@ impl OperatorService {
     pub(crate) fn get_result(&self, job_id: &str) -> Result<JobResultView, String> {
         let store = self.open_store()?;
         let job_id = parse_job_id(job_id)?;
-        let Some(job) = store.jobs().load(&job_id).map_err(|e| e.to_string())? else {
+        let Some(mut job) = store.jobs().load(&job_id).map_err(|e| e.to_string())? else {
             return Err(format!("job not found: {}", job_id.as_str()));
         };
+        self.ensure_job_git_naming(&store, &mut job)?;
 
         let result = match job.state {
             JobState::Succeeded => "success",
@@ -336,6 +356,8 @@ impl OperatorService {
         Ok(JobResultView {
             job_id: job.id.as_str().to_string(),
             result: result.to_string(),
+            branch_name: job.branch_name.clone(),
+            commit_message: job.commit_message.clone(),
             publish_warning: job.publish_warning.clone(),
             publish_result: job.publish_result.as_ref().map(publish_result_to_view),
         })
@@ -357,6 +379,19 @@ impl OperatorService {
             .check_runtime_dependencies()
             .map_err(|e| format!("sandbox backend validation failed: {e}"))?;
         Ok(execution_backend)
+    }
+
+    fn ensure_job_git_naming(&self, store: &SqliteStore, job: &mut Job) -> Result<(), String> {
+        if job.branch_name.is_some() && job.commit_message.is_some() {
+            return Ok(());
+        }
+
+        let naming = self
+            .config
+            .resolve_legacy_git_naming_for_job(job.id.as_str(), job.repo_alias.as_deref());
+        job.ensure_git_naming(naming.branch_name, naming.commit_message)
+            .map_err(|e| e.to_string())?;
+        store.jobs().update(job).map_err(|e| e.to_string())
     }
 }
 
@@ -387,6 +422,8 @@ fn job_to_view(job: &Job) -> JobView {
         job_id: job.id.as_str().to_string(),
         repo_ref: job.repo_ref.as_str().to_string(),
         repo_alias: job.repo_alias.clone(),
+        branch_name: job.branch_name.clone(),
+        commit_message: job.commit_message.clone(),
         revision: job.revision.as_str().to_string(),
         instruction: job.instruction.clone(),
         check_profile: job.check_profile.as_str().to_string(),

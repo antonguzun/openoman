@@ -13,12 +13,13 @@ Use openoman when you want agent automation to touch real code, but you do not w
 - [Bring your own task source](#cli-and-http-control-plane): use the built-in CLI, or wire your own Telegram bot, web UI, cron job, issue tracker bridge, or any other adapter against the HTTP API. Details: [docs/design-docs/control-plane-and-adapters.md](docs/design-docs/control-plane-and-adapters.md), [docs/api/control-plane.md](docs/api/control-plane.md), [docs/api/openapi.yaml](docs/api/openapi.yaml)
 - [Swap agents without changing the rest of the system](#agent-provider-support): Codex and Cursor use the same sandbox and publish flow through one provider-neutral config shape. Details: [config.example.toml](config.example.toml), [guest/README.md](guest/README.md)
 - [Run many repositories safely](#repository-aliases-accounts-and-env-overlays): bind each repo to its own account, env overlay, and isolated task runs without contaminating other repos or your local setup. Details: [config.example.toml](config.example.toml)
+- [Control branch and commit naming centrally](#repository-aliases-accounts-env-overlays-and-git-naming): configure one trusted host-side prompt for branch and commit names, or omit the key and keep the old deterministic naming path. Details: [config.example.toml](config.example.toml)
 - [Inspect what happened after the run](#artifacts-and-audit-trail): SQLite-backed job state plus patch, report, logs, and publish metadata make runs inspectable after the fact. Details: [docs/design-docs/operational-model.md](docs/design-docs/operational-model.md), [docs/api/control-plane.md](docs/api/control-plane.md)
 
 ## Near-term plans
 
 - More agent providers on top of the same execution and publish flow
-- More flexible branch naming and commit message generation
+- Richer naming providers and templates beyond the initial global host-side LLM option
 - Additional sandbox backends and runtime options
 - Firecracker `jailer` support for a more hardened sandbox mode
 - Agent pipelines tailored to different task types such as architecture checks, documentation checks, and review flows
@@ -104,17 +105,22 @@ Agent configuration lives under `[agent]` and uses provider-neutral keys:
 
 Existing Codex configs that still use `codex_bin` and `codex_auth_file` continue to work as compatibility aliases.
 
-## Repository aliases, accounts, and env overlays
+## Repository aliases, accounts, env overlays, and git naming
 
 Repository configuration supports many repositories under `[git]`:
 
 - `[[git.accounts]]` defines reusable publish credentials and trusted commit identity
 - `[[git.repos]]` defines repository alias, `repo_ref`, `platform`, optional `env_repo_name`, and provider-specific publish metadata
+- `[git.naming]` optionally enables trusted host-side LLM generation for `branch_name` and `commit_message`
 - `submit --repo <value>` resolves `<value>` as alias first, then falls back to a raw repo ref or path
 - `env_repo_name` defaults to the repo alias
 - `env_for_repo_dir` defaults to `./env_for_repo`, and `./env_for_repo/<env_repo_name>` is copied into the sandbox workspace root when present
 
-Alias-based jobs persist `repo_alias`, so publish behavior and environment overlays remain deterministic at `run` time.
+Alias-based jobs persist `repo_alias`, so publish behavior and environment overlays remain deterministic at `run` time. Jobs now also persist `branch_name` and `commit_message` at submit time. `POST /jobs/:id/retry` inherits those values so later continuation flows can keep using the same branch identity.
+
+If `[git.naming]` has a configured API key, openoman calls the naming provider on the trusted host at submit time using the global prompt template. If the key is omitted, or if the provider returns an unusable response, openoman keeps the legacy deterministic behavior and uses the repo or legacy publishing `branch_prefix` plus the job ID.
+
+The naming prompt can currently reference `{{job_id}}`, `{{repo_alias}}`, `{{repo_ref}}`, `{{revision}}`, `{{platform}}`, and `{{instruction}}`. `commit_message` must be returned as a single line; invalid multi-line or empty values fall back to the legacy deterministic commit message.
 
 Each job still runs in its own sandbox, so repo-specific automation does not overwrite files, shells, or tool state in the environment you use for manual work.
 
@@ -133,7 +139,7 @@ Publishing support includes:
 - `--publish-policy never` to skip publishing cleanly
 - `--publish-policy on_validation_success` as the current publish-policy flag name for the trusted host-side publish path
 
-For successful publish flows, `openoman result <job_id>` and `GET /jobs/:id/result` expose the branch name and PR/MR metadata. When publish prerequisites are missing intentionally, the job can still succeed and returns `publish_warning=...`.
+For successful publish flows, `openoman result <job_id>` and `GET /jobs/:id/result` expose the persisted `branch_name`, `commit_message`, and PR/MR metadata. When publish prerequisites are missing intentionally, the job can still succeed and returns `publish_warning=...`.
 
 ## Artifacts and audit trail
 

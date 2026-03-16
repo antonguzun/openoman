@@ -291,6 +291,30 @@ fn submit_then_status_reports_queued_state() {
 }
 
 #[test]
+fn submit_then_result_shows_legacy_branch_identity_before_run() {
+    let temp = TempDir::new().expect("tempdir");
+    let fake_codex = write_fake_codex(temp.path());
+    let config = write_process_config(temp.path(), &codex_agent(&fake_codex), None);
+
+    let job_id = submit_job(&config, Path::new("github.com/acme/repo"), "create a patch");
+
+    let mut result = cli_cmd();
+    let result_output = result
+        .args(["--config", &config, "result", &job_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result_stdout = String::from_utf8(result_output).expect("utf8 result output");
+
+    assert!(result_stdout.contains(&format!("job_id={job_id} result=in_progress")));
+    assert!(result_stdout.contains(&format!("branch_name=openoman/{job_id}")));
+    assert!(result_stdout.contains(&format!("commit_message=OpenOMAN job {job_id}")));
+    assert!(!result_stdout.contains("pull_request_url="));
+}
+
+#[test]
 fn submit_then_run_persists_canonical_artifacts() {
     let temp = TempDir::new().expect("tempdir");
     let fixture_repo = temp.path().join("fixture-repo");
@@ -715,6 +739,8 @@ fn submit_run_and_result_show_github_publish_metadata() {
         .clone();
     let result_stdout = String::from_utf8(result_output).expect("utf8 result output");
     assert!(result_stdout.contains(&format!("job_id={job_id} result=success")));
+    assert!(result_stdout.contains(&format!("branch_name={branch_name}")));
+    assert!(result_stdout.contains(&format!("commit_message=OpenOMAN job {job_id}")));
     assert!(result_stdout.contains(&format!("branch={branch_name}")));
     assert!(result_stdout.contains("pull_request_number=17"));
     assert!(result_stdout.contains("pull_request_url=https://example.test/pulls/17"));
@@ -822,6 +848,8 @@ fn gitlab_alias_publishes_and_result_prints_merge_request_metadata() {
         .clone();
     let result_stdout = String::from_utf8(result_output).expect("utf8 result output");
     assert!(result_stdout.contains(&format!("job_id={job_id} result=success")));
+    assert!(result_stdout.contains(&format!("branch_name={branch_name}")));
+    assert!(result_stdout.contains(&format!("commit_message=OpenOMAN job {job_id}")));
     assert!(result_stdout.contains(&format!("branch={branch_name}")));
     assert!(result_stdout.contains("pull_request_number=17"));
     assert!(result_stdout.contains(
@@ -990,6 +1018,8 @@ fn publish_policy_never_skips_pull_request_creation() {
         .clone();
     let result_stdout = String::from_utf8(result_output).expect("utf8 result output");
     assert!(result_stdout.contains(&format!("job_id={job_id} result=success")));
+    assert!(result_stdout.contains(&format!("branch_name=openoman/{job_id}")));
+    assert!(result_stdout.contains(&format!("commit_message=OpenOMAN job {job_id}")));
     assert!(!result_stdout.contains("branch="));
     assert!(!result_stdout.contains("pull_request_url="));
 }
@@ -1089,6 +1119,8 @@ fn submit_with_repo_alias_applies_env_overlay_and_reports_publish_warning() {
         .clone();
     let result_stdout = String::from_utf8(result_output).expect("utf8 result output");
     assert!(result_stdout.contains("publish_warning="));
+    assert!(result_stdout.contains(&format!("branch_name=openoman/{job_id}")));
+    assert!(result_stdout.contains(&format!("commit_message=OpenOMAN job {job_id}")));
     assert!(!result_stdout.contains("branch="));
     assert!(!result_stdout.contains("pull_request_url="));
 

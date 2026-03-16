@@ -237,6 +237,8 @@ components:
       required:
         - job_id
         - repo_ref
+        - branch_name
+        - commit_message
         - revision
         - instruction
         - check_profile
@@ -250,6 +252,12 @@ components:
         repo_ref:
           type: string
         repo_alias:
+          type: string
+          nullable: true
+        branch_name:
+          type: string
+          nullable: true
+        commit_message:
           type: string
           nullable: true
         revision:
@@ -332,13 +340,19 @@ components:
           type: integer
     JobResult:
       type: object
-      required: [job_id, result]
+      required: [job_id, result, branch_name, commit_message]
       properties:
         job_id:
           type: string
         result:
           type: string
           enum: [success, failed, canceled, in_progress]
+        branch_name:
+          type: string
+          nullable: true
+        commit_message:
+          type: string
+          nullable: true
         publish_warning:
           type: string
           nullable: true

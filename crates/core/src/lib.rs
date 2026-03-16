@@ -3,6 +3,7 @@ pub mod application;
 pub mod domain;
 pub mod execution;
 pub mod git;
+pub mod git_naming;
 pub mod github;
 pub mod gitlab;
 pub mod persistence;

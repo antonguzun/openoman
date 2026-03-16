@@ -72,6 +72,8 @@ impl SqliteStore {
                 id TEXT PRIMARY KEY,
                 repo_ref TEXT NOT NULL,
                 repo_alias TEXT,
+                branch_name TEXT,
+                commit_message TEXT,
                 revision TEXT NOT NULL,
                 instruction TEXT NOT NULL DEFAULT '',
                 check_profile TEXT NOT NULL,
@@ -158,6 +160,16 @@ impl SqliteStore {
             &conn,
             "repo_alias",
             "ALTER TABLE jobs ADD COLUMN repo_alias TEXT",
+        )?;
+        ensure_jobs_column(
+            &conn,
+            "branch_name",
+            "ALTER TABLE jobs ADD COLUMN branch_name TEXT",
+        )?;
+        ensure_jobs_column(
+            &conn,
+            "commit_message",
+            "ALTER TABLE jobs ADD COLUMN commit_message TEXT",
         )?;
         ensure_jobs_column(
             &conn,
@@ -276,7 +288,7 @@ fn load_job_snapshots<P: rusqlite::Params>(
     params: P,
 ) -> Result<Vec<JobSnapshot>, PersistenceError> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT id, repo_ref, repo_alias, revision, instruction, check_profile, publish_policy, state, active_attempt_id, validation_succeeded,
+        "SELECT id, repo_ref, repo_alias, branch_name, commit_message, revision, instruction, check_profile, publish_policy, state, active_attempt_id, validation_succeeded,
                 publish_branch_name, pull_request_url, pull_request_number, publish_warning
          FROM jobs {suffix_sql}"
     ))?;
@@ -286,17 +298,19 @@ fn load_job_snapshots<P: rusqlite::Params>(
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, Option<String>>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
             row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
             row.get::<_, String>(7)?,
-            row.get::<_, Option<u32>>(8)?,
-            row.get::<_, bool>(9)?,
-            row.get::<_, Option<String>>(10)?,
-            row.get::<_, Option<String>>(11)?,
-            row.get::<_, Option<u64>>(12)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, Option<u32>>(10)?,
+            row.get::<_, bool>(11)?,
+            row.get::<_, Option<String>>(12)?,
             row.get::<_, Option<String>>(13)?,
+            row.get::<_, Option<u64>>(14)?,
+            row.get::<_, Option<String>>(15)?,
         ))
     })?;
 
@@ -306,6 +320,8 @@ fn load_job_snapshots<P: rusqlite::Params>(
             id,
             repo_ref,
             repo_alias,
+            branch_name,
+            commit_message,
             revision,
             instruction,
             check_profile,
@@ -324,6 +340,8 @@ fn load_job_snapshots<P: rusqlite::Params>(
             id: JobId::new(id)?,
             repo_ref: RepoRef::new(repo_ref)?,
             repo_alias,
+            branch_name,
+            commit_message,
             revision: Revision::new(revision)?,
             instruction,
             check_profile: CheckProfile::new(check_profile)?,
@@ -359,18 +377,22 @@ fn upsert_job(tx: &Transaction<'_>, job: &Job) -> Result<(), PersistenceError> {
         .as_ref()
         .map(|result| result.pull_request_number);
     let repo_alias = job.repo_alias.as_deref();
+    let branch_name = job.branch_name.as_deref();
+    let commit_message = job.commit_message.as_deref();
     let publish_warning = job.publish_warning.as_deref();
 
     tx.execute(
         "INSERT INTO jobs(
-            id, repo_ref, repo_alias, revision, instruction, check_profile, publish_policy, state,
+            id, repo_ref, repo_alias, branch_name, commit_message, revision, instruction, check_profile, publish_policy, state,
             active_attempt_id, validation_succeeded, publish_branch_name, pull_request_url,
             pull_request_number, publish_warning
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT(id) DO UPDATE SET
             repo_ref = excluded.repo_ref,
             repo_alias = excluded.repo_alias,
+            branch_name = excluded.branch_name,
+            commit_message = excluded.commit_message,
             revision = excluded.revision,
             instruction = excluded.instruction,
             check_profile = excluded.check_profile,
@@ -386,6 +408,8 @@ fn upsert_job(tx: &Transaction<'_>, job: &Job) -> Result<(), PersistenceError> {
             job.id.as_str(),
             job.repo_ref.as_str(),
             repo_alias,
+            branch_name,
+            commit_message,
             job.revision.as_str(),
             job.instruction.as_str(),
             job.check_profile.as_str(),
@@ -758,11 +782,14 @@ mod tests {
             JobId::new("job-epic-2").expect("job id"),
             RepoRef::new("github.com/acme/repo").expect("repo ref"),
             None,
+            Some("openoman/job-epic-2".to_string()),
+            Some("OpenOMAN job job-epic-2".to_string()),
             Revision::new("main").expect("revision"),
             "persisted instruction".to_string(),
             CheckProfile::new("unit").expect("profile"),
             PublishPolicy::OnValidationSuccess,
         )
+        .expect("submit should succeed")
         .0
     }
 
@@ -806,6 +833,11 @@ mod tests {
         assert_eq!(reloaded.state, JobState::CollectingArtifacts);
         assert_eq!(reloaded.attempts.len(), 1);
         assert_eq!(reloaded.artifacts.len(), 1);
+        assert_eq!(reloaded.branch_name.as_deref(), Some("openoman/job-epic-2"));
+        assert_eq!(
+            reloaded.commit_message.as_deref(),
+            Some("OpenOMAN job job-epic-2")
+        );
     }
 
     #[test]
@@ -869,6 +901,7 @@ mod tests {
             .expect("load job")
             .expect("job should exist");
         assert_eq!(reloaded.repo_alias.as_deref(), Some("demo-alias"));
+        assert_eq!(reloaded.branch_name.as_deref(), Some("openoman/job-epic-2"));
         assert_eq!(
             reloaded.publish_warning.as_deref(),
             Some("publishing skipped: missing token")
@@ -966,21 +999,27 @@ mod tests {
             JobId::new("job-1").expect("job id"),
             RepoRef::new("github.com/acme/one").expect("repo ref"),
             None,
+            Some("openoman/job-1".to_string()),
+            Some("OpenOMAN job job-1".to_string()),
             Revision::new("main").expect("revision"),
             "first".to_string(),
             CheckProfile::new("unit").expect("profile"),
             PublishPolicy::Never,
         )
+        .expect("submit should succeed")
         .0;
         let second = Job::submit(
             JobId::new("job-2").expect("job id"),
             RepoRef::new("github.com/acme/two").expect("repo ref"),
             None,
+            Some("openoman/job-2".to_string()),
+            Some("OpenOMAN job job-2".to_string()),
             Revision::new("main").expect("revision"),
             "second".to_string(),
             CheckProfile::new("unit").expect("profile"),
             PublishPolicy::Never,
         )
+        .expect("submit should succeed")
         .0;
 
         store.jobs().create(&first).expect("create first");

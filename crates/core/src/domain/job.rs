@@ -138,6 +138,8 @@ pub struct Job {
     pub id: JobId,
     pub repo_ref: RepoRef,
     pub repo_alias: Option<String>,
+    pub branch_name: Option<String>,
+    pub commit_message: Option<String>,
     pub revision: Revision,
     pub instruction: String,
     pub check_profile: CheckProfile,
@@ -156,6 +158,8 @@ pub struct JobSnapshot {
     pub id: JobId,
     pub repo_ref: RepoRef,
     pub repo_alias: Option<String>,
+    pub branch_name: Option<String>,
+    pub commit_message: Option<String>,
     pub revision: Revision,
     pub instruction: String,
     pub check_profile: CheckProfile,
@@ -174,15 +178,22 @@ impl Job {
         id: JobId,
         repo_ref: RepoRef,
         repo_alias: Option<String>,
+        branch_name: Option<String>,
+        commit_message: Option<String>,
         revision: Revision,
         instruction: String,
         check_profile: CheckProfile,
         publish_policy: PublishPolicy,
-    ) -> (Self, JobEvent) {
+    ) -> Result<(Self, JobEvent), JobError> {
         let job = Self {
             id: id.clone(),
             repo_ref,
             repo_alias,
+            branch_name: normalize_optional_job_text(branch_name, JobError::EmptyBranchName)?,
+            commit_message: normalize_optional_job_text(
+                commit_message,
+                JobError::EmptyCommitMessage,
+            )?,
             revision,
             instruction,
             check_profile,
@@ -196,7 +207,7 @@ impl Job {
             validation_succeeded: false,
         };
 
-        (job, JobEvent::JobSubmitted { job_id: id })
+        Ok((job, JobEvent::JobSubmitted { job_id: id }))
     }
 
     pub fn rehydrate(snapshot: JobSnapshot) -> Self {
@@ -204,6 +215,8 @@ impl Job {
             id: snapshot.id,
             repo_ref: snapshot.repo_ref,
             repo_alias: snapshot.repo_alias,
+            branch_name: snapshot.branch_name,
+            commit_message: snapshot.commit_message,
             revision: snapshot.revision,
             instruction: snapshot.instruction,
             check_profile: snapshot.check_profile,
@@ -216,6 +229,20 @@ impl Job {
             active_attempt_id: snapshot.active_attempt_id,
             validation_succeeded: snapshot.validation_succeeded,
         }
+    }
+
+    pub fn ensure_git_naming(
+        &mut self,
+        branch_name: impl Into<String>,
+        commit_message: impl Into<String>,
+    ) -> Result<(), JobError> {
+        let branch_name =
+            normalize_required_job_text(branch_name.into(), JobError::EmptyBranchName)?;
+        let commit_message =
+            normalize_required_job_text(commit_message.into(), JobError::EmptyCommitMessage)?;
+        self.branch_name = Some(branch_name);
+        self.commit_message = Some(commit_message);
+        Ok(())
     }
 
     pub fn active_attempt_id(&self) -> Option<u32> {
@@ -465,6 +492,8 @@ pub enum JobError {
     NoActiveAttempt,
     PublishRequiresValidationSuccess,
     PublishSkipRequiresNeverPolicy,
+    EmptyBranchName,
+    EmptyCommitMessage,
     EmptyPublishWarning,
     TerminalJob,
 }
@@ -483,6 +512,8 @@ impl Display for JobError {
             Self::PublishSkipRequiresNeverPolicy => {
                 write!(f, "publish skipping requires publish policy never")
             }
+            Self::EmptyBranchName => write!(f, "branch name must not be empty"),
+            Self::EmptyCommitMessage => write!(f, "commit message must not be empty"),
             Self::EmptyPublishWarning => write!(f, "publish warning must not be empty"),
             Self::TerminalJob => write!(f, "job is in a terminal state"),
         }
@@ -490,6 +521,23 @@ impl Display for JobError {
 }
 
 impl std::error::Error for JobError {}
+
+fn normalize_optional_job_text(
+    value: Option<String>,
+    empty_error: JobError,
+) -> Result<Option<String>, JobError> {
+    value
+        .map(|raw| normalize_required_job_text(raw, empty_error.clone()))
+        .transpose()
+}
+
+fn normalize_required_job_text(value: String, empty_error: JobError) -> Result<String, JobError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(empty_error);
+    }
+    Ok(trimmed.to_string())
+}
 
 #[cfg(test)]
 mod tests {
@@ -500,11 +548,14 @@ mod tests {
             JobId::new("job-1").expect("valid id"),
             RepoRef::new("github.com/acme/repo").expect("valid repo"),
             None,
+            Some("openoman/job-1".to_string()),
+            Some("OpenOMAN job job-1".to_string()),
             Revision::new("main").expect("valid revision"),
             "test instruction".to_string(),
             CheckProfile::new("unit").expect("valid check profile"),
             PublishPolicy::OnValidationSuccess,
         )
+        .expect("submit should succeed")
         .0
     }
 
@@ -597,11 +648,14 @@ mod tests {
             JobId::new("job-never").expect("valid id"),
             RepoRef::new("github.com/acme/repo").expect("valid repo"),
             None,
+            Some("openoman/job-never".to_string()),
+            Some("OpenOMAN job job-never".to_string()),
             Revision::new("main").expect("valid revision"),
             "test instruction".to_string(),
             CheckProfile::new("unit").expect("valid check profile"),
             PublishPolicy::Never,
         )
+        .expect("submit should succeed")
         .0;
 
         job.start_attempt(1).expect("attempt should start");
@@ -643,5 +697,28 @@ mod tests {
             Some("missing publish token")
         );
         assert!(job.publish_result.is_none());
+    }
+
+    #[test]
+    fn ensure_git_naming_populates_missing_fields() {
+        let mut job = Job::submit(
+            JobId::new("job-missing-naming").expect("valid id"),
+            RepoRef::new("github.com/acme/repo").expect("valid repo"),
+            None,
+            None,
+            None,
+            Revision::new("main").expect("valid revision"),
+            "test instruction".to_string(),
+            CheckProfile::new("unit").expect("valid check profile"),
+            PublishPolicy::OnValidationSuccess,
+        )
+        .expect("submit should succeed")
+        .0;
+
+        job.ensure_git_naming("topic/job-missing-naming", "Refresh docs")
+            .expect("naming should be stored");
+
+        assert_eq!(job.branch_name.as_deref(), Some("topic/job-missing-naming"));
+        assert_eq!(job.commit_message.as_deref(), Some("Refresh docs"));
     }
 }

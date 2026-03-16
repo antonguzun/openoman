@@ -20,6 +20,10 @@ use openoman_core::{
         FirecrackerNetworkingConfig, FirecrackerNetworkingMode, HostRiskPosture, ResourceLimits,
         UserPackageDir,
     },
+    git_naming::{
+        build_legacy_git_naming, resolve_git_naming as core_resolve_git_naming,
+        GitNamingPromptContext, OpenAiGitNamingConfig, ResolvedGitNaming,
+    },
     github::GitHubPublisherConfig,
     gitlab::GitLabPublisherConfig,
 };
@@ -44,8 +48,21 @@ struct CoreConfig {
 struct GitConfig {
     trusted_workspace_dir: Option<String>,
     env_for_repo_dir: Option<String>,
+    naming: Option<GitNamingConfig>,
     accounts: Option<Vec<GitAccountConfig>>,
     repos: Option<Vec<GitRepoConfig>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitNamingConfig {
+    provider: Option<String>,
+    model: Option<String>,
+    api_base_url: Option<String>,
+    api_key: Option<String>,
+    api_key_env: Option<String>,
+    curl_bin: Option<String>,
+    timeout_seconds: Option<u64>,
+    prompt_template: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,6 +174,7 @@ pub(crate) struct AppConfig {
     pub(crate) agent: AgentRuntimeConfig,
     pub(crate) server: ServerRuntimeConfig,
     pub(crate) publishing: Option<PublishingRuntimeConfig>,
+    git_naming: Option<OpenAiGitNamingConfig>,
     repo_catalog: RepoCatalogRuntimeConfig,
 }
 
@@ -280,6 +298,7 @@ impl AppConfig {
         let git = git.unwrap_or(GitConfig {
             trusted_workspace_dir: None,
             env_for_repo_dir: None,
+            naming: None,
             accounts: None,
             repos: None,
         });
@@ -362,6 +381,7 @@ impl AppConfig {
             agent: agent_runtime,
             server: load_server_config(server)?,
             publishing: load_publishing_config(publishing, path)?,
+            git_naming: load_git_naming_config(&git)?,
             repo_catalog,
         })
     }
@@ -386,6 +406,35 @@ impl AppConfig {
             repo_ref: candidate.to_string(),
             repo_alias: None,
         })
+    }
+
+    pub(crate) fn resolve_submit_git_naming(
+        &self,
+        job_id: &str,
+        repo_ref: &str,
+        repo_alias: Option<&str>,
+        revision: &Revision,
+        instruction: &str,
+    ) -> ResolvedGitNaming {
+        let platform = self.platform_name_for_job(repo_alias);
+        let branch_prefix = self.legacy_branch_prefix_for_job(repo_alias);
+        let context = GitNamingPromptContext {
+            job_id,
+            repo_ref,
+            repo_alias,
+            revision: revision.as_str(),
+            instruction,
+            platform: &platform,
+        };
+        core_resolve_git_naming(self.git_naming.as_ref(), &branch_prefix, &context)
+    }
+
+    pub(crate) fn resolve_legacy_git_naming_for_job(
+        &self,
+        job_id: &str,
+        repo_alias: Option<&str>,
+    ) -> ResolvedGitNaming {
+        build_legacy_git_naming(&self.legacy_branch_prefix_for_job(repo_alias), job_id)
     }
 
     pub(crate) fn env_overlay_dir_for_alias(&self, repo_alias: Option<&str>) -> Option<PathBuf> {
@@ -418,6 +467,38 @@ impl AppConfig {
                     Some(trimmed.to_string())
                 }
             })
+    }
+
+    fn legacy_branch_prefix_for_job(&self, repo_alias: Option<&str>) -> String {
+        if let Some(alias) = repo_alias {
+            if let Some(repo) = self.repo_catalog.repos_by_alias.get(alias) {
+                return repo.publish.branch_prefix.clone();
+            }
+        }
+
+        self.publishing
+            .as_ref()
+            .map(|publishing| publishing.branch_prefix.clone())
+            .unwrap_or_else(|| "openoman".to_string())
+    }
+
+    fn platform_name_for_job(&self, repo_alias: Option<&str>) -> String {
+        if let Some(alias) = repo_alias {
+            if let Some(repo) = self.repo_catalog.repos_by_alias.get(alias) {
+                return match repo.platform {
+                    RepoPlatform::GitHub => "github",
+                    RepoPlatform::GitLab => "gitlab",
+                    RepoPlatform::GitLabSelfHosted => "gitlab_self_hosted",
+                }
+                .to_string();
+            }
+        }
+
+        if self.publishing.is_some() {
+            "github".to_string()
+        } else {
+            "unknown".to_string()
+        }
     }
 
     pub(crate) fn resolve_publish_plan_for_job(
@@ -887,6 +968,51 @@ fn load_repo_catalog_config(
     })
 }
 
+fn load_git_naming_config(git: &GitConfig) -> Result<Option<OpenAiGitNamingConfig>, String> {
+    let Some(config) = git.naming.as_ref() else {
+        return Ok(None);
+    };
+
+    let api_key = resolve_secret_value(config.api_key_env.as_deref(), config.api_key.clone());
+    let Some(api_key) = api_key else {
+        return Ok(None);
+    };
+
+    let provider = config
+        .provider
+        .as_deref()
+        .unwrap_or("openai")
+        .trim()
+        .to_ascii_lowercase();
+    if provider != "openai" {
+        return Err(format!(
+            "unsupported git.naming.provider '{}'; supported providers: openai",
+            provider
+        ));
+    }
+
+    let model =
+        normalize_required_string(config.model.as_deref().unwrap_or(""), "git.naming.model")?;
+    let prompt_template = normalize_required_string(
+        config.prompt_template.as_deref().unwrap_or(""),
+        "git.naming.prompt_template",
+    )?;
+
+    Ok(Some(OpenAiGitNamingConfig {
+        api_base_url: normalize_optional_string(
+            config.api_base_url.as_deref(),
+            "git.naming.api_base_url",
+        )?
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+        model,
+        api_key,
+        curl_bin: normalize_optional_string(config.curl_bin.as_deref(), "git.naming.curl_bin")?
+            .unwrap_or_else(|| "curl".to_string()),
+        timeout_seconds: config.timeout_seconds.unwrap_or(30),
+        prompt_template,
+    }))
+}
+
 fn resolve_generic_token(token_env: Option<&str>, token: Option<String>) -> Option<String> {
     if let Some(token_env) = token_env.map(str::trim).filter(|value| !value.is_empty()) {
         if let Ok(value) = env::var(token_env) {
@@ -899,6 +1025,25 @@ fn resolve_generic_token(token_env: Option<&str>, token: Option<String>) -> Opti
         }
     }
     token.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn resolve_secret_value(secret_env: Option<&str>, secret: Option<String>) -> Option<String> {
+    if let Some(secret_env) = secret_env.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Ok(value) = env::var(secret_env) {
+            if !value.trim().is_empty() {
+                return Some(value);
+            }
+        }
+    }
+
+    secret.and_then(|value| {
         let trimmed = value.trim();
         if trimmed.is_empty() {
             None
@@ -1436,7 +1581,7 @@ fn expand_home(raw: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::{fs, os::unix::fs::PermissionsExt};
     use tempfile::TempDir;
 
     #[test]
@@ -2733,5 +2878,113 @@ bin = "/usr/local/bin/codex"
 
         assert_eq!(loaded.server.bind_addr.to_string(), "127.0.0.1:9090");
         assert_eq!(loaded.server.auth_token.as_deref(), Some("secret-token"));
+    }
+
+    #[test]
+    fn app_config_treats_git_naming_without_api_key_as_disabled() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[git.naming]
+model = "gpt-5"
+prompt_template = "job={{job_id}}"
+
+[[git.repos]]
+alias = "demo"
+repo_ref = "https://github.com/acme/demo.git"
+branch_prefix = "topic"
+
+[sandbox]
+backend = "process"
+runtime_dir = "./workspaces/sandboxes"
+host_risk_posture = "already_isolated"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        let revision = Revision::new("main").expect("revision");
+        let naming = loaded.resolve_submit_git_naming(
+            "job-123",
+            "https://github.com/acme/demo.git",
+            Some("demo"),
+            &revision,
+            "refresh docs",
+        );
+
+        assert_eq!(naming.branch_name, "topic/job-123");
+        assert_eq!(naming.commit_message, "OpenOMAN job job-123");
+    }
+
+    #[test]
+    fn app_config_uses_git_naming_llm_when_api_key_is_configured() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        let fake_curl = temp.path().join("fake-curl.sh");
+        fs::write(
+            &fake_curl,
+            "#!/bin/sh\nprintf '%s' '{\"output\":[{\"content\":[{\"text\":\"{\\\"branch_name\\\":\\\"feature/refresh-docs\\\",\\\"commit_message\\\":\\\"Refresh docs wording\\\"}\"}]}]}'\n",
+        )
+        .expect("write fake curl");
+        fs::set_permissions(&fake_curl, PermissionsExt::from_mode(0o755)).expect("chmod fake curl");
+
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[git.naming]
+api_key = "test-key"
+model = "gpt-5"
+curl_bin = "{}"
+prompt_template = "job={{{{job_id}}}} instruction={{{{instruction}}}}"
+
+[[git.repos]]
+alias = "demo"
+repo_ref = "https://github.com/acme/demo.git"
+
+[sandbox]
+backend = "process"
+runtime_dir = "./workspaces/sandboxes"
+host_risk_posture = "already_isolated"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+                fake_curl.display().to_string().replace('\\', "\\\\"),
+            ),
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        let revision = Revision::new("main").expect("revision");
+        let naming = loaded.resolve_submit_git_naming(
+            "job-123",
+            "https://github.com/acme/demo.git",
+            Some("demo"),
+            &revision,
+            "refresh docs",
+        );
+
+        assert_eq!(naming.branch_name, "feature/refresh-docs");
+        assert_eq!(naming.commit_message, "Refresh docs wording");
     }
 }

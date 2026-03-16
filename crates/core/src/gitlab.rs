@@ -38,20 +38,18 @@ impl GitLabPublisher {
 
     pub fn publish_patch(
         &self,
-        job_id: &str,
+        branch_name: &str,
+        commit_message: &str,
         instruction: &str,
         trusted_clone_dir: &Path,
         patch_path: &Path,
     ) -> Result<PublishedMergeRequest, GitLabPublishError> {
-        let branch_name = build_branch_name(&self.config.branch_prefix, job_id);
-        let commit_message = format!("OpenOMAN job {job_id}");
-
         run_git(
             Some(trusted_clone_dir),
             vec![
                 OsStr::new("checkout"),
                 OsStr::new("-B"),
-                OsStr::new(&branch_name),
+                OsStr::new(branch_name),
             ],
         )?;
         run_git(
@@ -93,19 +91,19 @@ impl GitLabPublisher {
                 OsStr::new("commit"),
                 OsStr::new("--quiet"),
                 OsStr::new("-m"),
-                OsStr::new(&commit_message),
+                OsStr::new(commit_message),
             ],
         )?;
         push_branch(
             trusted_clone_dir,
             &self.config.push_url,
-            &branch_name,
+            branch_name,
             &self.config.token,
         )?;
 
-        let created = self.create_merge_request(&branch_name, job_id, instruction)?;
+        let created = self.create_merge_request(branch_name, commit_message, instruction)?;
         Ok(PublishedMergeRequest {
-            branch_name,
+            branch_name: branch_name.to_string(),
             pull_request_url: created.web_url,
             pull_request_number: created.iid,
         })
@@ -114,7 +112,7 @@ impl GitLabPublisher {
     fn create_merge_request(
         &self,
         branch_name: &str,
-        job_id: &str,
+        commit_message: &str,
         instruction: &str,
     ) -> Result<CreateMergeRequestResponse, GitLabPublishError> {
         let api_url = format!(
@@ -123,7 +121,7 @@ impl GitLabPublisher {
             percent_encode_path(&self.config.project_path)
         );
         let payload = CreateMergeRequestRequest {
-            title: format!("OpenOMAN job {job_id}"),
+            title: commit_message.to_string(),
             description: format!("Instruction:\n\n{instruction}"),
             source_branch: branch_name.to_string(),
             target_branch: self.config.base_branch.clone(),
@@ -204,26 +202,6 @@ impl std::error::Error for GitLabPublishError {}
 impl From<std::io::Error> for GitLabPublishError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
-    }
-}
-
-fn build_branch_name(prefix: &str, job_id: &str) -> String {
-    let prefix = prefix.trim_matches('/');
-    let sanitized_job_id = job_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-
-    if prefix.is_empty() {
-        sanitized_job_id
-    } else {
-        format!("{prefix}/{sanitized_job_id}")
     }
 }
 
@@ -504,7 +482,8 @@ mod tests {
 
         let published = publisher
             .publish_patch(
-                "job-publish",
+                "openoman/job-publish",
+                "Refresh README copy",
                 "append a line to README",
                 &prepared.trusted_clone_dir,
                 &patch_path,
@@ -552,6 +531,7 @@ mod tests {
         assert!(curl_invocation.contains(
             "https://gitlab.example.test/api/v4/projects/group%2Fsubgroup%2Fdemo/merge_requests"
         ));
+        assert!(curl_request_body.contains("\"title\":\"Refresh README copy\""));
         assert!(curl_request_body.contains("\"source_branch\":\"openoman/job-publish\""));
         assert!(curl_request_body.contains("\"target_branch\":\"main\""));
     }

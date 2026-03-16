@@ -368,6 +368,16 @@ where
                 Ok(None)
             }
             PublishExecutionPlan::GitHub(publishing) => {
+                let branch_name = job.branch_name.clone().ok_or_else(|| {
+                    RunJobError::Message(
+                        "branch_name must be populated before publishing".to_string(),
+                    )
+                })?;
+                let commit_message = job.commit_message.clone().ok_or_else(|| {
+                    RunJobError::Message(
+                        "commit_message must be populated before publishing".to_string(),
+                    )
+                })?;
                 let patch_record = artifact_records
                     .iter()
                     .find(|artifact| artifact.artifact_ref == "sandbox.patch")
@@ -379,7 +389,8 @@ where
                 let publisher = GitHubPublisher::new(publishing);
                 let published = publisher
                     .publish_patch(
-                        job.id.as_str(),
+                        &branch_name,
+                        &commit_message,
                         &job.instruction,
                         &prepared.trusted_clone_dir,
                         Path::new(&patch_record.path),
@@ -407,6 +418,16 @@ where
                 )?))
             }
             PublishExecutionPlan::GitLab(publishing) => {
+                let branch_name = job.branch_name.clone().ok_or_else(|| {
+                    RunJobError::Message(
+                        "branch_name must be populated before publishing".to_string(),
+                    )
+                })?;
+                let commit_message = job.commit_message.clone().ok_or_else(|| {
+                    RunJobError::Message(
+                        "commit_message must be populated before publishing".to_string(),
+                    )
+                })?;
                 let patch_record = artifact_records
                     .iter()
                     .find(|artifact| artifact.artifact_ref == "sandbox.patch")
@@ -418,7 +439,8 @@ where
                 let publisher = GitLabPublisher::new(publishing);
                 let published = publisher
                     .publish_patch(
-                        job.id.as_str(),
+                        &branch_name,
+                        &commit_message,
                         &job.instruction,
                         &prepared.trusted_clone_dir,
                         Path::new(&patch_record.path),
@@ -863,11 +885,14 @@ mod tests {
             JobId::new("job-running").expect("job id"),
             RepoRef::new(fixture_repo.display().to_string()).expect("repo ref"),
             None,
+            Some("openoman/job-running".to_string()),
+            Some("OpenOMAN job job-running".to_string()),
             Revision::new("main").expect("revision"),
             "append a blank line".to_string(),
             CheckProfile::new("unit").expect("profile"),
             PublishPolicy::Never,
-        );
+        )
+        .expect("submit should succeed");
         store.jobs().create(&job).expect("create job");
 
         let (observed_tx, observed_rx) = mpsc::channel();
@@ -950,11 +975,14 @@ mod tests {
             JobId::new("job-failing").expect("job id"),
             RepoRef::new(fixture_repo.display().to_string()).expect("repo ref"),
             None,
+            Some("openoman/job-failing".to_string()),
+            Some("OpenOMAN job job-failing".to_string()),
             Revision::new("main").expect("revision"),
             "append a blank line".to_string(),
             CheckProfile::new("unit").expect("profile"),
             PublishPolicy::Never,
-        );
+        )
+        .expect("submit should succeed");
         store.jobs().create(&job).expect("create job");
 
         let use_case = RunJobUseCase::new(
@@ -1024,11 +1052,14 @@ mod tests {
             JobId::new("job-publish-warning").expect("job id"),
             RepoRef::new(fixture_repo.display().to_string()).expect("repo ref"),
             Some("demo-alias".to_string()),
+            Some("openoman/job-publish-warning".to_string()),
+            Some("OpenOMAN job job-publish-warning".to_string()),
             Revision::new("main").expect("revision"),
             "append a blank line".to_string(),
             CheckProfile::new("unit").expect("profile"),
             PublishPolicy::OnValidationSuccess,
-        );
+        )
+        .expect("submit should succeed");
         store.jobs().create(&job).expect("create job");
 
         let use_case = RunJobUseCase::new(
