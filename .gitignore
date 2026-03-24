@@ -24,4 +24,4 @@ workspaces/*
 data/*
 config.toml
 .env
-
+env_for_repo/*

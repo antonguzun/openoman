@@ -11,7 +11,7 @@ use crate::{
     execution::{
         AgentExecutionSpec, AttemptSpec, CollectedExecutionOutput, ExecutionBackend, ResourceLimits,
     },
-    git::{write_canonical_patch, GitAdapter, PreparedWorkspace},
+    git::{write_canonical_patch, GitAdapter, PrepareWorkspaceOptions, PreparedWorkspace},
     github::{GitHubPublisher, GitHubPublisherConfig},
     gitlab::{GitLabPublisher, GitLabPublisherConfig},
     persistence::{NewArtifactRecord, NewOutboxEvent, OutboxStatus, SqliteStore},
@@ -25,6 +25,7 @@ pub struct RunJobUseCase {
     agent_execution: AgentExecutionSpec,
     repo_env_source_dir: Option<PathBuf>,
     repo_clone_token: Option<String>,
+    repo_post_clone_command: Option<String>,
     artifact_limits: RunJobArtifactLimits,
 }
 
@@ -67,6 +68,7 @@ impl RunJobUseCase {
         agent_execution: AgentExecutionSpec,
         repo_env_source_dir: Option<PathBuf>,
         repo_clone_token: Option<String>,
+        repo_post_clone_command: Option<String>,
         artifact_limits: RunJobArtifactLimits,
     ) -> Self {
         Self {
@@ -77,6 +79,7 @@ impl RunJobUseCase {
             agent_execution,
             repo_env_source_dir,
             repo_clone_token,
+            repo_post_clone_command,
             artifact_limits,
         }
     }
@@ -106,12 +109,15 @@ impl RunJobUseCase {
 
         let prepared = self
             .git
-            .prepare_workspace_with_env_overlay_and_clone_token(
+            .prepare_workspace_with_options(
                 &job.repo_ref,
                 &job.revision,
                 job.id.as_str(),
-                self.repo_env_source_dir.as_deref(),
-                self.repo_clone_token.as_deref(),
+                PrepareWorkspaceOptions {
+                    env_overlay_dir: self.repo_env_source_dir.as_deref(),
+                    clone_token: self.repo_clone_token.as_deref(),
+                    post_clone_command: self.repo_post_clone_command.as_deref(),
+                },
             )
             .map_err(|e| {
                 RunJobError::Message(format!(
@@ -924,6 +930,7 @@ mod tests {
                 agent_execution(),
                 None,
                 None,
+                None,
                 RunJobArtifactLimits {
                     log_limit_bytes: 1024 * 1024,
                     report_limit_bytes: 256 * 1024,
@@ -1001,6 +1008,7 @@ mod tests {
             agent_execution(),
             None,
             None,
+            None,
             RunJobArtifactLimits {
                 log_limit_bytes: 1024 * 1024,
                 report_limit_bytes: 256 * 1024,
@@ -1076,6 +1084,7 @@ mod tests {
             )),
             limits(),
             agent_execution(),
+            None,
             None,
             None,
             RunJobArtifactLimits {

@@ -4,6 +4,9 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
+    sync::mpsc,
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use openoman_core::{
@@ -15,10 +18,10 @@ use openoman_core::{
     },
     domain::job::Revision,
     execution::{
-        AgentExecutionSpec, ExecutionBackendConfig, ExecutionBackendKind, ExecutionRuntimeConfig,
-        FirecrackerBackendConfig, FirecrackerMode, FirecrackerNetworkPrivilegeMode,
-        FirecrackerNetworkingConfig, FirecrackerNetworkingMode, HostRiskPosture, ResourceLimits,
-        UserPackageDir,
+        AgentExecutionSpec, DockerAuthConfig, ExecutionBackendConfig, ExecutionBackendKind,
+        ExecutionRuntimeConfig, FirecrackerBackendConfig, FirecrackerMode,
+        FirecrackerNetworkPrivilegeMode, FirecrackerNetworkingConfig, FirecrackerNetworkingMode,
+        HostRiskPosture, ResourceLimits, UserPackageDir,
     },
     git_naming::{
         build_legacy_git_naming, resolve_git_naming as core_resolve_git_naming,
@@ -81,6 +84,7 @@ struct GitRepoConfig {
     platform: Option<String>,
     account: Option<String>,
     env_repo_name: Option<String>,
+    post_clone_command: Option<String>,
     repo_owner: Option<String>,
     repo_name: Option<String>,
     base_branch: Option<String>,
@@ -108,7 +112,11 @@ struct FirecrackerConfig {
     jailer_bin: Option<String>,
     kernel_image_path: Option<String>,
     rootfs_image_path: Option<String>,
+    runtime_disk_mb: Option<u64>,
     guest_cid_base: Option<u32>,
+    docker_daemon: Option<bool>,
+    docker_auth_config: Option<String>,
+    docker_auth_config_env: Option<String>,
     user_package_dirs: Option<Vec<UserPackageDirConfig>>,
     network: Option<FirecrackerNetworkConfig>,
 }
@@ -119,6 +127,7 @@ struct FirecrackerNetworkConfig {
     privilege_mode: Option<String>,
     tap_name_prefix: Option<String>,
     proxy_port: Option<u16>,
+    allowed_connect_ports: Option<Vec<u16>>,
     subnet_cidr: Option<String>,
 }
 
@@ -209,6 +218,7 @@ struct RepoRuntimeConfig {
     platform: RepoPlatform,
     account_alias: Option<String>,
     env_repo_name: String,
+    post_clone_command: Option<String>,
     publish: RepoPublishRuntimeConfig,
 }
 
@@ -345,6 +355,10 @@ impl AppConfig {
             path,
             matches!(sandbox_backend, ExecutionBackendKind::Firecracker),
         )?;
+        let disk_quota_bytes = firecracker
+            .as_ref()
+            .and_then(|config| config.runtime_disk_bytes)
+            .unwrap_or(2 * 1024 * 1024 * 1024);
         let agent_runtime = load_agent_runtime_config(agent, path)?;
         validate_agent_networking_contract(firecracker.as_ref(), &agent_runtime)?;
 
@@ -373,7 +387,7 @@ impl AppConfig {
                 limits: ResourceLimits {
                     vcpu_count: sandbox.cpu_cores.unwrap_or(2),
                     memory_mib: sandbox.memory_mb.unwrap_or(2048),
-                    disk_quota_bytes: 2 * 1024 * 1024 * 1024,
+                    disk_quota_bytes,
                     timeout_secs: sandbox.timeout_seconds.unwrap_or(1800),
                 },
                 host_risk_posture,
@@ -467,6 +481,15 @@ impl AppConfig {
                     Some(trimmed.to_string())
                 }
             })
+    }
+
+    pub(crate) fn post_clone_command_for_alias(&self, repo_alias: Option<&str>) -> Option<String> {
+        let alias = repo_alias?;
+        self.repo_catalog
+            .repos_by_alias
+            .get(alias)?
+            .post_clone_command
+            .clone()
     }
 
     fn legacy_branch_prefix_for_job(&self, repo_alias: Option<&str>) -> String {
@@ -938,6 +961,10 @@ fn load_repo_catalog_config(
             .as_deref()
             .map(|value| resolve_push_url(config_path, value))
             .transpose()?;
+        let post_clone_command = normalize_optional_string(
+            repo.post_clone_command.as_deref(),
+            &format!("git.repos alias '{}'.post_clone_command", alias),
+        )?;
 
         repos_by_alias.insert(
             alias,
@@ -946,6 +973,7 @@ fn load_repo_catalog_config(
                 platform,
                 account_alias,
                 env_repo_name,
+                post_clone_command,
                 publish: RepoPublishRuntimeConfig {
                     repo_owner: repo.repo_owner.clone(),
                     repo_name: repo.repo_name.clone(),
@@ -1343,7 +1371,11 @@ fn load_firecracker_config(
         jailer_bin: None,
         kernel_image_path: None,
         rootfs_image_path: None,
+        runtime_disk_mb: None,
         guest_cid_base: None,
+        docker_daemon: None,
+        docker_auth_config: None,
+        docker_auth_config_env: None,
         user_package_dirs: None,
         network: None,
     });
@@ -1371,7 +1403,16 @@ fn load_firecracker_config(
             add_to_path: package_dir.add_to_path.unwrap_or(false),
         });
     }
+    let docker_auth_config = load_firecracker_docker_auth_config(
+        config_path,
+        firecracker.docker_auth_config.as_deref(),
+        firecracker.docker_auth_config_env.as_deref(),
+    )?;
     let networking = load_firecracker_networking_config(firecracker.network)?;
+    let runtime_disk_bytes = firecracker
+        .runtime_disk_mb
+        .map(|value| runtime_disk_mb_to_bytes(value, "sandbox.firecracker.runtime_disk_mb"))
+        .transpose()?;
 
     Ok(Some(FirecrackerBackendConfig {
         mode,
@@ -1395,10 +1436,72 @@ fn load_firecracker_config(
                 .as_deref()
                 .unwrap_or("/opt/openoman/guest/rootfs.ext4"),
         )?,
+        runtime_disk_bytes,
         guest_cid_base: firecracker.guest_cid_base.unwrap_or(10_000),
+        docker_daemon: firecracker.docker_daemon.unwrap_or(false),
+        docker_auth_config,
         user_package_dirs,
         networking,
     }))
+}
+
+fn runtime_disk_mb_to_bytes(value: u64, key: &str) -> Result<u64, String> {
+    if value == 0 {
+        return Err(format!("{key} must be greater than zero"));
+    }
+    value
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| format!("{key} is too large"))
+}
+
+fn load_firecracker_docker_auth_config(
+    config_path: &Path,
+    docker_auth_config: Option<&str>,
+    docker_auth_config_env: Option<&str>,
+) -> Result<Option<DockerAuthConfig>, String> {
+    let docker_auth_config =
+        normalize_optional_string(docker_auth_config, "sandbox.firecracker.docker_auth_config")?;
+    let docker_auth_config_env = normalize_optional_string(
+        docker_auth_config_env,
+        "sandbox.firecracker.docker_auth_config_env",
+    )?;
+
+    match (docker_auth_config, docker_auth_config_env) {
+        (Some(_), Some(_)) => Err(
+            "sandbox.firecracker.docker_auth_config and sandbox.firecracker.docker_auth_config_env are mutually exclusive; set only one"
+                .to_string(),
+        ),
+        (Some(path), None) => {
+            let resolved_path = resolve_config_path(config_path, &path)?;
+            let metadata = fs::metadata(&resolved_path).map_err(|err| {
+                format!(
+                    "sandbox.firecracker.docker_auth_config does not exist or is not readable at {}: {err}",
+                    resolved_path.display()
+                )
+            })?;
+            if !metadata.is_file() {
+                return Err(format!(
+                    "sandbox.firecracker.docker_auth_config must point to a regular file: {}",
+                    resolved_path.display()
+                ));
+            }
+            Ok(Some(DockerAuthConfig::HostFile(resolved_path)))
+        }
+        (None, Some(env_name)) => {
+            let value = env::var(&env_name).map_err(|_| {
+                format!(
+                    "sandbox.firecracker.docker_auth_config_env references missing environment variable {env_name}"
+                )
+            })?;
+            if value.trim().is_empty() {
+                return Err(format!(
+                    "environment variable {env_name} referenced by sandbox.firecracker.docker_auth_config_env must not be empty"
+                ));
+            }
+            Ok(Some(DockerAuthConfig::InlineJson(value)))
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 fn load_firecracker_networking_config(
@@ -1409,6 +1512,7 @@ fn load_firecracker_networking_config(
         privilege_mode: None,
         tap_name_prefix: None,
         proxy_port: None,
+        allowed_connect_ports: None,
         subnet_cidr: None,
     });
     let mode = match network
@@ -1449,6 +1553,8 @@ fn load_firecracker_networking_config(
     if proxy_port == 0 {
         return Err("sandbox.firecracker.network.proxy_port must be non-zero".to_string());
     }
+    let allowed_connect_ports =
+        normalize_allowed_connect_ports(network.allowed_connect_ports.as_deref())?;
     let subnet_cidr = network
         .subnet_cidr
         .unwrap_or_else(|| "172.22.0.0/16".to_string());
@@ -1459,8 +1565,31 @@ fn load_firecracker_networking_config(
         privilege_mode,
         tap_name_prefix,
         proxy_port,
+        allowed_connect_ports,
         subnet_cidr,
     })
+}
+
+fn normalize_allowed_connect_ports(ports: Option<&[u16]>) -> Result<Vec<u16>, String> {
+    let mut normalized = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for port in ports.unwrap_or(&[443]) {
+        if *port == 0 {
+            return Err(
+                "sandbox.firecracker.network.allowed_connect_ports must not contain 0".to_string(),
+            );
+        }
+        if seen.insert(*port) {
+            normalized.push(*port);
+        }
+    }
+    if normalized.is_empty() {
+        return Err(
+            "sandbox.firecracker.network.allowed_connect_ports must contain at least one port"
+                .to_string(),
+        );
+    }
+    Ok(normalized)
 }
 
 fn validate_agent_networking_contract(
@@ -1510,18 +1639,28 @@ fn validate_ipv4_cidr(raw: &str, field_name: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn ensure_network_privileges(config: &ExecutionRuntimeConfig) -> Result<(), String> {
+pub(crate) fn ensure_network_privileges_guard(
+    config: &ExecutionRuntimeConfig,
+) -> Result<NetworkPrivilegeGuard, String> {
+    ensure_network_privileges_with_options(config, Path::new("sudo"), Duration::from_secs(60))
+}
+
+fn ensure_network_privileges_with_options(
+    config: &ExecutionRuntimeConfig,
+    sudo_bin: &Path,
+    refresh_interval: Duration,
+) -> Result<NetworkPrivilegeGuard, String> {
     let Some(firecracker) = config.firecracker() else {
-        return Ok(());
+        return Ok(NetworkPrivilegeGuard::inactive());
     };
     if firecracker.networking.mode != FirecrackerNetworkingMode::HostProxy {
-        return Ok(());
+        return Ok(NetworkPrivilegeGuard::inactive());
     }
     if firecracker.networking.privilege_mode != FirecrackerNetworkPrivilegeMode::Sudo {
-        return Ok(());
+        return Ok(NetworkPrivilegeGuard::inactive());
     }
 
-    let status = ProcessCommand::new("sudo")
+    let status = ProcessCommand::new(sudo_bin)
         .arg("-v")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -1534,7 +1673,61 @@ pub(crate) fn ensure_network_privileges(config: &ExecutionRuntimeConfig) -> Resu
                 .to_string(),
         );
     }
-    Ok(())
+    Ok(NetworkPrivilegeGuard::spawn(
+        sudo_bin.to_path_buf(),
+        refresh_interval,
+    ))
+}
+
+#[derive(Debug)]
+pub(crate) struct NetworkPrivilegeGuard {
+    stop_tx: Option<mpsc::Sender<()>>,
+    keepalive_thread: Option<JoinHandle<()>>,
+}
+
+impl NetworkPrivilegeGuard {
+    fn inactive() -> Self {
+        Self {
+            stop_tx: None,
+            keepalive_thread: None,
+        }
+    }
+
+    fn spawn(sudo_bin: PathBuf, refresh_interval: Duration) -> Self {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let keepalive_thread = thread::spawn(move || loop {
+            match stop_rx.recv_timeout(refresh_interval) {
+                Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let status = ProcessCommand::new(&sudo_bin)
+                        .args(["-n", "-v"])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    match status {
+                        Ok(status) if status.success() => {}
+                        _ => break,
+                    }
+                }
+            }
+        });
+        Self {
+            stop_tx: Some(stop_tx),
+            keepalive_thread: Some(keepalive_thread),
+        }
+    }
+}
+
+impl Drop for NetworkPrivilegeGuard {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(keepalive_thread) = self.keepalive_thread.take() {
+            let _ = keepalive_thread.join();
+        }
+    }
 }
 
 fn resolve_push_url(config_path: &Path, raw: &str) -> Result<String, String> {
@@ -1581,8 +1774,145 @@ fn expand_home(raw: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{fs, os::unix::fs::PermissionsExt, thread, time::Duration};
     use tempfile::TempDir;
+
+    fn load_execution_config(temp: &TempDir, network_block: &str) -> ExecutionRuntimeConfig {
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+{network_block}
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+egress_allowed_domains = ["api.openai.com"]
+"#,
+            ),
+        )
+        .expect("write config");
+        AppConfig::load(&config_path)
+            .expect("load config")
+            .execution
+    }
+
+    fn write_fake_sudo(temp: &TempDir, script_body: &str) -> PathBuf {
+        let script_path = temp.path().join("fake-sudo.sh");
+        fs::write(&script_path, script_body).expect("write fake sudo");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("fake sudo metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("chmod fake sudo");
+        script_path
+    }
+
+    #[test]
+    fn ensure_network_privileges_guard_refreshes_sudo_timestamp() {
+        let temp = TempDir::new().expect("tempdir");
+        let execution = load_execution_config(
+            &temp,
+            r#"
+[sandbox.firecracker.network]
+mode = "host-proxy"
+privilege_mode = "sudo"
+"#,
+        );
+        let log_path = temp.path().join("sudo.log");
+        let fake_sudo = write_fake_sudo(
+            &temp,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+                log_path.display()
+            ),
+        );
+
+        let guard = ensure_network_privileges_with_options(
+            &execution,
+            &fake_sudo,
+            Duration::from_millis(50),
+        )
+        .expect("network privileges");
+        thread::sleep(Duration::from_millis(180));
+        drop(guard);
+
+        let log = fs::read_to_string(&log_path).expect("sudo log");
+        assert!(log.lines().any(|line| line == "-v"));
+        assert!(log.lines().any(|line| line == "-n -v"));
+    }
+
+    #[test]
+    fn ensure_network_privileges_guard_is_inactive_outside_sudo_host_proxy() {
+        let temp = TempDir::new().expect("tempdir");
+        let execution = load_execution_config(
+            &temp,
+            r#"
+[sandbox.firecracker.network]
+mode = "host-proxy"
+privilege_mode = "direct"
+"#,
+        );
+        let log_path = temp.path().join("sudo.log");
+        let fake_sudo = write_fake_sudo(
+            &temp,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+                log_path.display()
+            ),
+        );
+
+        let guard = ensure_network_privileges_with_options(
+            &execution,
+            &fake_sudo,
+            Duration::from_millis(50),
+        )
+        .expect("inactive guard");
+        thread::sleep(Duration::from_millis(120));
+        drop(guard);
+
+        assert!(!log_path.exists(), "inactive guard should not invoke sudo");
+    }
+
+    #[test]
+    fn ensure_network_privileges_guard_surfaces_initial_sudo_failure() {
+        let temp = TempDir::new().expect("tempdir");
+        let execution = load_execution_config(
+            &temp,
+            r#"
+[sandbox.firecracker.network]
+mode = "host-proxy"
+privilege_mode = "sudo"
+"#,
+        );
+        let fake_sudo = write_fake_sudo(&temp, "#!/bin/sh\nexit 1\n");
+
+        let err = ensure_network_privileges_with_options(
+            &execution,
+            &fake_sudo,
+            Duration::from_millis(50),
+        )
+        .expect_err("sudo prime should fail");
+        assert!(err.contains("failed to acquire sudo credentials"));
+    }
 
     #[test]
     fn app_config_loads_egress_allowed_domains() {
@@ -1666,6 +1996,7 @@ mode = "host-proxy"
 privilege_mode = "direct"
 tap_name_prefix = "oomtap"
 proxy_port = 4128
+allowed_connect_ports = [443, 5050]
 subnet_cidr = "172.30.0.0/16"
 
 [agent]
@@ -1688,7 +2019,352 @@ egress_allowed_domains = ["api.openai.com"]
         );
         assert_eq!(firecracker.networking.tap_name_prefix, "oomtap");
         assert_eq!(firecracker.networking.proxy_port, 4128);
+        assert_eq!(
+            firecracker.networking.allowed_connect_ports,
+            vec![443, 5050]
+        );
         assert_eq!(firecracker.networking.subnet_cidr, "172.30.0.0/16");
+    }
+
+    #[test]
+    fn app_config_rejects_zero_firecracker_host_proxy_connect_port() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+[sandbox.firecracker.network]
+mode = "host-proxy"
+privilege_mode = "direct"
+allowed_connect_ports = [443, 0]
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+egress_allowed_domains = ["api.openai.com"]
+"#,
+        )
+        .expect("write config");
+
+        let err = AppConfig::load(&config_path).expect_err("config should fail");
+        assert!(
+            err.contains("sandbox.firecracker.network.allowed_connect_ports must not contain 0")
+        );
+    }
+
+    #[test]
+    fn app_config_loads_firecracker_docker_auth_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        let docker_auth_path = temp.path().join("docker-config.json");
+        fs::write(
+            &docker_auth_path,
+            r#"{"auths":{"registry.example.com":{"auth":"dGVzdA=="}}}"#,
+        )
+        .expect("write docker auth");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+docker_auth_config = "{}"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+                docker_auth_path.display()
+            ),
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        let firecracker = loaded.execution.firecracker().expect("firecracker config");
+        match firecracker
+            .docker_auth_config
+            .as_ref()
+            .expect("docker auth config")
+        {
+            DockerAuthConfig::HostFile(path) => assert_eq!(path, &docker_auth_path),
+            DockerAuthConfig::InlineJson(_) => panic!("expected host file docker auth config"),
+        }
+    }
+
+    #[test]
+    fn app_config_loads_firecracker_docker_daemon_flag() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+docker_daemon = true
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        let firecracker = loaded.execution.firecracker().expect("firecracker config");
+        assert!(firecracker.docker_daemon);
+    }
+
+    #[test]
+    fn app_config_defaults_firecracker_docker_daemon_to_false() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        let firecracker = loaded.execution.firecracker().expect("firecracker config");
+        assert!(!firecracker.docker_daemon);
+    }
+
+    #[test]
+    fn app_config_loads_firecracker_runtime_disk_mb() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+runtime_disk_mb = 4096
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        let firecracker = loaded.execution.firecracker().expect("firecracker config");
+        assert_eq!(firecracker.runtime_disk_bytes, Some(4096 * 1024 * 1024));
+        assert_eq!(loaded.execution.limits.disk_quota_bytes, 4096 * 1024 * 1024);
+    }
+
+    #[test]
+    fn app_config_rejects_zero_firecracker_runtime_disk_mb() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+runtime_disk_mb = 0
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+        )
+        .expect("write config");
+
+        let err = AppConfig::load(&config_path).expect_err("load should fail");
+        assert!(err.contains("sandbox.firecracker.runtime_disk_mb must be greater than zero"));
+    }
+
+    #[test]
+    fn app_config_loads_firecracker_docker_auth_from_env() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        let env_name = "OPENOMAN_TEST_DOCKER_AUTH_CONFIG_JSON";
+        env::set_var(
+            env_name,
+            r#"{"auths":{"registry.example.com":{"auth":"ZW52LXRlc3Q="}}}"#,
+        );
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+docker_auth_config_env = "{}"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+                env_name
+            ),
+        )
+        .expect("write config");
+
+        let loaded = AppConfig::load(&config_path).expect("load config");
+        env::remove_var(env_name);
+        let firecracker = loaded.execution.firecracker().expect("firecracker config");
+        match firecracker
+            .docker_auth_config
+            .as_ref()
+            .expect("docker auth config")
+        {
+            DockerAuthConfig::InlineJson(contents) => {
+                assert!(contents.contains("\"registry.example.com\""));
+            }
+            DockerAuthConfig::HostFile(_) => panic!("expected inline docker auth config"),
+        }
+    }
+
+    #[test]
+    fn app_config_rejects_conflicting_firecracker_docker_auth_inputs() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        let docker_auth_path = temp.path().join("docker-config.json");
+        fs::write(&docker_auth_path, "{}").expect("write docker auth");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[core]
+database_path = "./data/openoman.db"
+
+[git]
+trusted_workspace_dir = "./workspaces/trusted"
+
+[sandbox]
+backend = "firecracker"
+runtime_dir = "./workspaces/sandboxes"
+
+[sandbox.firecracker]
+mode = "direct"
+firecracker_bin = "/bin/true"
+jailer_bin = "/bin/true"
+kernel_image_path = "./guest/out/vmlinux"
+rootfs_image_path = "./guest/out/rootfs.ext4"
+docker_auth_config = "{}"
+docker_auth_config_env = "OPENOMAN_TEST_DOCKER_AUTH_CONFIG_JSON"
+
+[agent]
+provider = "codex"
+bin = "/usr/local/bin/codex"
+"#,
+                docker_auth_path.display()
+            ),
+        )
+        .expect("write config");
+
+        let err = AppConfig::load(&config_path).expect_err("conflicting docker auth should fail");
+        assert!(err.contains("docker_auth_config"));
+        assert!(err.contains("mutually exclusive"));
     }
 
     #[test]
@@ -2348,6 +3024,7 @@ alias = "demo"
 repo_ref = "https://github.com/acme/demo.git"
 platform = "github"
 account = "demo-account"
+post_clone_command = "git submodule update --init --recursive"
 repo_owner = "acme"
 repo_name = "demo"
 
@@ -2481,6 +3158,7 @@ alias = "demo"
 repo_ref = "https://github.com/acme/demo.git"
 platform = "github"
 account = "demo-account"
+post_clone_command = "git submodule update --init --recursive"
 repo_owner = "acme"
 repo_name = "demo"
 
@@ -2512,6 +3190,13 @@ bin = "/usr/local/bin/codex"
             .env_overlay_dir_for_alias(Some("demo"))
             .expect("overlay path");
         assert_eq!(overlay, temp.path().join("env_for_repo/demo"));
+        assert_eq!(
+            loaded.post_clone_command_for_alias(Some("demo")).as_deref(),
+            Some("git submodule update --init --recursive")
+        );
+        assert!(loaded
+            .post_clone_command_for_alias(Some("missing"))
+            .is_none());
     }
 
     #[test]

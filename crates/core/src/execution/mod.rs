@@ -5,7 +5,7 @@ mod firecracker;
 mod process;
 
 pub use backend::{
-    build_execution_backend, ExecutionBackend, ExecutionBackendCapabilities,
+    build_execution_backend, DockerAuthConfig, ExecutionBackend, ExecutionBackendCapabilities,
     ExecutionBackendConfig, ExecutionBackendKind, ExecutionIsolation, ExecutionRuntimeConfig,
     FirecrackerBackendConfig, FirecrackerMode, FirecrackerNetworkPrivilegeMode,
     FirecrackerNetworkingConfig, FirecrackerNetworkingMode, HostRiskPosture, UserPackageDir,

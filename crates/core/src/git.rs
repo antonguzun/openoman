@@ -51,6 +51,13 @@ pub struct PreparedWorkspace {
     pub sandbox_workspace_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrepareWorkspaceOptions<'a> {
+    pub env_overlay_dir: Option<&'a Path>,
+    pub clone_token: Option<&'a str>,
+    pub post_clone_command: Option<&'a str>,
+}
+
 #[derive(Debug, Clone)]
 pub struct GitAdapter {
     trusted_workspace_root: PathBuf,
@@ -69,12 +76,11 @@ impl GitAdapter {
         revision: &Revision,
         workspace_id: &str,
     ) -> Result<PreparedWorkspace, GitError> {
-        self.prepare_workspace_with_env_overlay_and_clone_token(
+        self.prepare_workspace_with_options(
             repo_ref,
             revision,
             workspace_id,
-            None,
-            None,
+            PrepareWorkspaceOptions::default(),
         )
     }
 
@@ -85,22 +91,23 @@ impl GitAdapter {
         workspace_id: &str,
         env_overlay_dir: Option<&Path>,
     ) -> Result<PreparedWorkspace, GitError> {
-        self.prepare_workspace_with_env_overlay_and_clone_token(
+        self.prepare_workspace_with_options(
             repo_ref,
             revision,
             workspace_id,
-            env_overlay_dir,
-            None,
+            PrepareWorkspaceOptions {
+                env_overlay_dir,
+                ..PrepareWorkspaceOptions::default()
+            },
         )
     }
 
-    pub fn prepare_workspace_with_env_overlay_and_clone_token(
+    pub fn prepare_workspace_with_options(
         &self,
         repo_ref: &RepoRef,
         revision: &Revision,
         workspace_id: &str,
-        env_overlay_dir: Option<&Path>,
-        clone_token: Option<&str>,
+        options: PrepareWorkspaceOptions<'_>,
     ) -> Result<PreparedWorkspace, GitError> {
         let workspace_root = self.trusted_workspace_root.join(workspace_id);
         let trusted_clone_dir = workspace_root.join("trusted-clone");
@@ -111,7 +118,7 @@ impl GitAdapter {
         }
         fs::create_dir_all(&workspace_root)?;
 
-        run_git_clone(repo_ref.as_str(), &trusted_clone_dir, clone_token)?;
+        run_git_clone(repo_ref.as_str(), &trusted_clone_dir, options.clone_token)?;
         run_git(
             Some(&trusted_clone_dir),
             vec![
@@ -120,9 +127,11 @@ impl GitAdapter {
                 OsStr::new(revision.as_str()),
             ],
         )?;
+        run_post_clone_command(&trusted_clone_dir, options.post_clone_command)?;
 
         copy_tree(&trusted_clone_dir, &sandbox_workspace_dir, &[])?;
-        let injected_files = copy_env_overlay_files(env_overlay_dir, &sandbox_workspace_dir)?;
+        let injected_files =
+            copy_env_overlay_files(options.env_overlay_dir, &sandbox_workspace_dir)?;
         if !injected_files.is_empty() {
             append_git_exclude_entries(&trusted_clone_dir, &injected_files)?;
             append_git_exclude_entries(&sandbox_workspace_dir, &injected_files)?;
@@ -134,6 +143,32 @@ impl GitAdapter {
             sandbox_workspace_dir,
         })
     }
+}
+
+fn run_post_clone_command(
+    trusted_clone_dir: &Path,
+    post_clone_command: Option<&str>,
+) -> Result<(), GitError> {
+    let Some(post_clone_command) = post_clone_command
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let output = Command::new("/bin/sh")
+        .current_dir(trusted_clone_dir)
+        .args(["-lc", post_clone_command])
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(GitError::CommandFailed {
+        program: "/bin/sh".to_string(),
+        args: vec!["-lc".to_string(), post_clone_command.to_string()],
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
 }
 
 fn run_git_clone(
@@ -721,6 +756,89 @@ mod tests {
         .expect("trusted exclude");
         assert!(trusted_exclude.contains("/.env"));
         assert!(trusted_exclude.contains("/.env.test"));
+    }
+
+    #[test]
+    fn post_clone_command_runs_in_trusted_clone_before_sandbox_copy() {
+        let temp = TempDir::new().expect("tempdir");
+        let fixture_repo = temp.path().join("fixture-repo");
+        init_fixture_repo(&fixture_repo);
+
+        let repo_ref = RepoRef::new(fixture_repo.display().to_string()).expect("repo ref");
+        let revision = Revision::new("main").expect("revision");
+        let adapter = GitAdapter::new(temp.path().join("workspaces"));
+        let prepared = adapter
+            .prepare_workspace_with_options(
+                &repo_ref,
+                &revision,
+                "job-005",
+                PrepareWorkspaceOptions {
+                    post_clone_command: Some(
+                        "mkdir -p generated && printf 'from hook\\n' > generated/post-clone.txt",
+                    ),
+                    ..PrepareWorkspaceOptions::default()
+                },
+            )
+            .expect("prepare workspace");
+
+        let trusted_generated = fs::read_to_string(
+            prepared
+                .trusted_clone_dir
+                .join("generated")
+                .join("post-clone.txt"),
+        )
+        .expect("trusted generated file");
+        let sandbox_generated = fs::read_to_string(
+            prepared
+                .sandbox_workspace_dir
+                .join("generated")
+                .join("post-clone.txt"),
+        )
+        .expect("sandbox generated file");
+
+        assert_eq!(trusted_generated, "from hook\n");
+        assert_eq!(sandbox_generated, "from hook\n");
+    }
+
+    #[test]
+    fn failing_post_clone_command_aborts_workspace_preparation() {
+        let temp = TempDir::new().expect("tempdir");
+        let fixture_repo = temp.path().join("fixture-repo");
+        init_fixture_repo(&fixture_repo);
+
+        let repo_ref = RepoRef::new(fixture_repo.display().to_string()).expect("repo ref");
+        let revision = Revision::new("main").expect("revision");
+        let adapter = GitAdapter::new(temp.path().join("workspaces"));
+        let err = adapter
+            .prepare_workspace_with_options(
+                &repo_ref,
+                &revision,
+                "job-006",
+                PrepareWorkspaceOptions {
+                    post_clone_command: Some("echo post-clone failed >&2; exit 17"),
+                    ..PrepareWorkspaceOptions::default()
+                },
+            )
+            .expect_err("post clone command should fail");
+
+        match err {
+            GitError::CommandFailed {
+                program,
+                args,
+                stderr,
+            } => {
+                assert_eq!(program, "/bin/sh");
+                assert_eq!(
+                    args,
+                    vec![
+                        "-lc".to_string(),
+                        "echo post-clone failed >&2; exit 17".to_string()
+                    ]
+                );
+                assert!(stderr.contains("post-clone failed"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     fn init_fixture_repo(path: &Path) {

@@ -17,7 +17,7 @@ use openoman_core::{
 use serde::Serialize;
 
 use crate::config::{
-    ensure_network_privileges, resolve_agent_execution_spec, AppConfig, PublishRuntimePlan,
+    ensure_network_privileges_guard, resolve_agent_execution_spec, AppConfig, PublishRuntimePlan,
 };
 
 const LOG_LIMIT_BYTES: usize = 1024 * 1024;
@@ -221,7 +221,7 @@ impl OperatorService {
     }
 
     pub(crate) fn run_job(&self, job_id: &str) -> Result<RunJobView, String> {
-        ensure_network_privileges(&self.config.execution)?;
+        let _network_privileges = ensure_network_privileges_guard(&self.config.execution)?;
         let store = self.open_store()?;
         let job_id = parse_job_id(job_id)?;
         let Some(mut submitted_job) = store.jobs().load(&job_id).map_err(|e| e.to_string())? else {
@@ -236,6 +236,9 @@ impl OperatorService {
         let repo_clone_token = self
             .config
             .resolve_clone_token_for_job(submitted_job.repo_alias.as_deref());
+        let repo_post_clone_command = self
+            .config
+            .post_clone_command_for_alias(submitted_job.repo_alias.as_deref());
         let run_job = RunJobUseCase::new(
             store,
             GitAdapter::new(&self.config.trusted_workspace_dir),
@@ -244,6 +247,7 @@ impl OperatorService {
             agent_execution,
             repo_env_source_dir,
             repo_clone_token,
+            repo_post_clone_command,
             RunJobArtifactLimits {
                 log_limit_bytes: LOG_LIMIT_BYTES,
                 report_limit_bytes: REPORT_LIMIT_BYTES,

@@ -19,3 +19,14 @@ paths = [
 regexes = [
   '''Authorization:\s+Bearer\s+secret-token''',
 ]
+
+[[allowlists]]
+description = "Test docker auth fixture in config tests"
+condition = "AND"
+regexTarget = "match"
+paths = [
+  '''^crates/cli/src/config\.rs$''',
+]
+regexes = [
+  '''auth":"ZW52LXRlc3Q="''',
+]

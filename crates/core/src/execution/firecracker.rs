@@ -34,6 +34,9 @@ use network::{parse_ipv4_cidr, FirecrackerNetworkController, NetworkLease, Netwo
 use runtime::{FirecrackerRuntimeStager, PreparedRuntimeTree};
 
 #[cfg(test)]
+use super::DockerAuthConfig;
+
+#[cfg(test)]
 use network::allocate_network_lease;
 
 #[cfg(test)]
@@ -577,6 +580,11 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    const GUEST_INIT_SCRIPT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../guest/openoman-init.sh"
+    ));
+
     fn base_runtime_config(root: &Path, firecracker_bin: &Path) -> ExecutionRuntimeConfig {
         let kernel = root.join("vmlinux");
         let rootfs = root.join("rootfs.ext4");
@@ -590,13 +598,17 @@ mod tests {
                 jailer_bin: "jailer".to_string(),
                 kernel_image_path: kernel,
                 rootfs_image_path: rootfs,
+                runtime_disk_bytes: None,
                 guest_cid_base: 10_000,
+                docker_daemon: false,
+                docker_auth_config: None,
                 user_package_dirs: Vec::new(),
                 networking: FirecrackerNetworkingConfig {
                     mode: FirecrackerNetworkingMode::Disabled,
                     privilege_mode: FirecrackerNetworkPrivilegeMode::Direct,
                     tap_name_prefix: "oomtap".to_string(),
                     proxy_port: 3128,
+                    allowed_connect_ports: vec![443],
                     subnet_cidr: "172.22.0.0/16".to_string(),
                 },
             }),
@@ -639,6 +651,22 @@ mod tests {
         assert!(err
             .to_string()
             .contains("duplicate sandbox.firecracker.user_package_dirs guest_path"));
+    }
+
+    #[test]
+    fn guest_init_script_configures_loopback() {
+        assert!(
+            GUEST_INIT_SCRIPT.contains("initialize_loopback()"),
+            "guest init script must define loopback bootstrap"
+        );
+        assert!(
+            GUEST_INIT_SCRIPT.contains("link set lo up"),
+            "guest init script must bring loopback up"
+        );
+        assert!(
+            GUEST_INIT_SCRIPT.contains("addr add 127.0.0.1/8 dev lo"),
+            "guest init script must assign 127.0.0.1/8 when needed"
+        );
     }
 
     #[test]
@@ -699,11 +727,8 @@ mod tests {
             )
             .expect("stage runtime tree");
 
-        let requested_size = compute_image_size_bytes(
-            &run_dir.join("runtime-tree"),
-            config.limits.disk_quota_bytes,
-        )
-        .expect("compute requested size");
+        let requested_size = compute_image_size_bytes(&run_dir.join("runtime-tree"))
+            .expect("compute requested size");
         let expected_image_size =
             requested_size.div_ceil(EXT4_BLOCK_SIZE_BYTES) * EXT4_BLOCK_SIZE_BYTES;
         let actual_image_size = fs::metadata(&prepared.image_path)
@@ -711,6 +736,122 @@ mod tests {
             .len();
 
         assert_eq!(actual_image_size, expected_image_size);
+    }
+
+    #[test]
+    fn stage_runtime_tree_honors_explicit_runtime_disk_size() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::write(workspace.join("README.md"), "hello\n").expect("write workspace file");
+
+        let fake_firecracker = write_fake_firecracker(temp.path());
+        let mut config = base_runtime_config(temp.path(), &fake_firecracker);
+        let explicit_size_bytes = 384 * 1024 * 1024_u64;
+        config.limits.disk_quota_bytes = explicit_size_bytes;
+        config
+            .firecracker_mut()
+            .expect("firecracker config")
+            .runtime_disk_bytes = Some(explicit_size_bytes);
+        let runner = FirecrackerDirectRunner::new(
+            config.runtime_dir.clone(),
+            config
+                .firecracker()
+                .cloned()
+                .expect("firecracker config should exist"),
+        );
+        let run_dir = config
+            .runtime_dir
+            .join("runs")
+            .join("job-explicit-size-attempt-1-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+
+        let prepared = runner
+            .stage_runtime_tree(
+                &AttemptSpec {
+                    job_id: "job-explicit-size".to_string(),
+                    attempt_id: 1,
+                    workspace_dir: workspace,
+                    instruction: "noop".to_string(),
+                    limits: config.limits.clone(),
+                    agent: AgentExecutionSpec {
+                        provider: "codex".to_string(),
+                        bin: "codex".to_string(),
+                        model: None,
+                        auth_file: None,
+                        api_key: None,
+                        egress_proxy: None,
+                        egress_allowed_domains: Vec::new(),
+                    },
+                },
+                &run_dir,
+                None,
+            )
+            .expect("stage runtime tree");
+
+        let actual_image_size = fs::metadata(&prepared.image_path)
+            .expect("runtime image metadata")
+            .len();
+        assert_eq!(actual_image_size, explicit_size_bytes);
+    }
+
+    #[test]
+    fn stage_runtime_tree_rejects_too_small_explicit_runtime_disk_size() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::write(workspace.join("README.md"), "hello\n").expect("write workspace file");
+
+        let fake_firecracker = write_fake_firecracker(temp.path());
+        let mut config = base_runtime_config(temp.path(), &fake_firecracker);
+        let explicit_size_bytes = 64 * 1024 * 1024_u64;
+        config.limits.disk_quota_bytes = explicit_size_bytes;
+        config
+            .firecracker_mut()
+            .expect("firecracker config")
+            .runtime_disk_bytes = Some(explicit_size_bytes);
+        let runner = FirecrackerDirectRunner::new(
+            config.runtime_dir.clone(),
+            config
+                .firecracker()
+                .cloned()
+                .expect("firecracker config should exist"),
+        );
+        let run_dir = config
+            .runtime_dir
+            .join("runs")
+            .join("job-small-explicit-size-attempt-1-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+
+        let err = runner
+            .stage_runtime_tree(
+                &AttemptSpec {
+                    job_id: "job-small-explicit-size".to_string(),
+                    attempt_id: 1,
+                    workspace_dir: workspace,
+                    instruction: "noop".to_string(),
+                    limits: config.limits.clone(),
+                    agent: AgentExecutionSpec {
+                        provider: "codex".to_string(),
+                        bin: "codex".to_string(),
+                        model: None,
+                        auth_file: None,
+                        api_key: None,
+                        egress_proxy: None,
+                        egress_allowed_domains: Vec::new(),
+                    },
+                },
+                &run_dir,
+                None,
+            )
+            .expect_err("explicit runtime disk should be rejected");
+
+        assert!(err
+            .to_string()
+            .contains("configured Firecracker runtime disk size"));
+        assert!(err
+            .to_string()
+            .contains("smaller than prepared runtime input needs"));
     }
 
     #[test]
@@ -769,6 +910,74 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&auth_contents.stdout).contains("\"auth_mode\":\"chatgpt\"")
         );
+    }
+
+    #[test]
+    fn stage_runtime_tree_copies_docker_auth_file_when_configured() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let docker_auth_path = temp.path().join("docker-config.json");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::write(workspace.join("README.md"), "hello\n").expect("write workspace file");
+        fs::write(
+            &docker_auth_path,
+            r#"{"auths":{"registry.example.com":{"auth":"dGVzdA=="}}}"#,
+        )
+        .expect("write docker auth file");
+
+        let fake_firecracker = write_fake_firecracker(temp.path());
+        let mut config = base_runtime_config(temp.path(), &fake_firecracker);
+        config
+            .firecracker_mut()
+            .expect("firecracker config should exist")
+            .docker_auth_config = Some(DockerAuthConfig::HostFile(docker_auth_path));
+        let runner = FirecrackerDirectRunner::new(
+            config.runtime_dir.clone(),
+            config
+                .firecracker()
+                .cloned()
+                .expect("firecracker config should exist"),
+        );
+        let run_dir = config
+            .runtime_dir
+            .join("runs")
+            .join("job-docker-auth-attempt-1-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+
+        let prepared = runner
+            .stage_runtime_tree(
+                &AttemptSpec {
+                    job_id: "job-docker-auth".to_string(),
+                    attempt_id: 1,
+                    workspace_dir: workspace,
+                    instruction: "noop".to_string(),
+                    limits: config.limits.clone(),
+                    agent: AgentExecutionSpec {
+                        provider: "codex".to_string(),
+                        bin: "codex".to_string(),
+                        model: None,
+                        auth_file: None,
+                        api_key: None,
+                        egress_proxy: None,
+                        egress_allowed_domains: Vec::new(),
+                    },
+                },
+                &run_dir,
+                None,
+            )
+            .expect("stage runtime tree");
+
+        let docker_auth_contents = Command::new("debugfs")
+            .args([
+                "-R",
+                "cat /openoman-config/docker-config.json",
+                prepared.image_path.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .expect("read docker auth file from image");
+        assert!(docker_auth_contents.status.success());
+        assert!(String::from_utf8_lossy(&docker_auth_contents.stdout)
+            .contains("\"registry.example.com\""));
     }
 
     #[test]
@@ -1052,6 +1261,55 @@ mod tests {
     }
 
     #[test]
+    fn host_proxy_allows_configured_non_443_connect_port() {
+        let temp = TempDir::new().expect("tempdir");
+        let fake_firecracker = write_fake_firecracker(temp.path());
+        let mut config = base_runtime_config(temp.path(), &fake_firecracker);
+        config
+            .firecracker_mut()
+            .expect("firecracker config")
+            .networking
+            .allowed_connect_ports = vec![443, 5050];
+        let runner = FirecrackerDirectRunner::new(
+            config.runtime_dir.clone(),
+            config
+                .firecracker()
+                .cloned()
+                .expect("firecracker config should exist"),
+        );
+        let log_path = temp.path().join("network.log");
+        let lease = NetworkLease {
+            tap_name: "oomtap1".to_string(),
+            guest_iface: "eth0".to_string(),
+            host_ip: Ipv4Addr::LOCALHOST,
+            guest_ip: Ipv4Addr::new(127, 0, 0, 2),
+            prefix_len: 30,
+            guest_mac: "02:fc:00:00:00:01".to_string(),
+            proxy_port: 0,
+        };
+        let mut proxy = runner
+            .start_network_proxy(&lease, &["*".to_string()], &log_path)
+            .expect("start proxy");
+
+        let mut client = TcpStream::connect(proxy.bind_addr).expect("connect");
+        client
+            .write_all(b"CONNECT 127.0.0.1:5050 HTTP/1.1\r\nHost: 127.0.0.1:5050\r\n\r\n")
+            .expect("write request");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("read proxy response");
+        proxy.stop();
+
+        assert!(
+            response.starts_with("HTTP/1.1 200 Connection established")
+                || response.starts_with("HTTP/1.1 502 Bad Gateway")
+        );
+        let log_contents = fs::read_to_string(&log_path).expect("read network log");
+        assert!(!log_contents.contains("allowed CONNECT ports are"));
+    }
+
+    #[test]
     fn direct_runner_smoke_boots_real_firecracker_when_opted_in() {
         if std::env::var("OPENOMAN_FIRECRACKER_E2E").ok().as_deref() != Some("1") {
             return;
@@ -1156,6 +1414,8 @@ mod tests {
             "append blank line",
             &["/opt/openoman/user-bin".to_string()],
             &[],
+            false,
+            false,
             None,
         )
         .expect("render agent env");
@@ -1186,6 +1446,8 @@ mod tests {
             "append blank line",
             &[],
             &[],
+            false,
+            false,
             Some(&lease),
         )
         .expect("render agent env");
@@ -1217,6 +1479,8 @@ mod tests {
             "append blank line",
             &[],
             &[],
+            false,
+            false,
             Some(&lease),
         )
         .expect("render agent env");
@@ -1240,6 +1504,8 @@ mod tests {
             "append blank line",
             &[],
             &[],
+            false,
+            false,
             None,
         )
         .expect("render agent env");
@@ -1247,6 +1513,56 @@ mod tests {
         assert!(env_file
             .contains("OPENOMAN_AGENT_AUTH_FILE='/mnt/runtime/openoman-config/agent-auth.json'"));
         assert!(env_file.contains("OPENOMAN_AGENT_AUTH_INSTALL_PATH='/root/.codex/auth.json'"));
+    }
+
+    #[test]
+    fn render_agent_env_includes_docker_auth_file_when_configured() {
+        let env_file = render_agent_env(
+            &AgentExecutionSpec {
+                provider: "codex".to_string(),
+                bin: "/usr/local/bin/codex".to_string(),
+                model: None,
+                auth_file: None,
+                api_key: None,
+                egress_proxy: None,
+                egress_allowed_domains: Vec::new(),
+            },
+            "append blank line",
+            &[],
+            &[],
+            false,
+            true,
+            None,
+        )
+        .expect("render agent env");
+
+        assert!(env_file.contains(
+            "OPENOMAN_DOCKER_AUTH_FILE='/mnt/runtime/openoman-config/docker-config.json'"
+        ));
+    }
+
+    #[test]
+    fn render_agent_env_includes_docker_daemon_marker_when_configured() {
+        let env_file = render_agent_env(
+            &AgentExecutionSpec {
+                provider: "codex".to_string(),
+                bin: "/usr/local/bin/codex".to_string(),
+                model: None,
+                auth_file: None,
+                api_key: None,
+                egress_proxy: None,
+                egress_allowed_domains: Vec::new(),
+            },
+            "append blank line",
+            &[],
+            &[],
+            true,
+            false,
+            None,
+        )
+        .expect("render agent env");
+
+        assert!(env_file.contains("OPENOMAN_DOCKER_DAEMON_ENABLED='1'"));
     }
 
     #[test]
@@ -1264,6 +1580,8 @@ mod tests {
             "append blank line",
             &[],
             &[],
+            false,
+            false,
             None,
         )
         .expect("render agent env");
@@ -1290,6 +1608,8 @@ mod tests {
             "append blank line",
             &[],
             &[],
+            false,
+            false,
             None,
         )
         .expect("render agent env");
@@ -1346,7 +1666,10 @@ exit 0
                 jailer_bin: "jailer".to_string(),
                 kernel_image_path: real_firecracker_kernel_path(),
                 rootfs_image_path: real_firecracker_rootfs_path(),
+                runtime_disk_bytes: None,
                 guest_cid_base: 10_000,
+                docker_daemon: false,
+                docker_auth_config: None,
                 user_package_dirs: vec![UserPackageDir {
                     host_path: package_dir.to_path_buf(),
                     guest_path: PathBuf::from("/opt/openoman/user-bin"),
@@ -1357,6 +1680,7 @@ exit 0
                     privilege_mode: FirecrackerNetworkPrivilegeMode::Direct,
                     tap_name_prefix: "oomtap".to_string(),
                     proxy_port: 3128,
+                    allowed_connect_ports: vec![443],
                     subnet_cidr: "172.22.0.0/16".to_string(),
                 },
             }),
@@ -1463,5 +1787,173 @@ echo "real-guest-codex finished"
         )
         .expect("chmod guest codex");
         script_path
+    }
+
+    fn write_real_guest_docker_probe_codex(root: &Path) -> PathBuf {
+        let script_path = root.join("codex");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+set -eux
+if [ "${1:-}" = "--version" ]; then
+  echo "real-guest-docker-probe-codex 0.0-test"
+  exit 0
+fi
+if [ "${1:-}" != "exec" ]; then
+  echo "unexpected invocation: $*" >&2
+  exit 2
+fi
+shift
+workdir="."
+report=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -C)
+      workdir="$2"
+      shift 2
+      ;;
+    -o)
+      report="$2"
+      shift 2
+      ;;
+    --full-auto)
+      shift 1
+      ;;
+    --color)
+      shift 2
+      ;;
+    *)
+      shift 1
+      ;;
+  esac
+done
+cd "$workdir"
+docker info >/tmp/docker-info.txt
+grep -Eq '^ ?Server Version:' /tmp/docker-info.txt
+grep -Eq 'Docker Root Dir: /mnt/runtime/docker$' /tmp/docker-info.txt
+ip addr show dev lo >/tmp/loopback-ip.txt
+grep -Eq 'inet 127\.0\.0\.1/8' /tmp/loopback-ip.txt
+python3 -m http.server 18080 --bind 127.0.0.1 >/tmp/python-loopback-http.txt 2>&1 &
+loopback_pid=$!
+trap 'kill "$loopback_pid" >/dev/null 2>&1 || true; cat /tmp/loopback-ip.txt >/dev/null 2>&1 || true; cat /tmp/python-loopback-http.txt >/dev/null 2>&1 || true' EXIT
+retries=30
+while [ "$retries" -gt 0 ]; do
+  if curl -fsS http://127.0.0.1:18080/README.md >/tmp/guest-loopback-http.txt; then
+    break
+  fi
+  retries=$((retries - 1))
+  sleep 1
+done
+if [ "$retries" -le 0 ]; then
+  echo "guest loopback curl did not succeed"
+  cat /tmp/loopback-ip.txt
+  cat /tmp/python-loopback-http.txt
+  exit 1
+fi
+[ "$retries" -gt 0 ]
+grep -q 'docker smoke' /tmp/guest-loopback-http.txt
+printf "guest loopback ok\n" > GUEST_LOOPBACK_OK.txt
+printf "docker daemon ready\n" > DOCKER_OK.txt
+printf "real guest docker probe completed\n" > "$report"
+echo "real-guest-docker-probe finished"
+"#,
+        )
+        .expect("write guest docker probe");
+        fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod guest docker probe");
+        script_path
+    }
+
+    #[test]
+    fn guest_docker_daemon_smoke_boots_real_firecracker_when_opted_in() {
+        if std::env::var("OPENOMAN_FIRECRACKER_E2E").ok().as_deref() != Some("1") {
+            return;
+        }
+
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let package_dir = temp.path().join("user-bin");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        fs::write(workspace.join("README.md"), "docker smoke\n").expect("write workspace file");
+
+        let fake_codex = write_real_guest_docker_probe_codex(package_dir.as_path());
+        let mut runtime_config = real_firecracker_runtime_config(temp.path(), &package_dir);
+        runtime_config
+            .firecracker_mut()
+            .expect("firecracker config")
+            .docker_daemon = true;
+        runtime_config.limits.memory_mib = 1024;
+        runtime_config.limits.timeout_secs = 90;
+        let backend = FirecrackerBackend::new(runtime_config.clone()).expect("backend");
+        backend
+            .check_runtime_dependencies()
+            .expect("real firecracker dependencies available");
+
+        let mut runner = backend.create_runner().expect("runner");
+        let handle = runner
+            .start(AttemptSpec {
+                job_id: "job-docker-real".to_string(),
+                attempt_id: 1,
+                workspace_dir: workspace,
+                instruction: "probe docker daemon".to_string(),
+                limits: runtime_config.limits.clone(),
+                agent: AgentExecutionSpec {
+                    provider: "codex".to_string(),
+                    bin: fake_codex
+                        .file_name()
+                        .expect("codex filename")
+                        .to_string_lossy()
+                        .into_owned(),
+                    model: None,
+                    auth_file: None,
+                    api_key: None,
+                    egress_proxy: None,
+                    egress_allowed_domains: Vec::new(),
+                },
+            })
+            .expect("start");
+        let serial_log_path = handle.run_dir.join("serial.log");
+        let vmm_log_path = handle.run_dir.join("firecracker.log");
+
+        let status = runner.wait(&handle).expect("wait");
+        let collected = runner
+            .collect_output(&handle, "job-docker-real", 1)
+            .expect("collect output");
+        let stop_result = runner.stop(&handle);
+        let serial_output = fs::read_to_string(&serial_log_path).unwrap_or_default();
+        let vmm_output = fs::read_to_string(&vmm_log_path).unwrap_or_default();
+        let logs = fs::read_to_string(&collected.logs_path).expect("logs");
+        let report = fs::read_to_string(&collected.report_path).expect("report");
+        assert!(
+            status.success,
+            "real firecracker docker probe failed with code {:?}\nvmm log:\n{}\nserial log:\n{}\nguest logs:\n{}",
+            status.code,
+            vmm_output,
+            serial_output,
+            logs
+        );
+        assert!(
+            logs.contains("guest docker daemon is ready"),
+            "guest logs did not show docker daemon readiness\nreport:\n{}\nlogs:\n{}",
+            report,
+            logs
+        );
+        let docker_ok = fs::read_to_string(collected.modified_workspace_dir.join("DOCKER_OK.txt"))
+            .expect("docker ok marker");
+        assert_eq!(docker_ok, "docker daemon ready\n");
+        let guest_loopback_ok = fs::read_to_string(
+            collected
+                .modified_workspace_dir
+                .join("GUEST_LOOPBACK_OK.txt"),
+        )
+        .expect("guest loopback ok marker");
+        assert_eq!(guest_loopback_ok, "guest loopback ok\n");
+        assert!(report.contains("real guest docker probe completed"));
+
+        stop_result.expect("stop");
     }
 }

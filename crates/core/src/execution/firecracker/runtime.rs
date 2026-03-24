@@ -7,8 +7,8 @@ use std::{
 use crate::agents::{build_launch_plan, AgentLaunchContext, AgentLaunchPlan, AgentReportMode};
 
 use super::super::{
-    shell_quote, AgentExecutionSpec, AttemptSpec, ExecutionError, FirecrackerBackendConfig,
-    UserPackageDir,
+    shell_quote, AgentExecutionSpec, AttemptSpec, DockerAuthConfig, ExecutionError,
+    FirecrackerBackendConfig, UserPackageDir,
 };
 use super::{
     network::{host_proxy_egress_policy, HostProxyEgressPolicy, NetworkLease},
@@ -68,6 +68,13 @@ impl<'a> FirecrackerRuntimeStager<'a> {
         if let Some(auth_file) = &spec.agent.auth_file {
             fs::copy(auth_file, config_dir.join("agent-auth.json"))?;
         }
+        if let Some(docker_auth_config) = &self.firecracker.docker_auth_config {
+            let docker_auth_contents = load_docker_auth_contents(docker_auth_config)?;
+            fs::write(
+                config_dir.join("docker-config.json"),
+                docker_auth_contents.as_bytes(),
+            )?;
+        }
         fs::write(
             config_dir.join("agent.env"),
             render_agent_env(
@@ -75,15 +82,43 @@ impl<'a> FirecrackerRuntimeStager<'a> {
                 &spec.instruction,
                 &guest_path_entries,
                 &self.firecracker.user_package_dirs,
+                self.firecracker.docker_daemon,
+                self.firecracker.docker_auth_config.is_some(),
                 network_lease,
             )?,
         )?;
         fs::write(
             config_dir.join("guest-init-contract.txt"),
-            "mount /dev/vdb at /mnt/runtime, source openoman-config/agent.env, bind package mounts, run the agent in /mnt/runtime/workspace, write report/logs to /mnt/runtime/openoman-output\n",
+            "mount /dev/vdb at /mnt/runtime, source openoman-config/agent.env, optionally start dockerd, bind package mounts, run the agent in /mnt/runtime/workspace, write report/logs to /mnt/runtime/openoman-output\n",
         )?;
 
-        let image_size_bytes = compute_image_size_bytes(&stage_root, spec.limits.disk_quota_bytes)?;
+        let minimum_image_size_bytes = compute_image_size_bytes(&stage_root)?;
+        let image_size_bytes = match self.firecracker.runtime_disk_bytes {
+            Some(explicit_size_bytes) => {
+                if explicit_size_bytes > spec.limits.disk_quota_bytes {
+                    return Err(ExecutionError::InvalidConfig(format!(
+                        "configured Firecracker runtime disk size {} bytes exceeds disk quota {} bytes",
+                        explicit_size_bytes, spec.limits.disk_quota_bytes
+                    )));
+                }
+                if explicit_size_bytes < minimum_image_size_bytes {
+                    return Err(ExecutionError::InvalidConfig(format!(
+                        "configured Firecracker runtime disk size {} bytes is smaller than prepared runtime input needs {} bytes",
+                        explicit_size_bytes, minimum_image_size_bytes
+                    )));
+                }
+                explicit_size_bytes
+            }
+            None => {
+                if minimum_image_size_bytes > spec.limits.disk_quota_bytes {
+                    return Err(ExecutionError::InvalidConfig(format!(
+                        "prepared runtime input needs {} bytes but disk quota is only {} bytes",
+                        minimum_image_size_bytes, spec.limits.disk_quota_bytes
+                    )));
+                }
+                minimum_image_size_bytes
+            }
+        };
         let image_path = run_dir.join("runtime.ext4");
         let blocks = image_size_bytes.div_ceil(EXT4_BLOCK_SIZE_BYTES);
         let mkfs_args = vec![
@@ -111,6 +146,8 @@ pub(super) fn render_agent_env(
     instruction: &str,
     guest_path_entries: &[String],
     user_package_dirs: &[UserPackageDir],
+    docker_daemon_enabled: bool,
+    docker_auth_config_enabled: bool,
     network_lease: Option<&NetworkLease>,
 ) -> Result<String, ExecutionError> {
     let egress_policy = host_proxy_egress_policy(&agent.egress_allowed_domains);
@@ -142,6 +179,14 @@ pub(super) fn render_agent_env(
             "OPENOMAN_AGENT_AUTH_INSTALL_PATH={}\n",
             shell_quote(&format!("/root/{}", relative_path.display()))
         ));
+    }
+    if docker_auth_config_enabled {
+        env_file.push_str(
+            "OPENOMAN_DOCKER_AUTH_FILE='/mnt/runtime/openoman-config/docker-config.json'\n",
+        );
+    }
+    if docker_daemon_enabled {
+        env_file.push_str("OPENOMAN_DOCKER_DAEMON_ENABLED='1'\n");
     }
     append_agent_launch_plan_env(&mut env_file, &launch_plan);
     if let Some(proxy) = &agent.egress_proxy {
@@ -212,6 +257,13 @@ pub(super) fn render_agent_env(
     Ok(env_file)
 }
 
+fn load_docker_auth_contents(config: &DockerAuthConfig) -> Result<String, ExecutionError> {
+    match config {
+        DockerAuthConfig::HostFile(path) => fs::read_to_string(path).map_err(ExecutionError::Io),
+        DockerAuthConfig::InlineJson(contents) => Ok(contents.clone()),
+    }
+}
+
 fn append_agent_launch_plan_env(env_file: &mut String, launch_plan: &AgentLaunchPlan) {
     env_file.push_str(&format!(
         "OPENOMAN_AGENT_ID={}\n",
@@ -265,20 +317,11 @@ fn append_agent_launch_plan_env(env_file: &mut String, launch_plan: &AgentLaunch
     }
 }
 
-pub(super) fn compute_image_size_bytes(
-    root: &Path,
-    disk_quota_bytes: u64,
-) -> Result<u64, ExecutionError> {
+pub(super) fn compute_image_size_bytes(root: &Path) -> Result<u64, ExecutionError> {
     let source_size = directory_size_bytes(root)?;
     let minimum = 64 * 1024 * 1024_u64;
     let overhead = 128 * 1024 * 1024_u64;
-    let requested = (source_size.saturating_add(overhead)).max(minimum);
-    if requested > disk_quota_bytes {
-        return Err(ExecutionError::InvalidConfig(format!(
-            "prepared runtime input needs {requested} bytes but disk quota is only {disk_quota_bytes} bytes"
-        )));
-    }
-    Ok(requested)
+    Ok((source_size.saturating_add(overhead)).max(minimum))
 }
 
 fn discover_host_dns_servers() -> Vec<String> {

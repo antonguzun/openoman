@@ -81,7 +81,12 @@ Firecracker-specific details:
 - `sandbox.firecracker.mode = "jailer"` is config-visible but rejected during startup validation
 - `sandbox.firecracker.network.mode = "disabled"` runs without guest networking
 - `sandbox.firecracker.network.mode = "host-proxy"` routes guest HTTPS through a host-local allowlisting proxy
+- `sandbox.firecracker.network.allowed_connect_ports = [443, 5050]` lets the host proxy tunnel HTTPS CONNECT traffic to non-443 ports such as private Docker registries
+- the default guest rootfs build now includes `make`, Docker CLI, `dockerd`, `docker compose`, `python3`, and a `python -> python3` compatibility symlink in addition to the agent CLIs
+- `sandbox.firecracker.runtime_disk_mb = 4096` explicitly sizes the per-attempt runtime disk (`/dev/vdb`) used for staged workspace data and guest Docker storage
+- `sandbox.firecracker.docker_daemon = true` starts `dockerd` inside the guest, stores Docker data under `/mnt/runtime/docker`, and waits for `/var/run/docker.sock` readiness before agent execution
 - `[[sandbox.firecracker.user_package_dirs]]` copies explicit host-user package directories into each run
+- `sandbox.firecracker.docker_auth_config` or `sandbox.firecracker.docker_auth_config_env` explicitly stages Docker registry credentials into `/root/.docker/config.json`
 
 Startup validates the configured backend before any command runs. With Firecracker, openoman fails fast if required host dependencies such as `firecracker`, `/dev/kvm`, or the configured guest asset paths are unavailable.
 
@@ -90,6 +95,8 @@ Guest asset documentation:
 - asset-pair build helper: [guest/build-assets.sh](guest/build-assets.sh)
 - rootfs-only build helper: [guest/build-rootfs.sh](guest/build-rootfs.sh)
 - guest runtime contract: [guest/README.md](guest/README.md)
+
+Docker registry auth is opt-in. openoman never auto-imports host `~/.docker/config.json`; if you want private image pulls inside the guest, point `sandbox.firecracker.docker_auth_config` at a specific host file or use `sandbox.firecracker.docker_auth_config_env` to pass JSON from a host environment variable. If the guest also needs to run containers, enable `sandbox.firecracker.docker_daemon = true` so the Docker CLI has a daemon to talk to. For image-heavy Docker workflows, raise `sandbox.firecracker.runtime_disk_mb` so `/mnt/runtime/docker` has enough space for pulled layers and build cache. If a private registry listens on a non-443 HTTPS port such as `5050`, add that port to `sandbox.firecracker.network.allowed_connect_ports` or the host proxy will deny the CONNECT tunnel before Docker auth is even attempted.
 
 ## Agent provider support
 
@@ -110,11 +117,12 @@ Existing Codex configs that still use `codex_bin` and `codex_auth_file` continue
 Repository configuration supports many repositories under `[git]`:
 
 - `[[git.accounts]]` defines reusable publish credentials and trusted commit identity
-- `[[git.repos]]` defines repository alias, `repo_ref`, `platform`, optional `env_repo_name`, and provider-specific publish metadata
+- `[[git.repos]]` defines repository alias, `repo_ref`, `platform`, optional `env_repo_name`, optional `post_clone_command`, and provider-specific publish metadata
 - `[git.naming]` optionally enables trusted host-side LLM generation for `branch_name` and `commit_message`
 - `submit --repo <value>` resolves `<value>` as alias first, then falls back to a raw repo ref or path
 - `env_repo_name` defaults to the repo alias
 - `env_for_repo_dir` defaults to `./env_for_repo`, and `./env_for_repo/<env_repo_name>` is copied into the sandbox workspace root when present
+- `post_clone_command`, when set on a repo alias, runs on the trusted host after clone plus checkout and before the trusted worktree is copied into the sandbox
 
 Alias-based jobs persist `repo_alias`, so publish behavior and environment overlays remain deterministic at `run` time. Jobs now also persist `branch_name` and `commit_message` at submit time. `POST /jobs/:id/retry` inherits those values so later continuation flows can keep using the same branch identity.
 

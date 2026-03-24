@@ -90,13 +90,20 @@ impl<'a> FirecrackerNetworkController<'a> {
         self.append_network_log_line(
             log_path,
             &format!(
-                "network setup requested: tap={} host_ip={}/{} guest_ip={}/{} proxy_port={} allowlist={}",
+                "network setup requested: tap={} host_ip={}/{} guest_ip={}/{} proxy_port={} connect_ports={} allowlist={}",
                 lease.tap_name,
                 lease.host_ip,
                 lease.prefix_len,
                 lease.guest_ip,
                 lease.prefix_len,
                 lease.proxy_port,
+                self.firecracker
+                    .networking
+                    .allowed_connect_ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
                 spec.agent.egress_allowed_domains.join(",")
             ),
         )?;
@@ -157,6 +164,8 @@ impl<'a> FirecrackerNetworkController<'a> {
         listener.set_nonblocking(true)?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let allowed_domains = Arc::new(allowed_domains.to_vec());
+        let allowed_connect_ports =
+            Arc::new(self.firecracker.networking.allowed_connect_ports.clone());
         let log_file = Arc::new(Mutex::new(
             fs::OpenOptions::new()
                 .create(true)
@@ -167,6 +176,7 @@ impl<'a> FirecrackerNetworkController<'a> {
         let shutdown_for_thread = Arc::clone(&shutdown);
         let log_for_thread = Arc::clone(&log_file);
         let allowed_for_thread = Arc::clone(&allowed_domains);
+        let ports_for_thread = Arc::clone(&allowed_connect_ports);
         let accept_thread = thread::spawn(move || {
             loop {
                 if shutdown_for_thread.load(Ordering::SeqCst) {
@@ -176,11 +186,13 @@ impl<'a> FirecrackerNetworkController<'a> {
                     Ok((stream, peer_addr)) => {
                         let log_for_client = Arc::clone(&log_for_thread);
                         let allowed_for_client = Arc::clone(&allowed_for_thread);
+                        let ports_for_client = Arc::clone(&ports_for_thread);
                         thread::spawn(move || {
                             handle_connect_proxy_client(
                                 stream,
                                 peer_addr.to_string(),
                                 allowed_for_client,
+                                ports_for_client,
                                 log_for_client,
                             );
                         });
@@ -315,6 +327,7 @@ fn handle_connect_proxy_client(
     mut client: TcpStream,
     peer_addr: String,
     allowed_domains: Arc<Vec<String>>,
+    allowed_connect_ports: Arc<Vec<u16>>,
     log: SharedLog,
 ) {
     let request = match read_connect_proxy_request(&mut client) {
@@ -355,11 +368,18 @@ fn handle_connect_proxy_client(
         return;
     }
 
-    if port != 443 {
+    if !allowed_connect_ports.contains(&port) {
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        let allowed_ports = allowed_connect_ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
         write_shared_log(
             &log,
-            &format!("proxy denied {host}:{port} from {peer_addr}: only port 443 is allowed"),
+            &format!(
+                "proxy denied {host}:{port} from {peer_addr}: allowed CONNECT ports are {allowed_ports}"
+            ),
         );
         return;
     }

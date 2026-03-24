@@ -669,13 +669,17 @@ mod tests {
             jailer_bin: "jailer".to_string(),
             kernel_image_path: PathBuf::from("/kernel"),
             rootfs_image_path: PathBuf::from("/rootfs"),
+            runtime_disk_bytes: None,
             guest_cid_base: 10_000,
+            docker_daemon: false,
+            docker_auth_config: None,
             user_package_dirs: Vec::new(),
             networking: FirecrackerNetworkingConfig {
                 mode: FirecrackerNetworkingMode::HostProxy,
                 privilege_mode: crate::execution::FirecrackerNetworkPrivilegeMode::Sudo,
                 tap_name_prefix: "oomtap".to_string(),
                 proxy_port: 3128,
+                allowed_connect_ports: vec![443],
                 subnet_cidr: "172.22.0.0/16".to_string(),
             },
         };

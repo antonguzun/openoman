@@ -20,7 +20,9 @@ The rootfs therefore needs to contain `/sbin/openoman-init`. The checked-in [`op
 
 - mount `/dev/vdb` at `/mnt/runtime`
 - load `/mnt/runtime/openoman-config/agent.env`
+- initialize guest loopback so `127.0.0.1` is available to agent and Docker workloads
 - optionally copy a staged provider auth file into the location expected by the selected CLI
+- optionally start `dockerd` inside the guest when Firecracker config enables guest Docker daemon support, with Docker data rooted at `/mnt/runtime/docker`
 - bind configured package directories into the guest filesystem
 - optionally configure `eth0` with a static `/30` address and export a host-local HTTP CONNECT proxy
 - run the agent inside `/mnt/runtime/workspace` with Firecracker as the outer sandbox boundary
@@ -52,7 +54,7 @@ Set `OPENOMAN_CONTAINER_ENGINE=docker` or `OPENOMAN_CONTAINER_ENGINE=podman` if 
 - downloads an uncompressed Firecracker-compatible kernel into `./guest/out/vmlinux`
 - downloads the matching published kernel config into `./guest/out/vmlinux.config`
 - builds a root filesystem image with `openoman-init.sh` injected as `/sbin/openoman-init` into `./guest/out/rootfs.ext4`
-- by default, installs guest-side `node`, `npm`, `git`, `ripgrep`, `@openai/codex`, and Cursor's `cursor-agent`, so both CLIs exist inside the guest image without host bind mounts
+- by default, installs guest-side `make`, Docker CLI, `dockerd`, `docker compose` support, `python3`, a `python -> python3` compatibility symlink, `node`, `npm`, `git`, `ripgrep`, `@openai/codex`, and Cursor's `cursor-agent`, so common test/agent CLIs exist inside the guest image without host bind mounts
 
 The default kernel download URL now points at Firecracker's official `firecracker-ci` guest kernel for the local architecture. The script also downloads the published sidecar config and refuses the build if it does not contain `CONFIG_HW_RANDOM_VIRTIO=y`, because the current guest Node/Codex workload stalls without that driver.
 
@@ -63,6 +65,10 @@ If you need a different guest package set, override the container setup step:
 ```sh
 OPENOMAN_GUEST_SETUP_CMD='apk add --no-cache bash curl nodejs npm && npm install -g @openai/codex && curl -fsSL https://cursor.com/install | bash'
 ./guest/build-rootfs.sh ./guest/out
+
+If you need private Docker registry access inside the guest, configure it on the host side through `sandbox.firecracker.docker_auth_config` or `sandbox.firecracker.docker_auth_config_env`. At run time, openoman stages that explicit Docker config into `/root/.docker/config.json`. No host Docker login is copied automatically.
+
+If you also need a Docker daemon inside the guest, set `sandbox.firecracker.docker_daemon = true`. That makes `openoman-init.sh` start `dockerd` during boot and wait until `docker info` succeeds before the agent begins running. Docker images, layers, and build cache are stored under `/mnt/runtime/docker`, so they consume the per-attempt runtime disk instead of the shared guest rootfs. If a Docker-heavy workflow needs more room, set `sandbox.firecracker.runtime_disk_mb` to enlarge `/dev/vdb` for that attempt. This is separate from Docker registry auth: auth controls credentials, while `docker_daemon` controls whether the guest starts a local daemon at all.
 ```
 
 If you only want the rootfs image, run:
@@ -106,10 +112,13 @@ Direct Firecracker mode now supports a host-proxy networking path for real agent
 - the guest gets a static `eth0` address inside a `/30` subnet
 - `HTTP_PROXY` and `HTTPS_PROXY` inside the guest point at a host-local HTTP CONNECT proxy
 - the proxy allows only exact hostnames from `agent.egress_allowed_domains`
+- CONNECT destinations are further restricted to `sandbox.firecracker.network.allowed_connect_ports`, which defaults to `[443]`
 
 This keeps guest egress constrained to the host proxy path instead of giving the VM general outbound internet access.
 
 `privilege_mode = "sudo"` is the default because creating the tap device requires host network privileges. `openoman run` calls `sudo -v` once before the attempt starts, then uses a hidden internal helper for tap setup and teardown. Use `privilege_mode = "direct"` only when the whole `openoman` process already runs with the required capabilities.
+
+The host proxy defaults to HTTPS CONNECT on port `443` only. If your guest needs to reach a private HTTPS service on another port, such as a Docker registry on `:5050`, add that port to `sandbox.firecracker.network.allowed_connect_ports`.
 
 The current guest kernel does not enable Linux Landlock (`CONFIG_SECURITY_LANDLOCK` is off in the pinned Firecracker kernel config). The Codex branch therefore runs `codex exec` with `--dangerously-bypass-approvals-and-sandbox`, and the Cursor branch relies on Firecracker itself rather than an inner sandbox. That is intentional here: Firecracker is already the actual isolation boundary for the untrusted workload.
 

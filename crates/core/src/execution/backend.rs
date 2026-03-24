@@ -54,6 +54,7 @@ pub struct FirecrackerNetworkingConfig {
     pub privilege_mode: FirecrackerNetworkPrivilegeMode,
     pub tap_name_prefix: String,
     pub proxy_port: u16,
+    pub allowed_connect_ports: Vec<u16>,
     pub subnet_cidr: String,
 }
 
@@ -65,13 +66,22 @@ pub struct UserPackageDir {
 }
 
 #[derive(Debug, Clone)]
+pub enum DockerAuthConfig {
+    HostFile(PathBuf),
+    InlineJson(String),
+}
+
+#[derive(Debug, Clone)]
 pub struct FirecrackerBackendConfig {
     pub mode: FirecrackerMode,
     pub firecracker_bin: String,
     pub jailer_bin: String,
     pub kernel_image_path: PathBuf,
     pub rootfs_image_path: PathBuf,
+    pub runtime_disk_bytes: Option<u64>,
     pub guest_cid_base: u32,
+    pub docker_daemon: bool,
+    pub docker_auth_config: Option<DockerAuthConfig>,
     pub user_package_dirs: Vec<UserPackageDir>,
     pub networking: FirecrackerNetworkingConfig,
 }

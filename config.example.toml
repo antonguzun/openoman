@@ -56,6 +56,8 @@ platform = "github"
 account = "github-personal"
 # Optional. Defaults to the repo alias when omitted.
 # env_repo_name = "reponame"
+# Optional. Runs on the trusted host after clone + checkout and before sandbox copy.
+# post_clone_command = "git submodule update --init --recursive"
 # Optional when inferable from repo_ref/push_url.
 repo_owner = "username"
 repo_name = "reponame"
@@ -99,7 +101,20 @@ jailer_bin = "jailer"
 # Provide host paths to the guest kernel and rootfs assets.
 kernel_image_path = "/opt/openoman/guest/vmlinux"
 rootfs_image_path = "/opt/openoman/guest/rootfs.ext4"
+# Optional explicit size for the per-attempt runtime disk (/dev/vdb), in MiB.
+# This is where workspace data, staged config, and guest Docker data live.
+# Omit to keep the current dynamic sizing behavior.
+# runtime_disk_mb = 4096
 guest_cid_base = 10000
+# Optional: start dockerd inside the guest so docker-compose workflows can talk to
+# /var/run/docker.sock from inside the microVM. Disabled by default to avoid extra
+# startup cost for runs that do not need Docker-in-Docker.
+# docker_daemon = true
+# Optional explicit Docker registry auth staged into the guest as /root/.docker/config.json.
+# Disabled by default so registry secrets do not enter the sandbox unless you opt in.
+# docker_auth_config = "~/.docker/config.json"
+# Or read the JSON contents from a host environment variable at run time:
+# docker_auth_config_env = "OPENOMAN_DOCKER_CONFIG_JSON"
 
 [sandbox.firecracker.network]
 # disabled: no guest NIC.
@@ -110,6 +125,10 @@ mode = "host-proxy"
 privilege_mode = "sudo"
 tap_name_prefix = "oomtap"
 proxy_port = 3128
+# Optional CONNECT destination ports allowed by the host proxy. Defaults to [443].
+# Add registry ports such as 5050 here when Docker needs to pull from a private registry
+# that does not listen on 443.
+# allowed_connect_ports = [443, 5050]
 subnet_cidr = "172.22.0.0/16"
 
 [[sandbox.firecracker.user_package_dirs]]
