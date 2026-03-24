@@ -6,6 +6,120 @@ openoman runs coding agents against real repositories without handing them your 
 
 Use openoman when you want agent automation to touch real code, but you do not want it to mutate your day-to-day environment, hold your Git credentials, or dictate how tasks enter the system.
 
+## How it works
+
+```mermaid
+flowchart TB
+    USER[User / External Adapter]
+
+    subgraph CANVAS[" "]
+        direction LR
+
+        subgraph VM["Disposable Firecracker microVM (Untrusted Guest)"]
+            VM_POS[" "]
+            INIT["/sbin/openoman-init"]
+            WS["Sandbox workspace"]
+            AGENT["Agent CLI<br/>Codex / Cursor"]
+            TESTS["Docker Compose / tests / local services"]
+            OUT["Untrusted outputs<br/>patch / report / logs"]
+            NOTE["No direct Git / VCS credentials<br/>No direct publish path"]
+        end
+
+        subgraph HOST["Trusted Host / Trusted Core"]
+            HOST_POS[" "]
+            API["CLI / HTTP Control Plane<br/>127.0.0.1:8080<br/>optional bearer token"]
+            DB[(SQLite<br/>jobs / attempts / artifacts / outbox)]
+
+            CLONE["Trusted clean clone<br/>clone / fetch / checkout revision"]
+            SNAP["Prepare sandbox workspace snapshot"]
+
+            RUNNER["Firecracker runner<br/>VM lifecycle + tap setup"]
+            VAL["Trusted validation<br/>apply patch + deterministic checks"]
+            PUB["Trusted publish flow<br/>create branch / push / PR-MR"]
+            ART["Artifact refs / local store<br/>patch / report / logs"]
+
+            GITCREDS["Git / VCS credentials<br/>host env / secret store"]
+            AGENTCREDS["Agent provider credentials source<br/>Codex auth file / Cursor API key"]
+            PROXY["Host allowlisting CONNECT proxy<br/>only explicit whitelisted domains"]
+        end
+
+        subgraph EXTERNAL["External network endpoints"]
+            EXT_POS[" "]
+            direction TB
+
+            subgraph EXTCOL[" "]
+                direction TB
+                VCS["GitHub / GitLab<br/>PR/MR API"]
+                VCS2["GitHub / GitLab<br/>repo hosting"]
+                MODEL["Agent provider APIs"]
+                PKG["Package registries<br/>PyPI / npm / crates / etc."]
+                OCI["Container registries<br/>Docker Hub / GHCR / etc."]
+            end
+        end
+    end
+
+    %% hidden layout edges — keep them before visible edges
+    VM_POS --- HOST_POS
+    HOST_POS --- EXT_POS
+    %% VCS2 --- VSC
+    %% VCS --- MODEL
+    MODEL --- PKG
+    PKG --- OCI
+    
+    USER -->|"submit / run / status"| API
+    API --> DB
+
+    VCS2 -->|"git clone / fetch"| CLONE
+    API --> CLONE
+    CLONE --> SNAP
+    API --> RUNNER
+
+    RUNNER --> INIT
+    INIT --> AGENT
+    INIT --> WS
+    AGENT -->|"edit files"| WS
+    AGENT --> TESTS
+    TESTS --> OUT
+    AGENT --> OUT
+
+    SNAP -->|"copy-in workspace snapshot"| WS
+
+    OUT -->|"copy-out artifacts"| ART
+    ART --> VAL
+    VAL --> PUB
+    GITCREDS --> PUB
+    PUB -->|"git push + PR/MR API"| VCS
+
+    AGENTCREDS -.->|"may be staged / injected into guest"| AGENT
+
+    AGENT -->|"HTTPS via host proxy"| PROXY
+    TESTS -->|"image pulls / package downloads via host proxy"| PROXY
+    PROXY -->|"whitelist-controlled egress"| MODEL
+    PROXY -->|"whitelist-controlled egress"| PKG
+    PROXY -->|"whitelist-controlled egress"| OCI
+
+    AGENT -.-> NOTE
+
+    classDef trusted fill:#EAF3FF,stroke:#1E5AA8,stroke-width:2px,color:#111;
+    classDef untrusted fill:#FFEAEA,stroke:#C62828,stroke-width:2px,color:#111;
+    classDef hostsecret fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#111;
+    classDef guestsecret fill:#FFF3E0,stroke:#EF6C00,stroke-width:2px,color:#111;
+    classDef external fill:#F5F5F5,stroke:#616161,stroke-width:1.5px,color:#111;
+    classDef layout fill:transparent,stroke:transparent,color:transparent;
+
+    class API,DB,CLONE,SNAP,RUNNER,VAL,PUB,ART,PROXY trusted;
+    class INIT,WS,AGENT,TESTS,OUT,NOTE untrusted;
+    class GITCREDS hostsecret;
+    class AGENTCREDS guestsecret;
+    class VCS,VCS2,MODEL,PKG,OCI,USER external;
+    class VM_POS,HOST_POS,EXT_POS layout;
+
+    style EXTCOL fill:transparent,stroke:transparent
+    style CANVAS fill:transparent,stroke:transparent
+
+    linkStyle 0,1,2,3,4,5 stroke:transparent
+```
+
 ## Feature map
 
 - [Keep agent work out of your manual environment](#disposable-sandbox-execution): each task runs in its own sandbox instead of your everyday clone or shell. The execution layer is sandbox-agnostic in design; the current implementation is Firecracker and currently targets Linux hosts with KVM. Details: [guest/README.md](guest/README.md)
