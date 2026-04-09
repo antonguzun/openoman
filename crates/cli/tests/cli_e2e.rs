@@ -739,8 +739,13 @@ fn submit_run_and_result_show_github_publish_metadata() {
         .clone();
     let result_stdout = String::from_utf8(result_output).expect("utf8 result output");
     assert!(result_stdout.contains(&format!("job_id={job_id} result=success")));
+    assert!(result_stdout.contains("status=succeeded"));
     assert!(result_stdout.contains(&format!("branch_name={branch_name}")));
+    assert!(result_stdout.contains(&format!(
+        "branch_url=https://github.com/acme/demo/tree/{branch_name}"
+    )));
     assert!(result_stdout.contains(&format!("commit_message=OpenOMAN job {job_id}")));
+    assert!(result_stdout.contains("merge_request_url=https://example.test/pulls/17"));
     assert!(result_stdout.contains(&format!("branch={branch_name}")));
     assert!(result_stdout.contains("pull_request_number=17"));
     assert!(result_stdout.contains("pull_request_url=https://example.test/pulls/17"));
@@ -848,8 +853,15 @@ fn gitlab_alias_publishes_and_result_prints_merge_request_metadata() {
         .clone();
     let result_stdout = String::from_utf8(result_output).expect("utf8 result output");
     assert!(result_stdout.contains(&format!("job_id={job_id} result=success")));
+    assert!(result_stdout.contains("status=succeeded"));
     assert!(result_stdout.contains(&format!("branch_name={branch_name}")));
+    assert!(result_stdout.contains(&format!(
+        "branch_url=https://gitlab.example.test/group/subgroup/demo/-/tree/{branch_name}"
+    )));
     assert!(result_stdout.contains(&format!("commit_message=OpenOMAN job {job_id}")));
+    assert!(result_stdout.contains(
+        "merge_request_url=https://gitlab.example.test/group/subgroup/demo/-/merge_requests/17"
+    ));
     assert!(result_stdout.contains(&format!("branch={branch_name}")));
     assert!(result_stdout.contains("pull_request_number=17"));
     assert!(result_stdout.contains(

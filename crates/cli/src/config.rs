@@ -39,6 +39,7 @@ struct FileConfig {
     sandbox: Option<SandboxConfig>,
     agent: Option<AgentConfig>,
     server: Option<ServerConfig>,
+    launcher: Option<LauncherConfig>,
     publishing: Option<PublishingConfig>,
 }
 
@@ -174,6 +175,11 @@ struct ServerConfig {
     auth_token_env: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct LauncherConfig {
+    socket_path: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AppConfig {
     pub(crate) database_path: PathBuf,
@@ -182,6 +188,7 @@ pub(crate) struct AppConfig {
     pub(crate) execution: ExecutionRuntimeConfig,
     pub(crate) agent: AgentRuntimeConfig,
     pub(crate) server: ServerRuntimeConfig,
+    pub(crate) launcher: LauncherRuntimeConfig,
     pub(crate) publishing: Option<PublishingRuntimeConfig>,
     git_naming: Option<OpenAiGitNamingConfig>,
     repo_catalog: RepoCatalogRuntimeConfig,
@@ -191,6 +198,11 @@ pub(crate) struct AppConfig {
 pub(crate) struct ServerRuntimeConfig {
     pub(crate) bind_addr: SocketAddr,
     pub(crate) auth_token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LauncherRuntimeConfig {
+    pub(crate) socket_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +300,7 @@ impl AppConfig {
             sandbox,
             agent,
             server,
+            launcher,
             publishing,
         } = parsed;
         let file_db = core.and_then(|c| c.database_path);
@@ -362,6 +375,14 @@ impl AppConfig {
         let agent_runtime = load_agent_runtime_config(agent, path)?;
         validate_agent_networking_contract(firecracker.as_ref(), &agent_runtime)?;
 
+        let runtime_dir = resolve_config_path(
+            path,
+            sandbox
+                .runtime_dir
+                .as_deref()
+                .unwrap_or("./workspaces/sandboxes"),
+        )?;
+
         Ok(Self {
             database_path: resolve_config_path(path, &database_path)?,
             trusted_workspace_dir: resolve_config_path(path, &trusted_workspace_dir)?,
@@ -377,13 +398,7 @@ impl AppConfig {
                     }
                     ExecutionBackendKind::Process => ExecutionBackendConfig::Process,
                 },
-                runtime_dir: resolve_config_path(
-                    path,
-                    sandbox
-                        .runtime_dir
-                        .as_deref()
-                        .unwrap_or("./workspaces/sandboxes"),
-                )?,
+                runtime_dir: runtime_dir.clone(),
                 limits: ResourceLimits {
                     vcpu_count: sandbox.cpu_cores.unwrap_or(2),
                     memory_mib: sandbox.memory_mb.unwrap_or(2048),
@@ -394,6 +409,7 @@ impl AppConfig {
             },
             agent: agent_runtime,
             server: load_server_config(server)?,
+            launcher: load_launcher_config(launcher, path, &runtime_dir)?,
             publishing: load_publishing_config(publishing, path)?,
             git_naming: load_git_naming_config(&git)?,
             repo_catalog,
@@ -693,6 +709,30 @@ impl AppConfig {
             legacy.github_config_for_job(revision)?,
         ))
     }
+
+    pub(crate) fn resolve_result_branch_url(
+        &self,
+        repo_alias: Option<&str>,
+        repo_ref: &str,
+        branch_name: Option<&str>,
+    ) -> Option<String> {
+        let branch_name = branch_name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+
+        if let Some(alias) = repo_alias {
+            let repo = self.repo_catalog.repos_by_alias.get(alias)?;
+            return build_repo_branch_url(repo, branch_name);
+        }
+
+        if let Some(legacy) = self.publishing.as_ref() {
+            if let Some(url) = build_legacy_github_branch_url(legacy, branch_name) {
+                return Some(url);
+            }
+        }
+
+        build_inferred_branch_url(repo_ref, branch_name)
+    }
 }
 
 fn load_server_config(config: Option<ServerConfig>) -> Result<ServerRuntimeConfig, String> {
@@ -736,6 +776,20 @@ fn load_server_config(config: Option<ServerConfig>) -> Result<ServerRuntimeConfi
         bind_addr: SocketAddr::new(host, config.port.unwrap_or(8080)),
         auth_token,
     })
+}
+
+fn load_launcher_config(
+    config: Option<LauncherConfig>,
+    config_path: &Path,
+    runtime_dir: &Path,
+) -> Result<LauncherRuntimeConfig, String> {
+    let config = config.unwrap_or(LauncherConfig { socket_path: None });
+    let socket_path =
+        match normalize_optional_string(config.socket_path.as_deref(), "launcher.socket_path")? {
+            Some(path) => resolve_config_path(config_path, &path)?,
+            None => crate::launcher::default_socket_path(runtime_dir),
+        };
+    Ok(LauncherRuntimeConfig { socket_path })
 }
 
 fn resolve_host_risk_posture(
@@ -1257,6 +1311,126 @@ fn parse_git_remote_location(raw_ref: &str) -> Option<GitRemoteLocation> {
     }
 
     None
+}
+
+fn build_repo_branch_url(repo: &RepoRuntimeConfig, branch_name: &str) -> Option<String> {
+    match repo.platform {
+        RepoPlatform::GitHub => build_github_branch_url(
+            repo.publish.repo_owner.as_deref(),
+            repo.publish.repo_name.as_deref(),
+            repo.publish.push_url.as_deref(),
+            Some(&repo.repo_ref),
+            branch_name,
+        ),
+        RepoPlatform::GitLab => build_gitlab_branch_url(
+            Some("gitlab.com"),
+            repo.publish.api_base_url.as_deref(),
+            repo.publish.repo_owner.as_deref(),
+            repo.publish.repo_name.as_deref(),
+            repo.publish.push_url.as_deref(),
+            Some(&repo.repo_ref),
+            branch_name,
+        ),
+        RepoPlatform::GitLabSelfHosted => build_gitlab_branch_url(
+            None,
+            repo.publish.api_base_url.as_deref(),
+            repo.publish.repo_owner.as_deref(),
+            repo.publish.repo_name.as_deref(),
+            repo.publish.push_url.as_deref(),
+            Some(&repo.repo_ref),
+            branch_name,
+        ),
+    }
+}
+
+fn build_legacy_github_branch_url(
+    publishing: &PublishingRuntimeConfig,
+    branch_name: &str,
+) -> Option<String> {
+    build_github_branch_url(
+        publishing.repo_owner.as_deref(),
+        publishing.repo_name.as_deref(),
+        publishing.push_url.as_deref(),
+        None,
+        branch_name,
+    )
+}
+
+fn build_inferred_branch_url(repo_ref: &str, branch_name: &str) -> Option<String> {
+    if let Some(url) = build_github_branch_url(None, None, None, Some(repo_ref), branch_name) {
+        return Some(url);
+    }
+
+    let location = infer_git_remote_location(None, Some(repo_ref))?;
+    if location.host == "gitlab.com" {
+        return build_gitlab_branch_url(
+            Some("gitlab.com"),
+            None,
+            None,
+            None,
+            None,
+            Some(repo_ref),
+            branch_name,
+        );
+    }
+
+    None
+}
+
+fn build_github_branch_url(
+    repo_owner: Option<&str>,
+    repo_name: Option<&str>,
+    push_url: Option<&str>,
+    repo_ref: Option<&str>,
+    branch_name: &str,
+) -> Option<String> {
+    let explicit = repo_owner
+        .zip(repo_name)
+        .map(|(owner, name)| GitHubRepoIdentity {
+            owner: owner.trim().to_string(),
+            name: name.trim().to_string(),
+        })
+        .filter(|identity| !identity.owner.is_empty() && !identity.name.is_empty());
+    let identity = explicit.or_else(|| infer_github_repo_identity(push_url, repo_ref))?;
+    Some(format!(
+        "https://github.com/{}/{}/tree/{}",
+        identity.owner, identity.name, branch_name
+    ))
+}
+
+fn build_gitlab_branch_url(
+    default_host: Option<&str>,
+    api_base_url: Option<&str>,
+    repo_owner: Option<&str>,
+    repo_name: Option<&str>,
+    push_url: Option<&str>,
+    repo_ref: Option<&str>,
+    branch_name: &str,
+) -> Option<String> {
+    let explicit_project_path = repo_owner
+        .zip(repo_name)
+        .map(|(owner, name)| format!("{}/{}", owner.trim_matches('/'), name.trim_matches('/')));
+    let project_path = explicit_project_path
+        .filter(|value| !value.contains("//") && !value.trim_matches('/').is_empty())
+        .or_else(|| {
+            infer_gitlab_project_identity(push_url, repo_ref).map(|value| value.project_path)
+        })?;
+    let host = infer_git_remote_location(push_url, repo_ref)
+        .map(|value| value.host)
+        .or_else(|| api_base_url.and_then(parse_http_host))
+        .or_else(|| default_host.map(str::to_string))?;
+    Some(format!(
+        "https://{host}/{project_path}/-/tree/{branch_name}"
+    ))
+}
+
+fn parse_http_host(raw: &str) -> Option<String> {
+    let (_, remainder) = raw.trim().split_once("://")?;
+    let authority = remainder
+        .split_once('/')
+        .map(|(authority, _)| authority)
+        .unwrap_or(remainder);
+    normalize_remote_authority(authority)
 }
 
 fn normalize_remote_authority(authority: &str) -> Option<String> {

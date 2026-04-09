@@ -340,20 +340,29 @@ components:
           type: integer
     JobResult:
       type: object
-      required: [job_id, result, branch_name, commit_message]
+      required: [job_id, status, result, branch_name, commit_message]
       properties:
         job_id:
           type: string
+        status:
+          type: string
+          enum: [queued, running, collecting_artifacts, validating, publishing, notifying, succeeded, failed, canceled]
         result:
           type: string
           enum: [success, failed, canceled, in_progress]
         branch_name:
           type: string
           nullable: true
+        branch_url:
+          type: string
+          nullable: true
         commit_message:
           type: string
           nullable: true
         publish_warning:
+          type: string
+          nullable: true
+        merge_request_url:
           type: string
           nullable: true
         publish_result:

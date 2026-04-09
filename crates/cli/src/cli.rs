@@ -17,6 +17,13 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
     Serve,
+    Api,
+    Launcher,
+    Dev,
+    Stack {
+        #[command(subcommand)]
+        command: StackCommands,
+    },
     Submit {
         /// Repository alias (preferred) or raw clone URL/path.
         #[arg(long)]
@@ -50,6 +57,13 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: InternalCommands,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum StackCommands {
+    Start,
+    Stop,
+    Status,
 }
 
 #[derive(Debug, Subcommand)]

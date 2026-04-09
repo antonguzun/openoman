@@ -19,6 +19,7 @@ use serde::Serialize;
 use crate::config::{
     ensure_network_privileges_guard, resolve_agent_execution_spec, AppConfig, PublishRuntimePlan,
 };
+use crate::launcher;
 
 const LOG_LIMIT_BYTES: usize = 1024 * 1024;
 const REPORT_LIMIT_BYTES: usize = 256 * 1024;
@@ -90,14 +91,17 @@ pub(crate) struct ArtifactView {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct JobResultView {
     pub(crate) job_id: String,
+    pub(crate) status: String,
     pub(crate) result: String,
     pub(crate) branch_name: Option<String>,
+    pub(crate) branch_url: Option<String>,
     pub(crate) commit_message: Option<String>,
     pub(crate) publish_warning: Option<String>,
+    pub(crate) merge_request_url: Option<String>,
     pub(crate) publish_result: Option<PublishResultView>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub(crate) struct RunJobView {
     pub(crate) job_id: String,
     pub(crate) state: String,
@@ -106,20 +110,12 @@ pub(crate) struct RunJobView {
 }
 
 impl OperatorService {
-    pub(crate) fn new(config: AppConfig) -> Result<Self, String> {
-        let execution_backend = build_execution_backend(config.execution.clone())
-            .map_err(|e| format!("failed to configure sandbox backend: {e}"))?;
-        execution_backend
-            .check_runtime_dependencies()
-            .map_err(|e| format!("sandbox backend validation failed: {e}"))?;
-        SqliteStore::open(&config.database_path).map_err(|e| {
-            format!(
-                "failed to open sqlite store at {}: {e}",
-                config.database_path.display()
-            )
-        })?;
+    pub(crate) fn for_api(config: AppConfig) -> Result<Self, String> {
+        Self::from_config(config, false)
+    }
 
-        Ok(Self { config })
+    pub(crate) fn for_launcher(config: AppConfig) -> Result<Self, String> {
+        Self::from_config(config, true)
     }
 
     pub(crate) fn config(&self) -> &AppConfig {
@@ -218,6 +214,24 @@ impl OperatorService {
             .map_err(|e| e.to_string())?;
 
         Ok(job_to_view(&retry))
+    }
+
+    pub(crate) fn next_queued_job_id(&self) -> Result<Option<String>, String> {
+        let store = self.open_store()?;
+        let jobs = store.jobs().list().map_err(|e| e.to_string())?;
+        Ok(jobs
+            .into_iter()
+            .rev()
+            .find(|job| job.state == JobState::Queued)
+            .map(|job| job.id.as_str().to_string()))
+    }
+
+    pub(crate) fn ensure_launcher_available(&self) -> Result<(), String> {
+        launcher::health(&self.config.launcher.socket_path)
+    }
+
+    pub(crate) fn dispatch_job_to_launcher(&self, job_id: &str) -> Result<RunJobView, String> {
+        launcher::run_job(&self.config.launcher.socket_path, job_id)
     }
 
     pub(crate) fn run_job(&self, job_id: &str) -> Result<RunJobView, String> {
@@ -357,14 +371,44 @@ impl OperatorService {
             JobState::Canceled => "canceled",
             _ => "in_progress",
         };
+        let branch_url = self.config.resolve_result_branch_url(
+            job.repo_alias.as_deref(),
+            job.repo_ref.as_str(),
+            job.branch_name.as_deref(),
+        );
+        let merge_request_url = job
+            .publish_result
+            .as_ref()
+            .map(|publish_result| publish_result.pull_request_url.clone());
         Ok(JobResultView {
             job_id: job.id.as_str().to_string(),
+            status: job.state.as_str().to_string(),
             result: result.to_string(),
             branch_name: job.branch_name.clone(),
+            branch_url,
             commit_message: job.commit_message.clone(),
             publish_warning: job.publish_warning.clone(),
+            merge_request_url,
             publish_result: job.publish_result.as_ref().map(publish_result_to_view),
         })
+    }
+
+    fn from_config(config: AppConfig, validate_execution_backend: bool) -> Result<Self, String> {
+        if validate_execution_backend {
+            let execution_backend = build_execution_backend(config.execution.clone())
+                .map_err(|e| format!("failed to configure sandbox backend: {e}"))?;
+            execution_backend
+                .check_runtime_dependencies()
+                .map_err(|e| format!("sandbox backend validation failed: {e}"))?;
+        }
+        SqliteStore::open(&config.database_path).map_err(|e| {
+            format!(
+                "failed to open sqlite store at {}: {e}",
+                config.database_path.display()
+            )
+        })?;
+
+        Ok(Self { config })
     }
 
     fn open_store(&self) -> Result<SqliteStore, String> {

@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenOMAN Launcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/openoman
+EnvironmentFile=-/etc/openoman/openoman.env
+ExecStart=/usr/local/bin/openoman --config /etc/openoman/config.toml launcher
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

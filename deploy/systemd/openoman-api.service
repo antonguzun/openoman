@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenOMAN API
+Requires=openoman-launcher.service
+After=network-online.target openoman-launcher.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openoman
+Group=openoman
+WorkingDirectory=/var/lib/openoman
+EnvironmentFile=-/etc/openoman/openoman.env
+ExecStart=/usr/local/bin/openoman --config /etc/openoman/config.toml api
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

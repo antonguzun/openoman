@@ -172,10 +172,13 @@ Response:
 ```json
 {
   "job_id": "job-1741860000000",
+  "status": "succeeded",
   "result": "success",
   "branch_name": "openoman/job-1741860000000",
+  "branch_url": "https://github.com/acme/repo/tree/openoman/job-1741860000000",
   "commit_message": "OpenOMAN job job-1741860000000",
   "publish_warning": null,
+  "merge_request_url": "https://github.com/acme/repo/pull/123",
   "publish_result": {
     "branch_name": "openoman/job-1741860000000",
     "pull_request_url": "https://github.com/acme/repo/pull/123",
@@ -190,6 +193,10 @@ Response:
 - `failed`
 - `canceled`
 - `in_progress`
+
+`status` mirrors the persisted job state such as `queued`, `running`, or `succeeded`.
+`branch_url` is returned when the server can derive a web URL for the branch from repo metadata.
+`merge_request_url` is the top-level convenience link for the published PR or MR and mirrors `publish_result.pull_request_url` when publishing has completed.
 
 ## Stability note
 
