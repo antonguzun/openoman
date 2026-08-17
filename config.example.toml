@@ -138,7 +138,7 @@ guest_path = "/opt/openoman/user-bin"
 add_to_path = true
 
 [agent]
-# Agent provider executed inside the sandbox. Supported providers: "codex", "cursor".
+# Agent provider executed inside the sandbox. Supported providers: "codex", "cursor", "claude".
 provider = "codex"
 # Preferred provider-neutral command path.
 bin = "/usr/local/bin/codex"
@@ -154,6 +154,15 @@ bin = "/usr/local/bin/codex"
 # codex_auth_file = "~/.codex/auth.json"
 # Domain allowlist enforced by the host CONNECT proxy in host-proxy networking mode.
 egress_allowed_domains = ["api.openai.com"]
+# For Claude Code, switch the provider and pass a subscription OAuth token
+# (created with `claude setup-token`) or an Anthropic API key:
+# provider = "claude"
+# bin = "claude"
+# model = "claude-opus-4-6"
+# api_key = "sk-ant-oat01-..."
+# Or: api_key_env = "OPENOMAN_CLAUDE_OAUTH_TOKEN"
+# egress_allowed_domains = ["api.anthropic.com"]
+#
 # For Cursor, switch the provider/bin and use Cursor's API domain instead:
 # provider = "cursor"
 # bin = "cursor-agent"

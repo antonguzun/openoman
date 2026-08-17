@@ -196,7 +196,7 @@ Firecracker-specific details:
 - `sandbox.firecracker.network.mode = "disabled"` runs without guest networking
 - `sandbox.firecracker.network.mode = "host-proxy"` routes guest HTTPS through a host-local allowlisting proxy
 - `sandbox.firecracker.network.allowed_connect_ports = [443, 5050]` lets the host proxy tunnel HTTPS CONNECT traffic to non-443 ports such as private Docker registries
-- the default guest rootfs build now includes `make`, Docker CLI, `dockerd`, `docker compose`, `python3`, and a `python -> python3` compatibility symlink in addition to the agent CLIs
+- the default guest rootfs build installs the Codex, Cursor and Claude Code CLIs, and includes `make`, Docker CLI, `dockerd`, `docker compose`, `python3`, and a `python -> python3` compatibility symlink in addition to the agent CLIs
 - `sandbox.firecracker.runtime_disk_mb = 4096` explicitly sizes the per-attempt runtime disk (`/dev/vdb`) used for staged workspace data and guest Docker storage
 - `sandbox.firecracker.docker_daemon = true` starts `dockerd` inside the guest, stores Docker data under `/mnt/runtime/docker`, and waits for `/var/run/docker.sock` readiness before agent execution
 - `[[sandbox.firecracker.user_package_dirs]]` copies explicit host-user package directories into each run
@@ -216,13 +216,14 @@ Docker registry auth is opt-in. openoman never auto-imports host `~/.docker/conf
 
 Agent configuration lives under `[agent]` and uses provider-neutral keys:
 
-- `provider = "codex"` or `provider = "cursor"`
+- `provider = "codex"`, `provider = "cursor"` or `provider = "claude"`
 - `bin = "..."` selects the agent binary inside the guest
-- `model = "gpt-5"` is supported for Cursor and passed as `cursor-agent --model ...`
+- `model = "gpt-5"` is supported for Cursor and passed as `cursor-agent --model ...`; Claude accepts `model` too and passes it as `claude --model ...`
 - `auth_file = "..."` is Codex-only and stages a host auth file into `/root/.codex/auth.json`
 - `api_key = "crsr_..."` injects a Cursor API key into the guest as `CURSOR_API_KEY`
+- for Claude, `api_key` / `api_key_env` carries a subscription OAuth token (`claude setup-token`) or an Anthropic API key, injected into the guest as `CLAUDE_CODE_OAUTH_TOKEN`; it never appears in the agent argv or in the stored logs
 - `api_key_env = "OPENOMAN_CURSOR_API_KEY"` reads the Cursor API key from a host environment variable at run time
-- `egress_allowed_domains = ["api.openai.com"]` or `["api2.cursor.sh"]` defines the host-proxy allowlist
+- `egress_allowed_domains = ["api.openai.com"]`, `["api2.cursor.sh"]` or `["api.anthropic.com"]` defines the host-proxy allowlist
 
 Existing Codex configs that still use `codex_bin` and `codex_auth_file` continue to work as compatibility aliases.
 
