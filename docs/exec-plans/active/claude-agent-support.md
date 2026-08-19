@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with [docs/PLANS.md](../PLANS.md).
+This document must be maintained in accordance with [docs/PLANS.md](../../PLANS.md).
 
 ## Purpose / Big Picture
 
@@ -56,6 +56,10 @@ The visible proof is twofold. First, config loading accepts `provider = "claude"
   Rationale: the guest runs the agent as uid 0, and Claude Code refuses `--dangerously-skip-permissions` under root unless it is told an external sandbox already exists. That is precisely the situation here: the agent runs inside a disposable microVM whose egress is restricted to an explicit hostname allowlist, so the isolation boundary is the VM, not the user id inside it. The variable asserts that boundary rather than creating one.
   Date/Author: 2026-08-17
 
+- Decision (revised 2026-08-18): move `IS_SANDBOX=1` out of the launch plan and into the Firecracker backend's `agent.env` renderer.
+  Rationale: `AgentLaunchPlan.env` is also applied verbatim by the process backend, which runs the agent directly on the host — there the variable would forge sandbox status and disable Claude Code's own refusal to run `--dangerously-skip-permissions` under root. Sandbox status is a backend fact, so the backend that actually provides the microVM asserts it, and every provider inside the VM sees it.
+  Date/Author: 2026-08-18
+
 - Decision: set `DISABLE_AUTOUPDATER=1` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`.
   Rationale: the version probe has a ten-second deadline and its failure aborts the attempt. Background requests to hosts outside the egress allowlist are the most likely way to exceed it, and neither auto-update nor telemetry is wanted in a disposable sandbox.
   Date/Author: 2026-08-17
@@ -96,11 +100,11 @@ The end-to-end tests are in `crates/cli/tests/cli_e2e.rs`. They do not boot a re
 
 First, add the adapter. In `crates/core/src/agents/mod.rs`, declare `struct ClaudeAdapter;` next to the other two, register it in `AgentAdapterRegistry::with_defaults`, and implement `AgentAdapter` for it. `load_runtime_config` defaults the binary to `claude`, accepts `model`, requires exactly one of `api_key` or `api_key_env`, and rejects the Codex compatibility fields with messages shaped like the Cursor ones. Add a small helper next to `resolve_cursor_execution_inputs` that resolves the token from either the inline value or the named host environment variable, with the same empty-value check.
 
-Second, build the launch plan. Arguments are `-p`, `--dangerously-skip-permissions`, `--output-format text`, optionally `--model <id>`, and finally the instruction. The environment carries `CLAUDE_CODE_OAUTH_TOKEN`, `IS_SANDBOX=1`, `DISABLE_AUTOUPDATER=1` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. Report mode is `Stdout`, no auth file is staged, the version probe is `--version`, and `redact_api_key_args` is false because the token is never in argv.
+Second, build the launch plan. Arguments are `-p`, `--dangerously-skip-permissions`, `--output-format text`, optionally `--model <id>`, then `--` and finally the instruction (the terminator keeps a dash-leading instruction positional). The environment carries `CLAUDE_CODE_OAUTH_TOKEN`, `DISABLE_AUTOUPDATER=1` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`; `IS_SANDBOX=1` is added by the Firecracker backend's `agent.env` renderer, not the plan (see the revised decision above). Report mode is `Stdout`, no auth file is staged, the version probe is `--version`, and `redact_api_key_args` is false because the token is never in argv.
 
 Third, widen the two `CodexAdapter` messages that describe `model`, `api_key` and `api_key_env` as Cursor-only, since they are now also Claude keys. Keep the word `cursor` in the model message: `crates/cli/src/config.rs` asserts that the error contains it.
 
-Fourth, cover it with tests. In `crates/core/src/agents/mod.rs` add a `claude_spec()` fixture and tests that assert the launch plan's provider id, report mode, arguments and environment; that the token stays out of argv; that `IS_SANDBOX` and `DISABLE_AUTOUPDATER` are present; that Codex compatibility fields are rejected and a missing token is reported; that the binary defaults to `claude` and `model` is accepted; and that host-proxy validation demands `api.anthropic.com`. In `crates/cli/tests/cli_e2e.rs` add a fake Claude script that refuses to run without `CLAUDE_CODE_OAUTH_TOKEN`, a `claude_agent` config helper, a `claude` arm in the fake Firecracker `case`, and an end-to-end test asserting the report, the log lines, the sandbox flag and the absence of the token in the logs.
+Fourth, cover it with tests. In `crates/core/src/agents/mod.rs` add a `claude_spec()` fixture and tests that assert the launch plan's provider id, report mode, arguments and environment; that the token stays out of argv; that `DISABLE_AUTOUPDATER` is present and `IS_SANDBOX` is absent from the plan (the Firecracker renderer test asserts it lands in `agent.env`); that Codex compatibility fields are rejected and a missing token is reported; that the binary defaults to `claude` and `model` is accepted; and that host-proxy validation demands `api.anthropic.com`. In `crates/cli/tests/cli_e2e.rs` add a fake Claude script that refuses to run without `CLAUDE_CODE_OAUTH_TOKEN`, a `claude_agent` config helper, a `claude` arm in the fake Firecracker `case`, and an end-to-end test asserting the report, the log lines, the sandbox flag and the absence of the token in the logs.
 
 Fifth, install the CLI in the guest image and document the provider. Add the Claude Code installer to `GUEST_SETUP_CMD` and a matching `command -v claude` check. Update `README.md` and `config.example.toml`.
 
@@ -175,7 +179,7 @@ registered by:
 
 The guest environment contract gains no new required keys. The launch plan environment for this provider is:
 
-    CLAUDE_CODE_OAUTH_TOKEN=<subscription token or Anthropic API key>
+    CLAUDE_CODE_OAUTH_TOKEN=<subscription OAuth token from `claude setup-token`>
     IS_SANDBOX=1
     DISABLE_AUTOUPDATER=1
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1

@@ -6,6 +6,7 @@ mod runtime;
 use std::{
     collections::HashMap,
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Child,
     thread,
@@ -283,6 +284,9 @@ impl ExecutionRunner for FirecrackerDirectRunner {
             fs::remove_dir_all(&run_dir)?;
         }
         fs::create_dir_all(&run_dir)?;
+        // The run dir holds the agent credential (agent.env, runtime.ext4); keep it
+        // unreadable to other local users for the whole attempt.
+        fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))?;
         let handle = ExecutionHandle {
             id: handle_id,
             run_dir: run_dir.clone(),
@@ -309,6 +313,7 @@ impl ExecutionRunner for FirecrackerDirectRunner {
                 if let Some(lease) = network_lease.as_ref() {
                     let _ = self.teardown_network_lease(lease, &network_log_path);
                 }
+                let _ = fs::remove_dir_all(&run_dir);
                 return Err(err);
             }
         };
@@ -327,6 +332,7 @@ impl ExecutionRunner for FirecrackerDirectRunner {
                 if let Some(lease) = network_lease.as_ref() {
                     let _ = self.teardown_network_lease(lease, &network_log_path);
                 }
+                let _ = fs::remove_dir_all(&run_dir);
                 return Err(err);
             }
         };
@@ -348,6 +354,7 @@ impl ExecutionRunner for FirecrackerDirectRunner {
                 if let Some(lease) = network_lease.as_ref() {
                     let _ = self.teardown_network_lease(lease, &network_log_path);
                 }
+                let _ = fs::remove_dir_all(&run_dir);
                 return Err(err);
             }
         };
@@ -1397,6 +1404,33 @@ mod tests {
     }
 
     #[test]
+    fn render_agent_env_marks_guest_as_sandbox() {
+        let env_file = render_agent_env(
+            &AgentExecutionSpec {
+                provider: "claude".to_string(),
+                bin: "claude".to_string(),
+                model: None,
+                auth_file: None,
+                api_key: Some("claude-secret".to_string()),
+                egress_proxy: None,
+                egress_allowed_domains: vec!["api.anthropic.com".to_string()],
+            },
+            "append blank line",
+            &[],
+            &[],
+            false,
+            false,
+            None,
+        )
+        .expect("render agent env");
+
+        // Only the Firecracker backend may assert sandbox status; the launch plan
+        // itself does not carry IS_SANDBOX (see the process-backend rationale in
+        // the Claude adapter).
+        assert!(env_file.contains("export IS_SANDBOX='1'"));
+    }
+
+    #[test]
     fn render_agent_env_includes_allowed_domains() {
         let env_file = render_agent_env(
             &AgentExecutionSpec {
@@ -1589,7 +1623,8 @@ mod tests {
         assert!(env_file.contains("AGENT_PROVIDER='cursor'"));
         assert!(env_file.contains("AGENT_BIN='/usr/local/bin/cursor-agent'"));
         assert!(env_file.contains("export CURSOR_API_KEY='cursor-secret'"));
-        assert!(env_file.contains("OPENOMAN_AGENT_ARG_COUNT='7'"));
+        assert!(env_file.contains("OPENOMAN_AGENT_ARG_COUNT='8'"));
+        assert!(env_file.contains("OPENOMAN_AGENT_ARG_006='--'"));
         assert!(env_file.contains("OPENOMAN_AGENT_REPORT_MODE='stdout'"));
     }
 
@@ -1615,8 +1650,9 @@ mod tests {
         .expect("render agent env");
 
         assert!(env_file.contains("AGENT_MODEL='gpt-5'"));
-        assert!(env_file.contains("OPENOMAN_AGENT_ARG_COUNT='9'"));
+        assert!(env_file.contains("OPENOMAN_AGENT_ARG_COUNT='10'"));
         assert!(env_file.contains("OPENOMAN_AGENT_ARG_007='gpt-5'"));
+        assert!(env_file.contains("OPENOMAN_AGENT_ARG_008='--'"));
     }
 
     fn write_fake_firecracker(root: &Path) -> PathBuf {

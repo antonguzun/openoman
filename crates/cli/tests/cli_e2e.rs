@@ -438,12 +438,13 @@ fn submit_then_run_supports_claude_provider() {
     let temp = TempDir::new().expect("tempdir");
     let fixture_repo = temp.path().join("fixture-repo");
     let fake_firecracker = write_fake_firecracker(temp.path());
-    let fake_claude = write_fake_claude(temp.path());
     init_fixture_repo(&fixture_repo);
+    // The fake Firecracker backend never executes the agent binary (it fabricates
+    // report/logs from agent.env), so the guest-style bare name is enough here.
     let config = write_config(
         temp.path(),
         &fake_firecracker,
-        &claude_agent(&fake_claude),
+        &claude_agent(Path::new("claude")),
         None,
     );
 
@@ -1317,67 +1318,6 @@ echo "fake codex applied instruction"
     )
     .expect("write fake codex");
     fs::set_permissions(&script_path, PermissionsExt::from_mode(0o755)).expect("chmod fake codex");
-    script_path
-}
-
-fn write_fake_claude(root: &Path) -> PathBuf {
-    let script_path = root.join("fake-claude-agent.sh");
-    fs::write(
-        &script_path,
-        r#"#!/usr/bin/env sh
-set -eu
-if [ "${1:-}" = "--version" ]; then
-  echo "2.1.197 (Claude Code)"
-  exit 0
-fi
-if [ "${CLAUDE_CODE_OAUTH_TOKEN:-}" = "" ]; then
-  echo "missing CLAUDE_CODE_OAUTH_TOKEN" >&2
-  exit 11
-fi
-print_mode=0
-skip_permissions=0
-model=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    -p|--print)
-      shift 1
-      print_mode=1
-      ;;
-    --dangerously-skip-permissions)
-      shift 1
-      skip_permissions=1
-      ;;
-    --model)
-      model="$2"
-      shift 2
-      ;;
-    --output-format)
-      shift 2
-      ;;
-    *)
-      instruction="$1"
-      shift 1
-      ;;
-  esac
-done
-if [ "$print_mode" -ne 1 ]; then
-  echo "expected print mode" >&2
-  exit 12
-fi
-if [ "$skip_permissions" -ne 1 ]; then
-  echo "expected --dangerously-skip-permissions" >&2
-  exit 13
-fi
-if printf "%s" "${instruction:-}" | grep -q "readme"; then
-  printf "\n" >> README.md
-else
-  printf "agent touched workspace\n" > AGENT_OUTPUT.txt
-fi
-echo "fake claude completed: ${instruction:-}${model:+ (model=$model)}"
-"#,
-    )
-    .expect("write fake claude");
-    fs::set_permissions(&script_path, PermissionsExt::from_mode(0o755)).expect("chmod fake claude");
     script_path
 }
 

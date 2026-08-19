@@ -19,7 +19,7 @@ flowchart TB
             VM_POS[" "]
             INIT["/sbin/openoman-init"]
             WS["Sandbox workspace"]
-            AGENT["Agent CLI<br/>Codex / Cursor"]
+            AGENT["Agent CLI<br/>Codex / Cursor / Claude"]
             TESTS["Docker Compose / tests / local services"]
             OUT["Untrusted outputs<br/>patch / report / logs"]
             NOTE["No direct Git / VCS credentials<br/>No direct publish path"]
@@ -39,7 +39,7 @@ flowchart TB
             ART["Artifact refs / local store<br/>patch / report / logs"]
 
             GITCREDS["Git / VCS credentials<br/>host env / secret store"]
-            AGENTCREDS["Agent provider credentials source<br/>Codex auth file / Cursor API key"]
+            AGENTCREDS["Agent provider credentials source<br/>Codex auth file / Cursor API key / Claude OAuth token"]
             PROXY["Host allowlisting CONNECT proxy<br/>only explicit whitelisted domains"]
         end
 
@@ -125,7 +125,7 @@ flowchart TB
 - [Keep agent work out of your manual environment](#disposable-sandbox-execution): each task runs in its own sandbox instead of your everyday clone or shell. The execution layer is sandbox-agnostic in design; the current implementation is Firecracker and currently targets Linux hosts with KVM. Details: [guest/README.md](guest/README.md)
 - [Keep Git and publishing on the trusted side](#trusted-publishing): the agent can change files, but it does not get direct Git credentials or publish access. openoman applies a deterministic host-side publish flow for GitHub and GitLab. Details: [config.example.toml](config.example.toml), [docs/api/control-plane.md](docs/api/control-plane.md)
 - [Bring your own task source](#cli-and-http-control-plane): use the built-in CLI, or wire your own Telegram bot, web UI, cron job, issue tracker bridge, or any other adapter against the HTTP API. Details: [docs/design-docs/control-plane-and-adapters.md](docs/design-docs/control-plane-and-adapters.md), [docs/api/control-plane.md](docs/api/control-plane.md), [docs/api/openapi.yaml](docs/api/openapi.yaml)
-- [Swap agents without changing the rest of the system](#agent-provider-support): Codex and Cursor use the same sandbox and publish flow through one provider-neutral config shape. Details: [config.example.toml](config.example.toml), [guest/README.md](guest/README.md)
+- [Swap agents without changing the rest of the system](#agent-provider-support): Codex, Cursor, and Claude Code use the same sandbox and publish flow through one provider-neutral config shape. Details: [config.example.toml](config.example.toml), [guest/README.md](guest/README.md)
 - [Run many repositories safely](#repository-aliases-accounts-and-env-overlays): bind each repo to its own account, env overlay, and isolated task runs without contaminating other repos or your local setup. Details: [config.example.toml](config.example.toml)
 - [Control branch and commit naming centrally](#repository-aliases-accounts-env-overlays-and-git-naming): configure one trusted host-side prompt for branch and commit names, or omit the key and keep the old deterministic naming path. Details: [config.example.toml](config.example.toml)
 - [Inspect what happened after the run](#artifacts-and-audit-trail): SQLite-backed job state plus patch, report, logs, and publish metadata make runs inspectable after the fact. Details: [docs/design-docs/operational-model.md](docs/design-docs/operational-model.md), [docs/api/control-plane.md](docs/api/control-plane.md)
@@ -221,7 +221,7 @@ Agent configuration lives under `[agent]` and uses provider-neutral keys:
 - `model = "gpt-5"` is supported for Cursor and passed as `cursor-agent --model ...`; Claude accepts `model` too and passes it as `claude --model ...`
 - `auth_file = "..."` is Codex-only and stages a host auth file into `/root/.codex/auth.json`
 - `api_key = "crsr_..."` injects a Cursor API key into the guest as `CURSOR_API_KEY`
-- for Claude, `api_key` / `api_key_env` carries a subscription OAuth token (`claude setup-token`) or an Anthropic API key, injected into the guest as `CLAUDE_CODE_OAUTH_TOKEN`; it never appears in the agent argv or in the stored logs
+- for Claude, `api_key` / `api_key_env` carries a subscription OAuth token created with `claude setup-token` (a plain Anthropic API key is not supported: the guest presents the value as an OAuth bearer token), injected into the guest as `CLAUDE_CODE_OAUTH_TOKEN`; it never appears in the agent argv or in the stored logs
 - `api_key_env = "OPENOMAN_CURSOR_API_KEY"` reads the Cursor API key from a host environment variable at run time
 - `egress_allowed_domains = ["api.openai.com"]`, `["api2.cursor.sh"]` or `["api.anthropic.com"]` defines the host-proxy allowlist
 

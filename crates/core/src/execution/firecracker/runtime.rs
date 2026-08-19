@@ -1,5 +1,7 @@
 use std::{
     fs,
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -66,17 +68,19 @@ impl<'a> FirecrackerRuntimeStager<'a> {
         fs::write(config_dir.join("instruction.txt"), &spec.instruction)?;
         fs::write(config_dir.join("package-mounts.tsv"), manifest)?;
         if let Some(auth_file) = &spec.agent.auth_file {
-            fs::copy(auth_file, config_dir.join("agent-auth.json"))?;
+            let staged_auth_file = config_dir.join("agent-auth.json");
+            fs::copy(auth_file, &staged_auth_file)?;
+            fs::set_permissions(&staged_auth_file, fs::Permissions::from_mode(0o600))?;
         }
         if let Some(docker_auth_config) = &self.firecracker.docker_auth_config {
             let docker_auth_contents = load_docker_auth_contents(docker_auth_config)?;
-            fs::write(
-                config_dir.join("docker-config.json"),
+            write_secret_file(
+                &config_dir.join("docker-config.json"),
                 docker_auth_contents.as_bytes(),
             )?;
         }
-        fs::write(
-            config_dir.join("agent.env"),
+        write_secret_file(
+            &config_dir.join("agent.env"),
             render_agent_env(
                 &spec.agent,
                 &spec.instruction,
@@ -85,7 +89,8 @@ impl<'a> FirecrackerRuntimeStager<'a> {
                 self.firecracker.docker_daemon,
                 self.firecracker.docker_auth_config.is_some(),
                 network_lease,
-            )?,
+            )?
+            .as_bytes(),
         )?;
         fs::write(
             config_dir.join("guest-init-contract.txt"),
@@ -131,9 +136,23 @@ impl<'a> FirecrackerRuntimeStager<'a> {
             blocks.to_string(),
         ];
         run_command("mkfs.ext4", &mkfs_args)?;
+        // The image embeds agent.env with the agent credential in clear text.
+        fs::set_permissions(&image_path, fs::Permissions::from_mode(0o600))?;
 
         Ok(PreparedRuntimeTree { image_path })
     }
+}
+
+// Credential-carrying files must never be readable by other local users; 0600 at
+// creation avoids the chmod-after-write window a plain fs::write would leave.
+fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)
 }
 
 #[derive(Debug)]
@@ -188,6 +207,11 @@ pub(super) fn render_agent_env(
     if docker_daemon_enabled {
         env_file.push_str("OPENOMAN_DOCKER_DAEMON_ENABLED='1'\n");
     }
+    // Truthful only on this backend: the agent runs as uid 0 inside a microVM.
+    // Claude Code requires IS_SANDBOX=1 before it accepts
+    // --dangerously-skip-permissions under root; the process backend must never
+    // set it because there the agent runs directly on the host.
+    env_file.push_str("export IS_SANDBOX='1'\n");
     append_agent_launch_plan_env(&mut env_file, &launch_plan);
     if let Some(proxy) = &agent.egress_proxy {
         env_file.push_str(&format!("export HTTPS_PROXY={}\n", shell_quote(proxy)));

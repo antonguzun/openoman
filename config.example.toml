@@ -139,29 +139,32 @@ add_to_path = true
 
 [agent]
 # Agent provider executed inside the sandbox. Supported providers: "codex", "cursor", "claude".
-provider = "codex"
+# provider = "codex"
 # Preferred provider-neutral command path.
-bin = "/usr/local/bin/codex"
+# bin = "/usr/local/bin/codex"
 # Codex-only optional host auth file copied into the guest as /root/.codex/auth.json.
 # auth_file = "~/.codex/auth.json"
-# Cursor-only inline API key copied into the guest as CURSOR_API_KEY.
+# Inline credential for key-based providers, copied into the guest
+# (Cursor: CURSOR_API_KEY, Claude: CLAUDE_CODE_OAUTH_TOKEN).
 # api_key = "crsr_..."
 # Optional alternative: host environment variable name whose value will be injected into the guest
-# as CURSOR_API_KEY at `openoman run` time.
+# at `openoman run` time.
 # api_key_env = "OPENOMAN_CURSOR_API_KEY"
 # Legacy Codex-only aliases still accepted for backward compatibility:
 # codex_bin = "/usr/local/bin/codex"
 # codex_auth_file = "~/.codex/auth.json"
 # Domain allowlist enforced by the host CONNECT proxy in host-proxy networking mode.
-egress_allowed_domains = ["api.openai.com"]
+# egress_allowed_domains = ["api.openai.com"]
 # For Claude Code, switch the provider and pass a subscription OAuth token
-# (created with `claude setup-token`) or an Anthropic API key:
-# provider = "claude"
-# bin = "claude"
-# model = "claude-opus-4-6"
+# created with `claude setup-token`; plain Anthropic API keys are not supported
+# because the guest presents the value as an OAuth bearer token:
+provider = "claude"
+bin = "claude"
+model = "claude-opus-5"
 # api_key = "sk-ant-oat01-..."
 # Or: api_key_env = "OPENOMAN_CLAUDE_OAUTH_TOKEN"
-# egress_allowed_domains = ["api.anthropic.com"]
+api_key_env = "OPENOMAN_CLAUDE_OAUTH_TOKEN"
+egress_allowed_domains = ["api.anthropic.com"]
 #
 # For Cursor, switch the provider/bin and use Cursor's API domain instead:
 # provider = "cursor"
