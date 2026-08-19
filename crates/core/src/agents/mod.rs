@@ -215,30 +215,81 @@ fn parse_agent_provider(raw: Option<&str>) -> Result<String, String> {
     ))
 }
 
+// The guest exports the resolved value verbatim, so surrounding whitespace or a
+// trailing CR from a copy-pasted token or CRLF dotenv file would only surface as an
+// auth failure deep inside the sandbox; trim it here instead.
+fn resolve_api_key_from_config(
+    config: &AgentRuntimeConfig,
+    provider: &str,
+) -> Result<String, String> {
+    if let Some(api_key) = &config.api_key {
+        return Ok(api_key.trim().to_string());
+    }
+    let env_name = config.api_key_env.as_deref().ok_or_else(|| {
+        format!(
+            "agent.api_key or agent.api_key_env is required when agent.provider = \"{provider}\""
+        )
+    })?;
+    let value = env::var(env_name).map_err(|_| {
+        format!("agent.api_key_env references missing environment variable {env_name}")
+    })?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!(
+            "environment variable {env_name} referenced by agent.api_key_env must not be empty"
+        ));
+    }
+    Ok(value.to_string())
+}
+
 fn resolve_cursor_execution_inputs(
     config: &AgentRuntimeConfig,
 ) -> Result<ResolvedCursorExecutionInputs, String> {
-    let api_key = if let Some(api_key) = &config.api_key {
-        api_key.clone()
-    } else {
-        let env_name = config.api_key_env.as_deref().ok_or_else(|| {
-            "agent.api_key or agent.api_key_env is required when agent.provider = \"cursor\""
-                .to_string()
-        })?;
-        let value = env::var(env_name).map_err(|_| {
-            format!("agent.api_key_env references missing environment variable {env_name}")
-        })?;
-        if value.trim().is_empty() {
-            return Err(format!(
-                "environment variable {env_name} referenced by agent.api_key_env must not be empty"
-            ));
-        }
-        value
-    };
-
+    let api_key = resolve_api_key_from_config(config, "cursor")?;
     Ok(ResolvedCursorExecutionInputs {
         staged_auth_file: discover_matching_cursor_auth_cache_path(&api_key),
         api_key,
+    })
+}
+
+// Shared config loading for the api-key providers (cursor, claude): they accept
+// the same provider-neutral keys and differ only in provider name and default
+// binary.
+fn load_api_key_provider_runtime_config(
+    provider: &str,
+    default_bin: &str,
+    input: AgentRuntimeConfigInput,
+) -> Result<AgentRuntimeConfig, String> {
+    if input.legacy_codex_bin.is_some() {
+        return Err(format!(
+            "agent.codex_bin is a Codex-only compatibility field and cannot be set when agent.provider = \"{provider}\""
+        ));
+    }
+    if input.auth_file.is_some() || input.legacy_codex_auth_file.is_some() {
+        return Err(format!(
+            "agent.auth_file and legacy agent.codex_auth_file are Codex-only fields and cannot be set when agent.provider = \"{provider}\""
+        ));
+    }
+    let (api_key, api_key_env) = match (input.api_key, input.api_key_env) {
+        (Some(_), Some(_)) => Err(format!(
+            "agent.api_key and agent.api_key_env are mutually exclusive; set only one when agent.provider = \"{provider}\""
+        )),
+        (Some(api_key), None) => Ok((Some(api_key), None)),
+        (None, Some(api_key_env)) => Ok((None, Some(api_key_env))),
+        (None, None) => Err(format!(
+            "agent.api_key or agent.api_key_env is required when agent.provider = \"{provider}\""
+        )),
+    }?;
+
+    Ok(AgentRuntimeConfig {
+        provider: provider.to_string(),
+        bin: input.bin.unwrap_or_else(|| default_bin.to_string()),
+        model: input.model,
+        auth_file: None,
+        api_key,
+        api_key_env,
+        egress_proxy: input.egress_proxy,
+        egress_allowed_domains: input.egress_allowed_domains,
     })
 }
 
@@ -248,6 +299,13 @@ fn agent_egress_policy(domains: &[String]) -> AgentEgressPolicy<'_> {
     } else {
         AgentEgressPolicy::Restricted(domains)
     }
+}
+
+// Hostname a provider's CLI must be able to reach through the host CONNECT
+// proxy in host-proxy networking mode, plus the reason quoted in the error.
+struct RequiredHostProxyDomain {
+    domain: &'static str,
+    reason: &'static str,
 }
 
 trait AgentAdapter {
@@ -261,8 +319,27 @@ trait AgentAdapter {
         &self,
         config: &AgentRuntimeConfig,
     ) -> Result<(Option<String>, Option<PathBuf>), String>;
-    fn validate_host_proxy_egress(&self, _egress_allowed_domains: &[String]) -> Result<(), String> {
-        Ok(())
+    fn required_host_proxy_domain(&self) -> Option<RequiredHostProxyDomain> {
+        None
+    }
+    fn validate_host_proxy_egress(&self, egress_allowed_domains: &[String]) -> Result<(), String> {
+        let Some(required) = self.required_host_proxy_domain() else {
+            return Ok(());
+        };
+        match agent_egress_policy(egress_allowed_domains) {
+            AgentEgressPolicy::AllowAllDebug => Ok(()),
+            AgentEgressPolicy::Restricted(domains)
+                if domains.iter().any(|domain| domain == required.domain) =>
+            {
+                Ok(())
+            }
+            AgentEgressPolicy::Restricted(_) => Err(format!(
+                "agent.egress_allowed_domains must include \"{}\" when agent.provider = \"{}\" and sandbox.firecracker.network.mode = \"host-proxy\" because {}",
+                required.domain,
+                self.provider_id(),
+                required.reason
+            )),
+        }
     }
     fn build_launch_plan(
         &self,
@@ -273,6 +350,7 @@ trait AgentAdapter {
 
 struct CodexAdapter;
 struct CursorAdapter;
+struct ClaudeAdapter;
 
 #[derive(Default)]
 struct AgentAdapterRegistry {
@@ -284,6 +362,7 @@ impl AgentAdapterRegistry {
         let mut registry = Self::default();
         registry.register(CodexAdapter);
         registry.register(CursorAdapter);
+        registry.register(ClaudeAdapter);
         registry
     }
 
@@ -345,13 +424,13 @@ impl AgentAdapter for CodexAdapter {
         }?;
         if input.model.is_some() {
             return Err(
-                "agent.model is currently supported only when agent.provider = \"cursor\""
+                "agent.model is currently supported only when agent.provider = \"cursor\" or \"claude\""
                     .to_string(),
             );
         }
         if input.api_key.is_some() || input.api_key_env.is_some() {
             return Err(
-                "agent.api_key and agent.api_key_env are Cursor-only fields and cannot be set when agent.provider = \"codex\""
+                "agent.api_key and agent.api_key_env are Cursor-only and Claude-only fields and cannot be set when agent.provider = \"codex\""
                     .to_string(),
             );
         }
@@ -426,41 +505,7 @@ impl AgentAdapter for CursorAdapter {
         provider: &str,
         input: AgentRuntimeConfigInput,
     ) -> Result<AgentRuntimeConfig, String> {
-        if input.legacy_codex_bin.is_some() {
-            return Err(
-                "agent.codex_bin is a Codex-only compatibility field and cannot be set when agent.provider = \"cursor\""
-                    .to_string(),
-            );
-        }
-        if input.auth_file.is_some() || input.legacy_codex_auth_file.is_some() {
-            return Err(
-                "agent.auth_file and legacy agent.codex_auth_file are Codex-only fields and cannot be set when agent.provider = \"cursor\""
-                    .to_string(),
-            );
-        }
-        let (api_key, api_key_env) = match (input.api_key, input.api_key_env) {
-            (Some(_), Some(_)) => Err(
-                "agent.api_key and agent.api_key_env are mutually exclusive; set only one when agent.provider = \"cursor\""
-                    .to_string(),
-            ),
-            (Some(api_key), None) => Ok((Some(api_key), None)),
-            (None, Some(api_key_env)) => Ok((None, Some(api_key_env))),
-            (None, None) => Err(
-                "agent.api_key or agent.api_key_env is required when agent.provider = \"cursor\""
-                    .to_string(),
-            ),
-        }?;
-
-        Ok(AgentRuntimeConfig {
-            provider: provider.to_string(),
-            bin: input.bin.unwrap_or_else(|| "cursor-agent".to_string()),
-            model: input.model,
-            auth_file: None,
-            api_key,
-            api_key_env,
-            egress_proxy: input.egress_proxy,
-            egress_allowed_domains: input.egress_allowed_domains,
-        })
+        load_api_key_provider_runtime_config(provider, "cursor-agent", input)
     }
 
     fn resolve_execution_inputs(
@@ -471,22 +516,11 @@ impl AgentAdapter for CursorAdapter {
         Ok((Some(resolved.api_key), resolved.staged_auth_file))
     }
 
-    fn validate_host_proxy_egress(&self, egress_allowed_domains: &[String]) -> Result<(), String> {
-        const CURSOR_REQUIRED_HOST_PROXY_DOMAIN: &str = "api2.cursor.sh";
-
-        match agent_egress_policy(egress_allowed_domains) {
-            AgentEgressPolicy::AllowAllDebug => Ok(()),
-            AgentEgressPolicy::Restricted(domains)
-                if domains
-                    .iter()
-                    .any(|domain| domain == CURSOR_REQUIRED_HOST_PROXY_DOMAIN) =>
-            {
-                Ok(())
-            }
-            AgentEgressPolicy::Restricted(_) => Err(format!(
-                "agent.egress_allowed_domains must include \"{CURSOR_REQUIRED_HOST_PROXY_DOMAIN}\" when agent.provider = \"cursor\" and sandbox.firecracker.network.mode = \"host-proxy\" because Cursor CLI print mode tunnels through that hostname"
-            )),
-        }
+    fn required_host_proxy_domain(&self) -> Option<RequiredHostProxyDomain> {
+        Some(RequiredHostProxyDomain {
+            domain: "api2.cursor.sh",
+            reason: "Cursor CLI print mode tunnels through that hostname",
+        })
     }
 
     fn build_launch_plan(
@@ -516,6 +550,9 @@ impl AgentAdapter for CursorAdapter {
             args.push("--model".to_string());
             args.push(model.clone());
         }
+        // The instruction is free text and may start with '-'; end option parsing
+        // so the CLI always treats it as the positional prompt.
+        args.push("--".to_string());
         args.push(context.instruction.to_string());
 
         Ok(AgentLaunchPlan {
@@ -531,6 +568,95 @@ impl AgentAdapter for CursorAdapter {
             env,
             version_probe_args: vec!["--version".to_string()],
             redact_api_key_args: spec.auth_file.is_none(),
+        })
+    }
+}
+
+impl AgentAdapter for ClaudeAdapter {
+    fn provider_id(&self) -> &'static str {
+        "claude"
+    }
+
+    fn load_runtime_config(
+        &self,
+        provider: &str,
+        input: AgentRuntimeConfigInput,
+    ) -> Result<AgentRuntimeConfig, String> {
+        load_api_key_provider_runtime_config(provider, "claude", input)
+    }
+
+    fn resolve_execution_inputs(
+        &self,
+        config: &AgentRuntimeConfig,
+    ) -> Result<(Option<String>, Option<PathBuf>), String> {
+        let token = resolve_api_key_from_config(config, "claude")?;
+        Ok((Some(token), None))
+    }
+
+    fn required_host_proxy_domain(&self) -> Option<RequiredHostProxyDomain> {
+        Some(RequiredHostProxyDomain {
+            domain: "api.anthropic.com",
+            reason: "Claude Code reaches the Anthropic API through that hostname",
+        })
+    }
+
+    fn build_launch_plan(
+        &self,
+        spec: &AgentExecutionSpec,
+        context: AgentLaunchContext<'_>,
+    ) -> Result<AgentLaunchPlan, ExecutionError> {
+        let token = spec.api_key.as_ref().ok_or_else(|| {
+            ExecutionError::InvalidConfig(
+                "claude execution requires an api key or oauth token".to_string(),
+            )
+        })?;
+
+        let mut args = vec![
+            "-p".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--output-format".to_string(),
+            "text".to_string(),
+        ];
+        if let Some(model) = &spec.model {
+            args.push("--model".to_string());
+            args.push(model.clone());
+        }
+        // The instruction is free text and may start with '-'; end option parsing
+        // so the CLI always treats it as the positional prompt.
+        args.push("--".to_string());
+        args.push(context.instruction.to_string());
+
+        Ok(AgentLaunchPlan {
+            provider_id: self.provider_id(),
+            binary: context.binary.to_string(),
+            args,
+            working_directory: context.workspace_dir.to_string(),
+            report_mode: AgentReportMode::Stdout,
+            auth_file_home_relative_path: None,
+            env: vec![
+                // Subscription OAuth token. The guest starts from an empty environment and
+                // only sources the generated agent.env, so a host ANTHROPIC_API_KEY cannot
+                // leak in and take precedence over this token.
+                ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone()),
+                // IS_SANDBOX is deliberately NOT set here: whether the agent is sandboxed
+                // is a property of the backend, not the provider. The Firecracker backend
+                // sets it when rendering agent.env; the process backend runs the agent on
+                // the host, where forging it would defeat the CLI's own root guard.
+                //
+                // The version probe is wrapped in `timeout -k 1 10`. An auto-update or
+                // telemetry request to a host outside the egress allowlist would hang past
+                // that deadline and abort the attempt before the agent ever runs.
+                ("DISABLE_AUTOUPDATER".to_string(), "1".to_string()),
+                (
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
+                    "1".to_string(),
+                ),
+            ],
+            version_probe_args: vec!["--version".to_string()],
+            // The token travels in the environment only. The guest log redactor understands
+            // just a literal `--api-key` argument, so putting it in argv would write it to
+            // the stored sandbox.logs artifact in clear text.
+            redact_api_key_args: false,
         })
     }
 }
@@ -607,6 +733,18 @@ mod tests {
         assert!(plan.args.contains(&"/report.txt".to_string()));
     }
 
+    fn claude_spec() -> AgentExecutionSpec {
+        AgentExecutionSpec {
+            provider: "claude".to_string(),
+            bin: "claude".to_string(),
+            model: Some("claude-opus-4-6".to_string()),
+            auth_file: None,
+            api_key: Some("claude-secret".to_string()),
+            egress_proxy: None,
+            egress_allowed_domains: vec!["api.anthropic.com".to_string()],
+        }
+    }
+
     #[test]
     fn cursor_adapter_builds_stdout_plan_with_redacted_api_key() {
         let plan = build_launch_plan(
@@ -624,6 +762,10 @@ mod tests {
         assert_eq!(plan.report_mode, AgentReportMode::Stdout);
         assert!(plan.redact_api_key_args);
         assert!(plan.args.contains(&"--api-key".to_string()));
+        assert_eq!(
+            plan.args.get(plan.args.len() - 2).map(String::as_str),
+            Some("--")
+        );
         assert!(plan
             .env
             .iter()
@@ -659,6 +801,189 @@ mod tests {
         let discovered =
             discover_matching_cursor_auth_cache_path_in_home("cursor-inline-secret", temp.path());
         assert_eq!(discovered.as_deref(), Some(auth_path.as_path()));
+    }
+
+    #[test]
+    fn claude_adapter_builds_stdout_plan_with_token_in_env() {
+        let plan = build_launch_plan(
+            &claude_spec(),
+            AgentLaunchContext {
+                binary: "/usr/local/bin/claude",
+                workspace_dir: "/workspace",
+                report_path: "/report.txt",
+                instruction: "append blank line",
+            },
+        )
+        .expect("plan");
+
+        assert_eq!(plan.provider_id, "claude");
+        assert_eq!(plan.report_mode, AgentReportMode::Stdout);
+        assert!(plan.auth_file_home_relative_path.is_none());
+        assert!(plan.args.contains(&"-p".to_string()));
+        assert!(plan
+            .args
+            .contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(plan.args.contains(&"claude-opus-4-6".to_string()));
+        assert_eq!(
+            plan.args.last().map(String::as_str),
+            Some("append blank line")
+        );
+        // A dash-leading instruction must stay positional.
+        assert_eq!(
+            plan.args.get(plan.args.len() - 2).map(String::as_str),
+            Some("--")
+        );
+        assert!(plan
+            .env
+            .iter()
+            .any(|(key, value)| key == "CLAUDE_CODE_OAUTH_TOKEN" && value == "claude-secret"));
+    }
+
+    #[test]
+    fn claude_launch_plan_keeps_token_out_of_argv() {
+        let plan = build_launch_plan(
+            &claude_spec(),
+            AgentLaunchContext {
+                binary: "/usr/local/bin/claude",
+                workspace_dir: "/workspace",
+                report_path: "/report.txt",
+                instruction: "append blank line",
+            },
+        )
+        .expect("plan");
+
+        // The guest log redactor only understands a literal `--api-key` argument, so the
+        // token must never appear in argv or it would be written to sandbox.logs verbatim.
+        assert!(!plan.redact_api_key_args);
+        assert!(!plan.args.iter().any(|arg| arg.contains("claude-secret")));
+    }
+
+    #[test]
+    fn claude_launch_plan_leaves_sandbox_marking_to_the_backend() {
+        let plan = build_launch_plan(
+            &claude_spec(),
+            AgentLaunchContext {
+                binary: "/usr/local/bin/claude",
+                workspace_dir: "/workspace",
+                report_path: "/report.txt",
+                instruction: "append blank line",
+            },
+        )
+        .expect("plan");
+
+        // Whether the agent is sandboxed is a backend fact: the Firecracker
+        // renderer exports IS_SANDBOX=1, while the process backend runs the agent
+        // on the host, where a plan-supplied IS_SANDBOX would forge Claude Code's
+        // own refusal to run --dangerously-skip-permissions under root.
+        assert!(!plan.env.iter().any(|(key, _)| key == "IS_SANDBOX"));
+        // The version probe runs under `timeout -k 1 10`; background traffic to hosts
+        // outside the egress allowlist would hang past that deadline.
+        assert!(plan
+            .env
+            .iter()
+            .any(|(key, value)| key == "DISABLE_AUTOUPDATER" && value == "1"));
+    }
+
+    #[test]
+    fn resolve_api_key_from_config_trims_inline_and_env_values() {
+        let inline = AgentRuntimeConfig {
+            provider: "claude".to_string(),
+            bin: "claude".to_string(),
+            model: None,
+            auth_file: None,
+            api_key: Some("  sk-ant-oat01-inline\n".to_string()),
+            api_key_env: None,
+            egress_proxy: None,
+            egress_allowed_domains: Vec::new(),
+        };
+        assert_eq!(
+            resolve_api_key_from_config(&inline, "claude").expect("inline key"),
+            "sk-ant-oat01-inline"
+        );
+
+        // A CRLF dotenv file or a copy-paste leaves whitespace around the value.
+        env::set_var("OPENOMAN_TEST_CLAUDE_TOKEN_TRIM", " sk-ant-oat01-env\r\n");
+        let from_env = AgentRuntimeConfig {
+            api_key: None,
+            api_key_env: Some("OPENOMAN_TEST_CLAUDE_TOKEN_TRIM".to_string()),
+            ..inline
+        };
+        assert_eq!(
+            resolve_api_key_from_config(&from_env, "claude").expect("env key"),
+            "sk-ant-oat01-env"
+        );
+        env::remove_var("OPENOMAN_TEST_CLAUDE_TOKEN_TRIM");
+    }
+
+    #[test]
+    fn load_claude_runtime_config_rejects_codex_compat_fields() {
+        let err = load_agent_runtime_config(AgentRuntimeConfigInput {
+            provider: Some("claude".to_string()),
+            api_key: Some("claude-secret".to_string()),
+            legacy_codex_bin: Some("codex".to_string()),
+            ..AgentRuntimeConfigInput::default()
+        })
+        .expect_err("codex compatibility fields must be rejected for claude");
+        assert!(err.contains("codex_bin"));
+
+        let err = load_agent_runtime_config(AgentRuntimeConfigInput {
+            provider: Some("claude".to_string()),
+            ..AgentRuntimeConfigInput::default()
+        })
+        .expect_err("claude requires a token");
+        assert!(err.contains("agent.api_key or agent.api_key_env"));
+    }
+
+    #[test]
+    fn load_claude_runtime_config_defaults_bin_and_accepts_model() {
+        let config = load_agent_runtime_config(AgentRuntimeConfigInput {
+            provider: Some("claude".to_string()),
+            model: Some("claude-opus-4-6".to_string()),
+            api_key: Some("claude-secret".to_string()),
+            ..AgentRuntimeConfigInput::default()
+        })
+        .expect("runtime config");
+
+        assert_eq!(config.bin, "claude");
+        assert_eq!(config.model.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn validate_claude_host_proxy_requires_api_anthropic_com() {
+        let firecracker = FirecrackerBackendConfig {
+            mode: crate::execution::FirecrackerMode::Direct,
+            firecracker_bin: "firecracker".to_string(),
+            jailer_bin: "jailer".to_string(),
+            kernel_image_path: PathBuf::from("/kernel"),
+            rootfs_image_path: PathBuf::from("/rootfs"),
+            runtime_disk_bytes: None,
+            guest_cid_base: 10_000,
+            docker_daemon: false,
+            docker_auth_config: None,
+            user_package_dirs: Vec::new(),
+            networking: FirecrackerNetworkingConfig {
+                mode: FirecrackerNetworkingMode::HostProxy,
+                privilege_mode: crate::execution::FirecrackerNetworkPrivilegeMode::Sudo,
+                tap_name_prefix: "oomtap".to_string(),
+                proxy_port: 3128,
+                allowed_connect_ports: vec![443],
+                subnet_cidr: "172.22.0.0/16".to_string(),
+            },
+        };
+        let agent = AgentRuntimeConfig {
+            provider: "claude".to_string(),
+            bin: "claude".to_string(),
+            model: None,
+            auth_file: None,
+            api_key: Some("claude-secret".to_string()),
+            api_key_env: None,
+            egress_proxy: None,
+            egress_allowed_domains: vec!["example.com".to_string()],
+        };
+
+        let err = validate_agent_networking_contract(Some(&firecracker), &agent)
+            .expect_err("claude host proxy should require api.anthropic.com");
+        assert!(err.contains("api.anthropic.com"));
     }
 
     #[test]

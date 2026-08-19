@@ -48,6 +48,16 @@ fn cursor_agent(bin: &Path) -> AgentTestConfig<'_> {
     }
 }
 
+fn claude_agent(bin: &Path) -> AgentTestConfig<'_> {
+    AgentTestConfig {
+        provider: "claude",
+        bin,
+        model: None,
+        api_key: Some("claude-test-token"),
+        api_key_env: None,
+    }
+}
+
 fn cursor_agent_from_env(bin: &Path) -> AgentTestConfig<'_> {
     AgentTestConfig {
         provider: "cursor",
@@ -421,6 +431,49 @@ fn submit_then_run_persists_canonical_artifacts_with_process_backend() {
     assert!(report.contains("fake codex completed"));
     assert!(logs.contains("openoman process backend started"));
     assert!(logs.contains("fake codex applied instruction"));
+}
+
+#[test]
+fn submit_then_run_supports_claude_provider() {
+    let temp = TempDir::new().expect("tempdir");
+    let fixture_repo = temp.path().join("fixture-repo");
+    let fake_firecracker = write_fake_firecracker(temp.path());
+    init_fixture_repo(&fixture_repo);
+    // The fake Firecracker backend never executes the agent binary (it fabricates
+    // report/logs from agent.env), so the guest-style bare name is enough here.
+    let config = write_config(
+        temp.path(),
+        &fake_firecracker,
+        &claude_agent(Path::new("claude")),
+        None,
+    );
+
+    let job_id = submit_job(&config, &fixture_repo, "add empty line in readme");
+
+    let mut run = cli_cmd();
+    run.args(["--config", &config, "run", &job_id])
+        .assert()
+        .success()
+        .stdout(format!("job {job_id} finished with state=succeeded\n"));
+
+    let attempt_dir = temp
+        .path()
+        .join("sandbox-runtime")
+        .join("jobs")
+        .join(&job_id)
+        .join("attempt-1");
+    let report = fs::read_to_string(attempt_dir.join("report.txt")).expect("read report");
+    let logs = fs::read_to_string(attempt_dir.join("logs.txt")).expect("read logs");
+    let patch = fs::read_to_string(attempt_dir.join("patch.diff")).expect("read patch");
+
+    assert!(report.contains("fake claude completed"));
+    assert!(logs.contains("agent provider: claude"));
+    assert!(logs.contains("claude oauth token present"));
+    // The guest runs as root; without IS_SANDBOX Claude Code refuses to start.
+    assert!(logs.contains("claude sandbox flag: 1"));
+    // The token must never reach the logged argv.
+    assert!(!logs.contains("claude-test-token"));
+    assert!(patch.contains("README.md"));
 }
 
 #[test]
@@ -1363,6 +1416,18 @@ printf "agent provider: %s\nagent bin: %s\nagent model: %s\ninstruction: %s\n" "
 case "${AGENT_PROVIDER:-unknown}" in
   codex)
     printf "fake codex completed: %s\n" "$instruction" > "$tmpdir/report.txt"
+    ;;
+  claude)
+    if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+      printf "claude oauth token missing\n" >> "$tmpdir/logs.txt"
+      printf "fake claude failed: missing token for %s\n" "$instruction" > "$tmpdir/report.txt"
+      debugfs -w -R "write $tmpdir/logs.txt /openoman-output/logs.txt" "$image" >/dev/null 2>&1
+      debugfs -w -R "write $tmpdir/report.txt /openoman-output/report.txt" "$image" >/dev/null 2>&1
+      exit 19
+    fi
+    printf "claude oauth token present\n" >> "$tmpdir/logs.txt"
+    printf "claude sandbox flag: %s\n" "${IS_SANDBOX:-unset}" >> "$tmpdir/logs.txt"
+    printf "fake claude completed: %s\n" "$instruction" > "$tmpdir/report.txt"
     ;;
   cursor)
     if [ -z "${CURSOR_API_KEY:-}" ]; then

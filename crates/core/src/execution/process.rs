@@ -237,6 +237,10 @@ impl ProcessRunner {
             .open(&logs_path)?;
         command.current_dir(Path::new(&plan.working_directory));
         command.args(&plan.args);
+        // Never inherit the caller's stdin: `claude -p` reads a non-TTY stdin to
+        // EOF, so a held-open pipe would hang the attempt and any piped bytes
+        // would be injected into the agent's prompt.
+        command.stdin(Stdio::null());
         match plan.report_mode {
             AgentReportMode::File => {
                 command.stdout(Stdio::from(logs_file.try_clone()?));

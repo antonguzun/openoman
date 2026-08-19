@@ -54,7 +54,7 @@ Set `OPENOMAN_CONTAINER_ENGINE=docker` or `OPENOMAN_CONTAINER_ENGINE=podman` if 
 - downloads an uncompressed Firecracker-compatible kernel into `./guest/out/vmlinux`
 - downloads the matching published kernel config into `./guest/out/vmlinux.config`
 - builds a root filesystem image with `openoman-init.sh` injected as `/sbin/openoman-init` into `./guest/out/rootfs.ext4`
-- by default, installs guest-side `make`, Docker CLI, `dockerd`, `docker compose` support, `python3`, a `python -> python3` compatibility symlink, `node`, `npm`, `git`, `ripgrep`, `@openai/codex`, and Cursor's `cursor-agent`, so common test/agent CLIs exist inside the guest image without host bind mounts
+- by default, installs guest-side `make`, Docker CLI, `dockerd`, `docker compose` support, `python3`, a `python -> python3` compatibility symlink, `node`, `npm`, `git`, `ripgrep`, `@openai/codex`, Cursor's `cursor-agent`, and Anthropic's `claude` (Claude Code), so common test/agent CLIs exist inside the guest image without host bind mounts
 
 The default kernel download URL now points at Firecracker's official `firecracker-ci` guest kernel for the local architecture. The script also downloads the published sidecar config and refuses the build if it does not contain `CONFIG_HW_RANDOM_VIRTIO=y`, because the current guest Node/Codex workload stalls without that driver.
 
@@ -63,7 +63,7 @@ On `x86_64`, the default is `https://s3.amazonaws.com/spec.ccfc.min/firecracker-
 If you need a different guest package set, override the container setup step:
 
 ```sh
-OPENOMAN_GUEST_SETUP_CMD='apk add --no-cache bash curl nodejs npm && npm install -g @openai/codex && curl -fsSL https://cursor.com/install | bash'
+OPENOMAN_GUEST_SETUP_CMD='apk add --no-cache bash curl nodejs npm && npm install -g @openai/codex && curl -fsSL https://cursor.com/install | bash && curl -fsSL https://claude.ai/install.sh | bash'
 ./guest/build-rootfs.sh ./guest/out
 
 If you need private Docker registry access inside the guest, configure it on the host side through `sandbox.firecracker.docker_auth_config` or `sandbox.firecracker.docker_auth_config_env`. At run time, openoman stages that explicit Docker config into `/root/.docker/config.json`. No host Docker login is copied automatically.
